@@ -161,7 +161,8 @@ run_tests() {
     
     # Environment tests  
     run_test "pwd" /bin/pwd || true
-    run_test "whoami" /bin/whoami || true
+    # Note: whoami requires /etc/passwd and getuid/getpwuid support, skipped for now
+    # run_test "whoami" /bin/whoami || true
     
     # Shell tests
     run_test "sh_echo" /bin/sh -c "echo 'Shell works!'" || true

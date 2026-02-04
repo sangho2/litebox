@@ -203,3 +203,269 @@ impl StateManager {
         Ok(state)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_temp_manager() -> (TempDir, StateManager) {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StateManager::new(temp_dir.path().to_path_buf());
+        (temp_dir, manager)
+    }
+
+    #[test]
+    fn test_status_display() {
+        assert_eq!(Status::Creating.to_string(), "creating");
+        assert_eq!(Status::Created.to_string(), "created");
+        assert_eq!(Status::Running.to_string(), "running");
+        assert_eq!(Status::Stopped.to_string(), "stopped");
+    }
+
+    #[test]
+    fn test_status_serde() {
+        // Serialize
+        assert_eq!(
+            serde_json::to_string(&Status::Creating).unwrap(),
+            "\"creating\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Status::Running).unwrap(),
+            "\"running\""
+        );
+
+        // Deserialize
+        assert_eq!(
+            serde_json::from_str::<Status>("\"created\"").unwrap(),
+            Status::Created
+        );
+        assert_eq!(
+            serde_json::from_str::<Status>("\"stopped\"").unwrap(),
+            Status::Stopped
+        );
+    }
+
+    #[test]
+    fn test_container_state_new() {
+        let state = ContainerState::new("test-id".to_string(), PathBuf::from("/tmp/bundle"));
+
+        assert_eq!(state.oci_version, "1.0.0");
+        assert_eq!(state.id, "test-id");
+        assert_eq!(state.status, Status::Creating);
+        assert!(state.pid.is_none());
+        assert_eq!(state.bundle, PathBuf::from("/tmp/bundle"));
+        assert!(state.annotations.is_empty());
+    }
+
+    #[test]
+    fn test_state_manager_paths() {
+        let (_temp, manager) = create_temp_manager();
+
+        assert!(manager.container_dir("foo").ends_with("containers/foo"));
+        assert!(
+            manager
+                .sync_pipe("foo")
+                .ends_with("containers/foo/sync.pipe")
+        );
+    }
+
+    #[test]
+    fn test_state_manager_create_and_exists() {
+        let (_temp, manager) = create_temp_manager();
+
+        assert!(!manager.exists("test-container"));
+
+        manager.create_dir("test-container").unwrap();
+
+        // Directory exists but state file doesn't yet
+        assert!(!manager.exists("test-container"));
+
+        // Save state to create the file
+        let state = ContainerState::new("test-container".to_string(), PathBuf::from("/bundle"));
+        manager.save(&state).unwrap();
+
+        assert!(manager.exists("test-container"));
+    }
+
+    #[test]
+    fn test_state_manager_create_duplicate_fails() {
+        let (_temp, manager) = create_temp_manager();
+
+        manager.create_dir("test-container").unwrap();
+        let result = manager.create_dir("test-container");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_state_manager_save_and_load() {
+        let (_temp, manager) = create_temp_manager();
+
+        let mut state = ContainerState::new("test-id".to_string(), PathBuf::from("/tmp/bundle"));
+        state.status = Status::Running;
+        state.pid = Some(12345);
+        state
+            .annotations
+            .insert("key".to_string(), "value".to_string());
+
+        manager.save(&state).unwrap();
+        let loaded = manager.load("test-id").unwrap();
+
+        assert_eq!(loaded.id, "test-id");
+        assert_eq!(loaded.status, Status::Running);
+        assert_eq!(loaded.pid, Some(12345));
+        assert_eq!(loaded.bundle, PathBuf::from("/tmp/bundle"));
+        assert_eq!(loaded.annotations.get("key").unwrap(), "value");
+    }
+
+    #[test]
+    fn test_state_manager_load_not_found() {
+        let (_temp, manager) = create_temp_manager();
+
+        let result = manager.load("nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_state_manager_update() {
+        let (_temp, manager) = create_temp_manager();
+
+        let state = ContainerState::new("test-id".to_string(), PathBuf::from("/bundle"));
+        manager.save(&state).unwrap();
+
+        let updated = manager
+            .update("test-id", |s| {
+                s.status = Status::Running;
+                s.pid = Some(999);
+            })
+            .unwrap();
+
+        assert_eq!(updated.status, Status::Running);
+        assert_eq!(updated.pid, Some(999));
+
+        // Verify persisted
+        let loaded = manager.load("test-id").unwrap();
+        assert_eq!(loaded.status, Status::Running);
+    }
+
+    #[test]
+    fn test_state_manager_delete() {
+        let (_temp, manager) = create_temp_manager();
+
+        manager.create_dir("test-container").unwrap();
+        let state = ContainerState::new("test-container".to_string(), PathBuf::from("/bundle"));
+        manager.save(&state).unwrap();
+
+        assert!(manager.exists("test-container"));
+
+        manager.delete("test-container").unwrap();
+
+        assert!(!manager.exists("test-container"));
+        assert!(!manager.container_dir("test-container").exists());
+    }
+
+    #[test]
+    fn test_state_manager_delete_nonexistent_ok() {
+        let (_temp, manager) = create_temp_manager();
+
+        // Should not error on nonexistent container
+        manager.delete("nonexistent").unwrap();
+    }
+
+    #[test]
+    fn test_state_manager_list_empty() {
+        let (_temp, manager) = create_temp_manager();
+
+        let ids = manager.list().unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_state_manager_list() {
+        let (_temp, manager) = create_temp_manager();
+
+        manager.create_dir("container-a").unwrap();
+        manager.create_dir("container-b").unwrap();
+        manager.create_dir("container-c").unwrap();
+
+        let mut ids = manager.list().unwrap();
+        ids.sort();
+
+        assert_eq!(ids, vec!["container-a", "container-b", "container-c"]);
+    }
+
+    #[test]
+    fn test_is_process_alive() {
+        // Current process should be alive
+        let pid = std::process::id();
+        assert!(StateManager::is_process_alive(pid));
+
+        // PID 0 (kernel) check - typically not accessible
+        // PID that almost certainly doesn't exist
+        assert!(!StateManager::is_process_alive(u32::MAX - 1000));
+    }
+
+    #[test]
+    fn test_refresh_state_running_process_dead() {
+        let (_temp, manager) = create_temp_manager();
+
+        let mut state = ContainerState::new("test-id".to_string(), PathBuf::from("/bundle"));
+        state.status = Status::Running;
+        state.pid = Some(u32::MAX - 1000); // Non-existent PID
+        manager.save(&state).unwrap();
+
+        let refreshed = manager.refresh_state("test-id").unwrap();
+
+        assert_eq!(refreshed.status, Status::Stopped);
+    }
+
+    #[test]
+    fn test_refresh_state_running_process_alive() {
+        let (_temp, manager) = create_temp_manager();
+
+        let mut state = ContainerState::new("test-id".to_string(), PathBuf::from("/bundle"));
+        state.status = Status::Running;
+        state.pid = Some(std::process::id()); // Current process is alive
+        manager.save(&state).unwrap();
+
+        let refreshed = manager.refresh_state("test-id").unwrap();
+
+        assert_eq!(refreshed.status, Status::Running);
+    }
+
+    #[test]
+    fn test_refresh_state_not_running() {
+        let (_temp, manager) = create_temp_manager();
+
+        let mut state = ContainerState::new("test-id".to_string(), PathBuf::from("/bundle"));
+        state.status = Status::Created;
+        state.pid = Some(u32::MAX - 1000);
+        manager.save(&state).unwrap();
+
+        let refreshed = manager.refresh_state("test-id").unwrap();
+
+        // Status unchanged because it wasn't Running
+        assert_eq!(refreshed.status, Status::Created);
+    }
+
+    #[test]
+    fn test_container_state_json_format() {
+        let mut state = ContainerState::new("test-id".to_string(), PathBuf::from("/bundle"));
+        state.status = Status::Running;
+        state.pid = Some(12345);
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+
+        // Verify OCI-compliant field names
+        assert!(json.contains("\"ociVersion\""));
+        assert!(json.contains("\"1.0.0\""));
+        assert!(json.contains("\"status\": \"running\""));
+        assert!(json.contains("\"pid\": 12345"));
+
+        // Annotations should be omitted when empty
+        assert!(!json.contains("annotations"));
+    }
+}

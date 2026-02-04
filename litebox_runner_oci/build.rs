@@ -2,10 +2,35 @@
 // Licensed under the MIT license.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 const RTLD_AUDIT_DIR: &str = "../litebox_rtld_audit";
 
 fn main() {
+    // Capture git commit hash for version info
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
+    println!("cargo:rustc-env=GIT_HASH={git_hash}");
+
+    // Check for dirty working tree
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| !o.stdout.is_empty());
+    println!(
+        "cargo:rustc-env=GIT_DIRTY={}",
+        if dirty { "-dirty" } else { "" }
+    );
+
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/index");
     let mut make_cmd = std::process::Command::new("make");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();

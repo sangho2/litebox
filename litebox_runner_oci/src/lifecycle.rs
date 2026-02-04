@@ -159,8 +159,14 @@ impl Lifecycle {
 
         // Connect to the child's sync socket and signal it to start
         let sync_path = self.state_manager.sync_pipe(id);
-        let mut stream = UnixStream::connect(&sync_path)
-            .context("failed to connect to container sync socket")?;
+        let mut stream = UnixStream::connect(&sync_path).with_context(|| {
+            format!(
+                "failed to connect to container sync socket at {}. \
+                 The container process may have exited unexpectedly. \
+                 Try deleting and recreating the container.",
+                sync_path.display()
+            )
+        })?;
 
         stream
             .write_all(b"S")
@@ -264,5 +270,299 @@ impl Lifecycle {
             }
         }
         Ok(states)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::StateManager;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn create_temp_lifecycle() -> (TempDir, Lifecycle) {
+        let temp_dir = TempDir::new().unwrap();
+        let state_manager = StateManager::new(temp_dir.path().to_path_buf());
+        let lifecycle = Lifecycle::new(state_manager);
+        (temp_dir, lifecycle)
+    }
+
+    fn create_valid_bundle(temp_dir: &TempDir) -> PathBuf {
+        let bundle_dir = temp_dir.path().join("bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+
+        // Create minimal config.json
+        let config = r#"{
+            "ociVersion": "1.0.0",
+            "root": { "path": "rootfs" },
+            "process": {
+                "args": ["/bin/echo", "hello"],
+                "cwd": "/"
+            }
+        }"#;
+        fs::write(bundle_dir.join("config.json"), config).unwrap();
+
+        // Create rootfs directory
+        fs::create_dir_all(bundle_dir.join("rootfs")).unwrap();
+
+        bundle_dir
+    }
+
+    #[test]
+    fn test_lifecycle_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_manager = StateManager::new(temp_dir.path().to_path_buf());
+        let _lifecycle = Lifecycle::new(state_manager);
+        // Constructor should work without error
+    }
+
+    #[test]
+    fn test_create_bundle_not_found() {
+        let (_temp, lifecycle) = create_temp_lifecycle();
+
+        let result = lifecycle.create("test-id", Path::new("/nonexistent/bundle"));
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bundle not found"));
+    }
+
+    #[test]
+    fn test_create_config_not_found() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+
+        // Create bundle dir without config.json
+        let bundle_dir = temp.path().join("bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+
+        let result = lifecycle.create("test-id", &bundle_dir);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("config.json not found")
+        );
+    }
+
+    #[test]
+    fn test_create_already_exists() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        // Pre-create a container state
+        let state = ContainerState::new("test-id".to_string(), bundle.clone());
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.create("test-id", &bundle);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_start_not_found() {
+        let (_temp, lifecycle) = create_temp_lifecycle();
+
+        let result = lifecycle.start("nonexistent");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_start_wrong_status_running() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        // Create a container in Running status (can't start again)
+        let mut state = ContainerState::new("test-id".to_string(), bundle);
+        state.status = Status::Running;
+        state.pid = Some(12345);
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.start("test-id");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot start"));
+        assert!(err.contains("running"));
+    }
+
+    #[test]
+    fn test_start_wrong_status_stopped() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        // Create a container in Stopped status
+        let mut state = ContainerState::new("test-id".to_string(), bundle);
+        state.status = Status::Stopped;
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.start("test-id");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot start"));
+        assert!(err.contains("stopped"));
+    }
+
+    #[test]
+    fn test_state_not_found() {
+        let (_temp, lifecycle) = create_temp_lifecycle();
+
+        let result = lifecycle.state("nonexistent");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_state_returns_container_state() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        let mut state = ContainerState::new("test-id".to_string(), bundle);
+        state.status = Status::Created;
+        state.pid = Some(999);
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.state("test-id").unwrap();
+
+        assert_eq!(result.id, "test-id");
+        assert_eq!(result.status, Status::Created);
+        assert_eq!(result.pid, Some(999));
+    }
+
+    #[test]
+    fn test_kill_not_found() {
+        let (_temp, lifecycle) = create_temp_lifecycle();
+
+        let result = lifecycle.kill("nonexistent", libc::SIGTERM);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_kill_already_stopped() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        let mut state = ContainerState::new("test-id".to_string(), bundle);
+        state.status = Status::Stopped;
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.kill("test-id", libc::SIGTERM);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already stopped"));
+    }
+
+    #[test]
+    fn test_kill_no_pid() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        let mut state = ContainerState::new("test-id".to_string(), bundle);
+        state.status = Status::Running;
+        state.pid = None; // No PID
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.kill("test-id", libc::SIGTERM);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no PID"));
+    }
+
+    #[test]
+    fn test_delete_not_found() {
+        let (_temp, lifecycle) = create_temp_lifecycle();
+
+        let result = lifecycle.delete("nonexistent", false);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_stopped_container() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        let mut state = ContainerState::new("test-id".to_string(), bundle);
+        state.status = Status::Stopped;
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.delete("test-id", false);
+
+        assert!(result.is_ok());
+        assert!(!lifecycle.state_manager.exists("test-id"));
+    }
+
+    #[test]
+    fn test_delete_running_without_force_fails() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        let mut state = ContainerState::new("test-id".to_string(), bundle);
+        state.status = Status::Running;
+        state.pid = Some(std::process::id()); // Use current process so it appears alive
+        lifecycle.state_manager.save(&state).unwrap();
+
+        let result = lifecycle.delete("test-id", false);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot delete"));
+        assert!(err.contains("--force"));
+    }
+
+    #[test]
+    fn test_list_empty() {
+        let (_temp, lifecycle) = create_temp_lifecycle();
+
+        let states = lifecycle.list().unwrap();
+
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn test_list_multiple_containers() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        // Create multiple containers
+        for i in 1..=3 {
+            let mut state = ContainerState::new(format!("container-{i}"), bundle.clone());
+            state.status = Status::Stopped;
+            lifecycle.state_manager.save(&state).unwrap();
+        }
+
+        let mut states = lifecycle.list().unwrap();
+        states.sort_by(|a, b| a.id.cmp(&b.id));
+
+        assert_eq!(states.len(), 3);
+        assert_eq!(states[0].id, "container-1");
+        assert_eq!(states[1].id, "container-2");
+        assert_eq!(states[2].id, "container-3");
+    }
+
+    #[test]
+    fn test_list_skips_corrupted_state() {
+        let (temp, lifecycle) = create_temp_lifecycle();
+        let bundle = create_valid_bundle(&temp);
+
+        // Create a valid container
+        let state = ContainerState::new("valid-container".to_string(), bundle);
+        lifecycle.state_manager.save(&state).unwrap();
+
+        // Create a corrupted container (directory exists but state.json is invalid)
+        let corrupted_dir = temp.path().join("containers").join("corrupted-container");
+        fs::create_dir_all(&corrupted_dir).unwrap();
+        fs::write(corrupted_dir.join("state.json"), "not valid json").unwrap();
+
+        let states = lifecycle.list().unwrap();
+
+        // Should only return the valid container
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].id, "valid-container");
     }
 }

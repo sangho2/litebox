@@ -30,14 +30,18 @@ Pull and unpack an Alpine image to create an OCI bundle:
 
 ```bash
 # Create bundle directory
-mkdir -p /tmp/test-bundle/rootfs
+mkdir -p /tmp/test-bundle
 cd /tmp/test-bundle
 
 # Pull Alpine image using skopeo
 skopeo copy docker://alpine:latest oci:alpine:latest
 
-# Unpack to rootfs
-umoci unpack --image alpine:latest rootfs
+# Unpack to a temporary directory
+umoci unpack --image alpine:latest bundle
+
+# Move rootfs to expected location
+mv bundle/rootfs .
+rm -rf bundle alpine
 
 # Create OCI config.json
 cat > config.json << 'EOF'
@@ -46,7 +50,9 @@ cat > config.json << 'EOF'
   "root": { "path": "rootfs" },
   "process": {
     "args": ["/bin/echo", "Hello from LiteBox!"],
-    "env": ["PATH=/usr/local/bin:/usr/bin:/bin"]
+    "env": ["PATH=/usr/local/bin:/usr/bin:/bin"],
+    "cwd": "/",
+    "user": { "uid": 0, "gid": 0 }
   }
 }
 EOF
@@ -169,7 +175,78 @@ ls -la /run/litebox-oci/containers/
 cat /run/litebox-oci/containers/<container-id>/state.json
 ```
 
-## 7. Cleanup
+## 7. Rootless Operation
+
+LiteBox OCI supports rootless operation without requiring root privileges.
+
+### 7.1 Rootless CLI
+
+Use `--root` to specify a user-writable state directory:
+
+```bash
+# Run rootless
+litebox-oci --root ~/.litebox-oci run --bundle /tmp/test-bundle test-run
+
+# Check containers
+ls ~/.litebox-oci/containers/
+cat ~/.litebox-oci/containers/*/state.json
+
+# Lifecycle commands
+litebox-oci --root ~/.litebox-oci create -b /tmp/test-bundle test1
+litebox-oci --root ~/.litebox-oci list
+litebox-oci --root ~/.litebox-oci delete test1
+```
+
+Set an alias for convenience:
+
+```bash
+alias litebox-oci='litebox-oci --root ~/.litebox-oci'
+```
+
+### 7.2 Rootless containerd
+
+```bash
+# Install rootless containerd (if not already)
+containerd-rootless-setuptool.sh install
+
+# Start rootless containerd
+systemctl --user start containerd
+
+# Pull image (rootless)
+ctr --address ~/.local/share/containerd/containerd.sock \
+    image pull docker.io/library/alpine:latest
+
+# Run with litebox-oci (rootless)
+ctr --address ~/.local/share/containerd/containerd.sock \
+    run --rm --runc-binary $(which litebox-oci) \
+    docker.io/library/alpine:latest test-rootless \
+    /bin/echo "Hello rootless!"
+```
+
+### 7.3 Rootless nerdctl
+
+`nerdctl` provides better rootless support:
+
+```bash
+# Run rootless with nerdctl
+nerdctl run --rm --runtime=$(which litebox-oci) alpine echo "Hello"
+```
+
+### 7.4 Rootless containerd Configuration
+
+Create `~/.config/containerd/config.toml`:
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.litebox]
+  runtime_type = "io.containerd.runc.v2"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.litebox.options]
+    BinaryName = "/home/YOUR_USER/.cargo/bin/litebox-oci"
+    Root = "/home/YOUR_USER/.litebox-oci"
+```
+
+Replace `YOUR_USER` with your actual username.
+
+## 8. Cleanup
 
 ```bash
 # Remove test bundle

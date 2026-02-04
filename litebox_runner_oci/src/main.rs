@@ -14,12 +14,23 @@ use clap::{Parser, Subcommand};
 use litebox_runner_oci::lifecycle::Lifecycle;
 use litebox_runner_oci::state::StateManager;
 
+/// Build version string including git commit hash.
+fn version_string() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_HASH"),
+        env!("GIT_DIRTY"),
+        ")"
+    )
+}
+
 #[derive(Parser, Debug)]
 #[clap(
     name = "litebox-oci",
     about = "OCI container runtime powered by LiteBox"
 )]
-#[command(version)]
+#[command(version = version_string())]
 struct Cli {
     /// Root directory for container state
     #[clap(long, default_value = "/run/litebox-oci")]
@@ -112,6 +123,53 @@ enum Command {
 
         /// Container ID
         container_id: String,
+
+        /// Set environment variables (can be specified multiple times)
+        #[clap(short, long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Read environment variables from a file (one KEY=VALUE per line)
+        #[clap(long, value_name = "FILE")]
+        env_file: Option<PathBuf>,
+
+        /// Bind mount a host path into the container (can be specified multiple times)
+        /// Format: source=<path>,destination=<path>[,readonly]
+        #[clap(short, long, value_name = "MOUNT_SPEC")]
+        mount: Vec<String>,
+
+        /// Redirect stdout to a file
+        #[clap(long, value_name = "FILE")]
+        stdout: Option<PathBuf>,
+
+        /// Redirect stderr to a file
+        #[clap(long, value_name = "FILE")]
+        stderr: Option<PathBuf>,
+    },
+
+    /// Execute a command in a container's rootfs (simplified exec)
+    ///
+    /// Note: This creates a new sandbox with the same rootfs, it does not
+    /// share process state with the running container.
+    Exec {
+        /// Container ID
+        container_id: String,
+
+        /// Set environment variables (can be specified multiple times)
+        #[clap(short, long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Read environment variables from a file (one KEY=VALUE per line)
+        #[clap(long, value_name = "FILE")]
+        env_file: Option<PathBuf>,
+
+        /// Bind mount a host path into the container (can be specified multiple times)
+        /// Format: source=<path>,destination=<path>[,readonly]
+        #[clap(short, long, value_name = "MOUNT_SPEC")]
+        mount: Vec<String>,
+
+        /// Command and arguments to execute
+        #[clap(required = true, num_args = 1..)]
+        command: Vec<String>,
     },
 
     /// Show runtime version and features
@@ -141,6 +199,88 @@ fn parse_signal(s: &str) -> Result<i32> {
         "CONT" => Ok(libc::SIGCONT),
         _ => anyhow::bail!("unknown signal: {s}"),
     }
+}
+
+/// Parse environment variables from command line and optional env file.
+fn parse_extra_env(env: &[String], env_file: Option<&PathBuf>) -> Result<Vec<String>> {
+    let mut extra_env = Vec::new();
+
+    // Parse env file if provided
+    if let Some(path) = env_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read env file: {}", path.display()))?;
+
+        for line in content.lines() {
+            let line = line.trim();
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Validate KEY=VALUE format
+            if !line.contains('=') {
+                anyhow::bail!("invalid env file line (expected KEY=VALUE): {line}");
+            }
+            extra_env.push(line.to_string());
+        }
+    }
+
+    // Add command-line env vars (these override file vars)
+    for var in env {
+        if !var.contains('=') {
+            anyhow::bail!("invalid env var (expected KEY=VALUE): {var}");
+        }
+        extra_env.push(var.clone());
+    }
+
+    Ok(extra_env)
+}
+
+/// Parse mount specifications into Mount structs.
+fn parse_mounts(mount_specs: &[String]) -> Result<Vec<litebox_runner_oci::Mount>> {
+    let mut mounts = Vec::new();
+
+    for spec in mount_specs {
+        let mut source = None;
+        let mut destination = None;
+        let mut readonly = false;
+
+        for part in spec.split(',') {
+            let part = part.trim();
+            if let Some(val) = part.strip_prefix("source=") {
+                source = Some(PathBuf::from(val));
+            } else if let Some(val) = part.strip_prefix("src=") {
+                source = Some(PathBuf::from(val));
+            } else if let Some(val) = part.strip_prefix("destination=") {
+                destination = Some(val.to_string());
+            } else if let Some(val) = part.strip_prefix("dst=") {
+                destination = Some(val.to_string());
+            } else if let Some(val) = part.strip_prefix("target=") {
+                destination = Some(val.to_string());
+            } else if part == "readonly" || part == "ro" {
+                readonly = true;
+            } else if part.starts_with("type=") {
+                // Accept but ignore type (we only support bind-like behavior)
+            } else if !part.is_empty() {
+                anyhow::bail!("unknown mount option: {part}");
+            }
+        }
+
+        let source = source.ok_or_else(|| anyhow::anyhow!("mount missing source: {spec}"))?;
+        let destination =
+            destination.ok_or_else(|| anyhow::anyhow!("mount missing destination: {spec}"))?;
+
+        if !source.exists() {
+            anyhow::bail!("mount source does not exist: {}", source.display());
+        }
+
+        mounts.push(litebox_runner_oci::Mount {
+            source,
+            destination,
+            readonly,
+        });
+    }
+
+    Ok(mounts)
 }
 
 fn main() -> Result<()> {
@@ -247,6 +387,11 @@ fn main() -> Result<()> {
         Command::Run {
             bundle,
             container_id,
+            env,
+            env_file,
+            mount,
+            stdout,
+            stderr,
         } => {
             tracing::info!(
                 container_id = %container_id,
@@ -258,13 +403,50 @@ fn main() -> Result<()> {
                 .canonicalize()
                 .with_context(|| format!("bundle path not found: {}", bundle.display()))?;
 
-            let exit_code = litebox_runner_oci::run_container(&bundle)?;
+            // Set up stdio redirection if requested
+            let stdio = litebox_runner_oci::StdioRedirect {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            };
+
+            let extra_env = parse_extra_env(&env, env_file.as_ref())?;
+            let mounts = parse_mounts(&mount)?;
+            let exit_code =
+                litebox_runner_oci::run_container_full(&bundle, None, &extra_env, &mounts, &stdio)?;
+            std::process::exit(exit_code);
+        }
+
+        Command::Exec {
+            container_id,
+            env,
+            env_file,
+            mount,
+            command,
+        } => {
+            tracing::info!(
+                container_id = %container_id,
+                command = ?command,
+                "exec in container"
+            );
+
+            // Load container state to get bundle path
+            let state = lifecycle.state(&container_id)?;
+
+            // Container must exist (any status is fine for exec)
+            let bundle = state.bundle;
+
+            let extra_env = parse_extra_env(&env, env_file.as_ref())?;
+            let mounts = parse_mounts(&mount)?;
+            // Run with overridden command, extra env, and mounts
+            let exit_code = litebox_runner_oci::run_container_with_all_options(
+                &bundle, &command, &extra_env, &mounts,
+            )?;
             std::process::exit(exit_code);
         }
 
         Command::Info => {
             println!("litebox-oci - OCI container runtime powered by LiteBox");
-            println!("Version: {}", env!("CARGO_PKG_VERSION"));
+            println!("Version: {}", version_string());
             println!();
             println!("Features:");
             println!("  - Userspace syscall emulation via LiteBox");
@@ -281,6 +463,7 @@ fn main() -> Result<()> {
             println!();
             println!("Convenience Commands:");
             println!("  run     - Create and run a container directly");
+            println!("  exec    - Run a command in a container's rootfs");
             println!("  info    - Show this information");
             Ok(())
         }

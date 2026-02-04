@@ -435,6 +435,15 @@ impl From<litebox::fs::FileStatus> for FileStat {
             blksize,
             ..
         } = value;
+
+        // Use a fixed reasonable timestamp (2024-01-01 00:00:00 UTC) instead of epoch
+        // This avoids "Jan 1 1970" display issues in tools like `ls -l`
+        // 1704067200 = seconds since epoch for 2024-01-01 00:00:00 UTC
+        #[cfg(target_arch = "x86_64")]
+        const DEFAULT_TIMESTAMP: i64 = 1704067200;
+        #[cfg(target_arch = "x86")]
+        const DEFAULT_TIMESTAMP: u32 = 1704067200;
+
         Self {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
@@ -451,6 +460,12 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_size: size,
             st_blksize: blksize,
             st_blocks: 0,
+            st_atime: DEFAULT_TIMESTAMP,
+            st_atime_nsec: 0,
+            st_mtime: DEFAULT_TIMESTAMP,
+            st_mtime_nsec: 0,
+            st_ctime: DEFAULT_TIMESTAMP,
+            st_ctime_nsec: 0,
             ..Default::default()
         }
     }

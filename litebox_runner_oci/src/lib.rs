@@ -19,4 +19,9 @@ pub mod lifecycle;
 mod runner;
 pub mod state;
 
+pub use runner::Mount;
+pub use runner::StdioRedirect;
 pub use runner::run_container;
+pub use runner::run_container_full;
+pub use runner::run_container_with_all_options;
+pub use runner::run_container_with_options;
