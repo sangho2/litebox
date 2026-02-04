@@ -242,9 +242,21 @@ cat /proc/loadavg
 - `/proc/self/maps` - Memory mappings
 - `/proc/<pid>/*` - Same as /proc/self/*
 
+## Process Model
+
+LiteBox supports **pthreads** and **execve**, but not **fork()**:
+
+- ✅ Multi-threaded programs work (Go, Rust, Java, Python with threads)
+- ✅ Direct command execution works (`/bin/ls`, `/usr/bin/python`)
+- ❌ Shell scripts calling external commands fail (`sh -c "ls"` needs fork)
+- ❌ Traditional fork-then-exec patterns don't work
+
+**Workaround:** Run commands directly instead of through shell.
+
 ## Limitations
 
 - ❌ x86_64 only (ARM64 not yet supported)
+- ❌ No fork() syscall (pthreads and execve work)
 - ❌ No per-container network isolation (all containers share same TUN IP)
 - ❌ No cgroup resource limits
 - ❌ Symlinks flattened to regular files

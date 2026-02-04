@@ -95,17 +95,42 @@ LiteBox emulates syscalls in userspace. Most common syscalls are supported:
 ### Fully Supported
 - File operations: `open`, `read`, `write`, `close`, `stat`, `fstat`, `lstat`, `statx`, `statfs`
 - Directory operations: `mkdir`, `rmdir`, `getdents`
-- Process operations: `fork`, `execve`, `exit`, `wait`
+- Process operations: `execve`, `exit`, `wait`, `clone` (threads only)
 - Memory operations: `mmap`, `munmap`, `brk`
 - Misc: `getcwd`, `chdir`, `uname`
 
 ### Partially Supported
 - `ioctl` - Limited terminal ioctls
 - `fcntl` - Basic operations only
+- `clone` - Threads only (`CLONE_VM|CLONE_THREAD`), not full processes
 
-### Not Supported (warnings only)
-- `lgetxattr`, `listxattr` - Extended attributes
+### Not Supported
+- `fork`, `vfork` - Returns ENOSYS (use execve directly)
+- `lgetxattr`, `listxattr` - Extended attributes (warnings only)
 - `inotify_*` - File watching
+
+## Process Model
+
+LiteBox supports multi-threading but not multi-processing:
+
+| Syscall | Status | Notes |
+|---------|--------|-------|
+| `clone` (threads) | ✅ Supported | With `CLONE_VM\|CLONE_THREAD` flags |
+| `execve` | ✅ Supported | Replaces current process |
+| `fork` | ❌ Not supported | Returns ENOSYS |
+| `vfork` | ❌ Not supported | Returns ENOSYS |
+
+**What works:**
+- Multi-threaded applications (pthreads, Go goroutines, Rust threads)
+- Direct command execution (`/bin/ls`, `/usr/bin/python script.py`)
+- Programs using execve to run other programs
+
+**What doesn't work:**
+- Shell scripts running external commands (`sh -c "ls"`)
+- Traditional fork-then-exec patterns
+- Daemon-style process spawning
+
+**Workaround:** Instead of `["sh", "-c", "command"]`, use direct execution `["/path/to/command", "args"]`.
 
 ## Virtual /proc Filesystem
 

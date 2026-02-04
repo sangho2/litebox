@@ -2,6 +2,63 @@
 
 Common issues and solutions when using litebox-oci.
 
+## Shell Scripts and fork() Limitation
+
+### "can't fork: Function not implemented"
+
+**Problem:** Shell scripts that run external commands fail with fork error.
+
+**Cause:** LiteBox doesn't support `fork()` syscall. Shell needs fork to run external commands.
+
+**What works:**
+```bash
+# Direct execution (no shell)
+args: ["/bin/ls", "/"]
+
+# Shell built-ins only
+args: ["/bin/sh", "-c", "echo hello; pwd; echo $((1+2))"]
+
+# Use exec for ONE external command (replaces shell)
+args: ["/bin/sh", "-c", "VAR=setup; exec /bin/echo $VAR"]
+```
+
+**What fails:**
+```bash
+# Multiple external commands
+args: ["/bin/sh", "-c", "ls /; cat /etc/passwd"]  # FAILS
+
+# Pipes
+args: ["/bin/sh", "-c", "ls | grep bin"]  # FAILS
+
+# Command substitution
+args: ["/bin/sh", "-c", "echo $(date)"]  # FAILS
+```
+
+**Workarounds:**
+
+1. **Direct execution** - Run commands directly without shell wrapper:
+   ```json
+   // Instead of: ["sh", "-c", "ls -la /"]
+   // Use:
+   {"args": ["/bin/ls", "-la", "/"]}
+   ```
+
+2. **Use shell built-ins** - `echo`, `pwd`, `cd`, `export`, `[`, `test`, arithmetic `$((...))`:
+   ```json
+   {"args": ["/bin/sh", "-c", "echo Hello; pwd; [ -f /etc/passwd ] && echo exists"]}
+   ```
+
+3. **exec for final command** - Use `exec` to run one external command:
+   ```json
+   {"args": ["/bin/sh", "-c", "export VAR=value; exec /bin/myapp"]}
+   ```
+
+4. **Multiple container runs** - Run commands separately:
+   ```bash
+   litebox-oci run -b /bundle c1 -- /bin/ls /
+   litebox-oci run -b /bundle c2 -- /bin/cat /etc/passwd
+   ```
+
 ## Container Creation Issues
 
 ### "container already exists"

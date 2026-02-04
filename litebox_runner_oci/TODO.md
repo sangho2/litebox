@@ -37,7 +37,7 @@
 
 ### Short-term
 - [ ] Test with more container images (debian, ubuntu, fedora)
-- [ ] Test with multi-process workloads
+- [x] Test with multi-process workloads (pthreads ✓, execve ✓, fork ✗)
 
 ### Medium-term
 - [ ] Implement console-socket for TTY support
@@ -51,7 +51,7 @@
 - [ ] ARM64 support (requires rtld_audit.so port)
 - [ ] Per-container network isolation (multiple TUN devices or veth pairs)
 - [ ] Raw socket support (SOCK_RAW for ping/ICMP)
-- [ ] Support for more syscalls
+- [ ] fork() support (see notes below)
 - [ ] seccomp backend improvements
 - [ ] Audit syscall emulation for security gaps
 - [ ] Support for capabilities
@@ -65,6 +65,7 @@
 4. **Alpine cleanup segfault**: Sometimes segfaults during cleanup (doesn't affect execution)
 5. **Raw sockets not supported**: ping and other ICMP tools fail (SOCK_RAW not implemented in litebox)
 6. **Some TCP edge cases**: Certain socket state transitions cause panics in smoltcp stack
+7. **fork() not supported**: Shell scripts can't run external commands (use direct exec instead)
 
 ## Notes
 
@@ -93,6 +94,30 @@ TUN-based networking uses LiteBox's smoltcp TCP/IP stack:
 - Gateway: `10.0.0.1` (host TUN interface)
 - Supports: TCP, UDP sockets
 - Not supported: Raw sockets (ICMP/ping)
+
+### Multi-threading and Process Model
+
+LiteBox supports **pthreads** (multi-threading) and **execve**, but not **fork()**:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| pthreads | ✅ Supported | `clone()` with `CLONE_VM\|CLONE_THREAD` |
+| execve | ✅ Supported | Replaces current process image |
+| fork | ❌ Not supported | Returns ENOSYS |
+
+**Implications:**
+- Multi-threaded applications (Go, Rust, Java, Python threads) work
+- Direct command execution works (`/bin/ls`, `/usr/bin/python`)
+- Shell scripts calling external commands fail (sh needs fork)
+- Traditional fork-then-exec patterns don't work
+
+**Workaround:** Run commands directly instead of through shell:
+```json
+// Instead of: ["sh", "-c", "ls /"]
+// Use:        ["/bin/ls", "/"]
+```
+
+**Future:** Implementing fork would require forking the LiteBox process itself while sharing the emulated address space across instances. This technique was used in kernel-mode LiteBox but hasn't been ported to userspace yet.
 
 ### Virtual /proc Filesystem
 
