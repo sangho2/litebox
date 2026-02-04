@@ -54,6 +54,8 @@ impl EpollDescriptor {
             Descriptor::Eventfd { file, .. } => Ok(EpollDescriptor::Eventfd(file.clone())),
             Descriptor::Epoll { file, .. } => Ok(EpollDescriptor::Epoll(file.clone())),
             Descriptor::Unix { file, .. } => Ok(EpollDescriptor::Unix(file.clone())),
+            // Proc files don't support epoll
+            Descriptor::Proc { .. } => Err(Errno::EPERM),
         }
     }
 }

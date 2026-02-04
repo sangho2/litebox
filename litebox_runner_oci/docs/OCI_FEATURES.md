@@ -93,7 +93,7 @@ These flags extend OCI functionality for the `run` and `exec` commands:
 LiteBox emulates syscalls in userspace. Most common syscalls are supported:
 
 ### Fully Supported
-- File operations: `open`, `read`, `write`, `close`, `stat`, `fstat`, `lstat`
+- File operations: `open`, `read`, `write`, `close`, `stat`, `fstat`, `lstat`, `statx`, `statfs`
 - Directory operations: `mkdir`, `rmdir`, `getdents`
 - Process operations: `fork`, `execve`, `exit`, `wait`
 - Memory operations: `mmap`, `munmap`, `brk`
@@ -106,6 +106,37 @@ LiteBox emulates syscalls in userspace. Most common syscalls are supported:
 ### Not Supported (warnings only)
 - `lgetxattr`, `listxattr` - Extended attributes
 - `inotify_*` - File watching
+
+## Virtual /proc Filesystem
+
+LiteBox emulates a subset of `/proc` to enable common container tools:
+
+### Supported /proc Files
+
+| Path | Description | Used by |
+|------|-------------|---------|
+| `/proc/cpuinfo` | CPU information | Various tools |
+| `/proc/meminfo` | Memory statistics | `free`, monitoring tools |
+| `/proc/mounts` | Mount points | `df`, `mount` |
+| `/proc/stat` | System statistics | Performance tools |
+| `/proc/version` | Kernel version | `uname`, scripts |
+| `/proc/uptime` | System uptime | `uptime` |
+| `/proc/loadavg` | Load averages | `uptime`, `top` |
+| `/proc/filesystems` | Supported filesystems | `mount` |
+| `/proc/self/stat` | Process status (raw) | Process tools |
+| `/proc/self/status` | Process status (readable) | `ps`, scripts |
+| `/proc/self/cmdline` | Command line | `ps`, process info |
+| `/proc/self/environ` | Environment variables | Debug tools |
+| `/proc/self/exe` | Executable path (symlink) | Self-discovery |
+| `/proc/self/cwd` | Working directory (symlink) | Self-discovery |
+| `/proc/self/maps` | Memory mappings | Debug tools |
+| `/proc/self/fd/<n>` | File descriptor symlinks | Debug tools |
+| `/proc/<pid>/*` | Same as `/proc/self/*` | |
+
+### Not Supported /proc Files
+- `/proc/net/*` - Network statistics
+- `/proc/sys/*` (except hostname, osrelease) - Kernel parameters
+- `/proc/interrupts`, `/proc/ioports` - Hardware info
 
 ## Networking
 

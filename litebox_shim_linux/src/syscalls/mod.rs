@@ -10,6 +10,7 @@ pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
 pub mod process;
+pub mod procfs;
 pub(crate) mod unix;
 
 pub(crate) mod signal;

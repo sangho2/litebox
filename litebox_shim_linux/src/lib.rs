@@ -481,6 +481,15 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    /// Virtual /proc file
+    Proc {
+        file: syscalls::procfs::ProcFile,
+        /// Content of the proc file (generated on open)
+        content: alloc::vec::Vec<u8>,
+        /// Current read position
+        position: core::sync::atomic::AtomicUsize,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 /// A strongly-typed FD.

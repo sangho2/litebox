@@ -29,6 +29,9 @@
 - [x] `--stdout` and `--stderr` for stdio redirection
 - [x] Cache rewritten binaries for faster subsequent runs
 - [x] TUN-based networking via `--tun-device` flag (TCP/UDP supported, raw sockets not yet)
+- [x] statx syscall implementation
+- [x] statfs/fstatfs syscall implementation
+- [x] Virtual /proc filesystem emulation (cpuinfo, meminfo, mounts, stat, status, etc.)
 
 ## TODO
 
@@ -90,3 +93,22 @@ TUN-based networking uses LiteBox's smoltcp TCP/IP stack:
 - Gateway: `10.0.0.1` (host TUN interface)
 - Supports: TCP, UDP sockets
 - Not supported: Raw sockets (ICMP/ping)
+
+### Virtual /proc Filesystem
+
+LiteBox emulates a subset of /proc for container compatibility:
+- `/proc/cpuinfo` - CPU information
+- `/proc/meminfo` - Memory statistics
+- `/proc/mounts` - Mount points (for `df` command)
+- `/proc/stat` - System statistics
+- `/proc/version` - Kernel version string
+- `/proc/loadavg` - Load averages
+- `/proc/uptime` - System uptime
+- `/proc/filesystems` - Supported filesystems
+- `/proc/self/stat` - Process status
+- `/proc/self/status` - Human-readable process status
+- `/proc/self/cmdline` - Command line arguments
+- `/proc/self/environ` - Environment variables
+- `/proc/self/exe` - Executable path (symlink)
+- `/proc/self/cwd` - Current directory (symlink)
+- `/proc/self/maps` - Memory mappings

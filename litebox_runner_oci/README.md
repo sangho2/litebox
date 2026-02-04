@@ -197,6 +197,50 @@ rm -rf ~/.cache/litebox-oci/rewritten/
 - ✅ Stdio redirection (`--stdout`, `--stderr`)
 - ✅ Binary caching for faster subsequent runs
 - ✅ TUN-based networking (`--tun-device`)
+- ✅ Virtual /proc filesystem (cpuinfo, meminfo, mounts, etc.)
+
+### Virtual /proc Filesystem
+
+LiteBox emulates essential `/proc` files for container compatibility:
+
+```bash
+# CPU information
+cat /proc/cpuinfo
+
+# Memory statistics
+cat /proc/meminfo
+
+# Mount points (enables `df` command)
+cat /proc/mounts
+df -h
+
+# Process information
+cat /proc/self/status
+cat /proc/self/cmdline
+
+# System info
+cat /proc/version
+cat /proc/uptime
+cat /proc/loadavg
+```
+
+**Supported /proc files:**
+- `/proc/cpuinfo` - CPU information
+- `/proc/meminfo` - Memory statistics
+- `/proc/mounts` - Mount points
+- `/proc/stat` - System statistics
+- `/proc/version` - Kernel version string
+- `/proc/uptime` - System uptime
+- `/proc/loadavg` - Load averages
+- `/proc/filesystems` - Supported filesystems
+- `/proc/self/stat` - Process status
+- `/proc/self/status` - Human-readable status
+- `/proc/self/cmdline` - Command line
+- `/proc/self/environ` - Environment variables
+- `/proc/self/exe` - Executable path (symlink)
+- `/proc/self/cwd` - Working directory (symlink)
+- `/proc/self/maps` - Memory mappings
+- `/proc/<pid>/*` - Same as /proc/self/*
 
 ## Limitations
 

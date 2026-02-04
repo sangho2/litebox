@@ -23,6 +23,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
+use crate::syscalls::procfs::{ProcContext, ProcFile, generate_proc_content};
 use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, Task};
 use core::sync::atomic::Ordering;
 
@@ -132,8 +133,17 @@ impl Task {
 
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+        // Check if this is a /proc path
+        let path_str = path.normalized()?;
+        if let Some(proc_file) = ProcFile::from_path(&path_str) {
+            return self.sys_open_proc(proc_file, flags);
+        }
+
         let mode = mode & !self.get_umask();
-        let file = self.global.fs.open(path, flags - OFlags::CLOEXEC, mode)?;
+        let file = self
+            .global
+            .fs
+            .open(path_str, flags - OFlags::CLOEXEC, mode)?;
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -151,6 +161,74 @@ impl Task {
             .write()
             .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+    }
+
+    /// Open a virtual /proc file
+    fn sys_open_proc(&self, proc_file: ProcFile, flags: OFlags) -> Result<u32, Errno> {
+        // /proc files are read-only (except some we don't emulate)
+        if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
+            return Err(Errno::EACCES);
+        }
+
+        // Get process context for content generation
+        let proc_ctx = self.get_proc_context();
+
+        // Generate the content for this proc file
+        let content = generate_proc_content(&proc_file, &proc_ctx);
+
+        let files = self.files.borrow();
+        files
+            .file_descriptors
+            .write()
+            .insert(
+                self,
+                Descriptor::Proc {
+                    file: proc_file,
+                    content,
+                    position: core::sync::atomic::AtomicUsize::new(0),
+                    close_on_exec: core::sync::atomic::AtomicBool::new(
+                        flags.contains(OFlags::CLOEXEC),
+                    ),
+                },
+            )
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+    }
+
+    /// Get the process context for /proc content generation
+    fn get_proc_context(&self) -> ProcContext {
+        // Get comm (command name) from the task
+        let comm_bytes = self.comm.get();
+        let comm_len = comm_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(comm_bytes.len());
+        let comm = String::from_utf8_lossy(&comm_bytes[..comm_len]).into_owned();
+
+        // Get credentials
+        let creds = &self.credentials;
+
+        // Create a minimal proc context
+        // Note: We don't have access to the original argv/environ after loading
+        #[allow(clippy::cast_sign_loss)]
+        ProcContext {
+            pid: self.pid as u32,
+            ppid: self.ppid as u32,
+            uid: creds.uid,
+            gid: creds.gid,
+            exe_path: if comm.is_empty() {
+                "/bin/unknown".into()
+            } else {
+                alloc::format!("/usr/bin/{comm}")
+            },
+            cmdline: if comm.is_empty() {
+                vec![]
+            } else {
+                vec![comm.clone()]
+            },
+            environ: vec![], // We don't store environ, but could add placeholder
+            cwd: "/".into(), // We could get this from fs if stored
+            hostname: "litebox".into(),
+        }
     }
 
     /// Handle syscall `openat`
@@ -290,6 +368,30 @@ impl Task {
                 litebox_common_linux::ReceiveFlags::empty(),
                 None,
             ),
+            Descriptor::Proc {
+                content, position, ..
+            } => {
+                // Read from the virtual proc file content
+                let read_pos = if let Some(off) = offset {
+                    off
+                } else {
+                    position.load(Ordering::Relaxed)
+                };
+
+                if read_pos >= content.len() {
+                    return Ok(0); // EOF
+                }
+
+                let remaining = content.len() - read_pos;
+                let to_read = buf.len().min(remaining);
+                buf[..to_read].copy_from_slice(&content[read_pos..read_pos + to_read]);
+
+                if offset.is_none() {
+                    position.store(read_pos + to_read, Ordering::Relaxed);
+                }
+
+                Ok(to_read)
+            }
         }
     }
 
@@ -343,6 +445,10 @@ impl Task {
             }
             Descriptor::Unix { file, .. } => {
                 file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+            }
+            Descriptor::Proc { .. } => {
+                // /proc files are read-only
+                Err(Errno::EBADF)
             }
         };
         if let Err(Errno::EPIPE) = res {
@@ -398,6 +504,20 @@ impl Task {
             Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
                 Err(Errno::ESPIPE)
             }
+            Descriptor::Proc {
+                position, content, ..
+            } => {
+                // Support seeking in proc files
+                let pos = position.load(Ordering::Relaxed);
+                #[allow(clippy::cast_sign_loss)]
+                let new_pos = match whence {
+                    SeekWhence::RelativeToBeginning => offset as usize,
+                    SeekWhence::RelativeToCurrentOffset => (pos as isize + offset) as usize,
+                    SeekWhence::RelativeToEnd => (content.len() as isize + offset) as usize,
+                };
+                position.store(new_pos, Ordering::Relaxed);
+                Ok(new_pos)
+            }
         }
     }
 
@@ -445,9 +565,10 @@ impl Task {
                     }
                 }
             }
-            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                Ok(())
-            }
+            Descriptor::Eventfd { .. }
+            | Descriptor::Epoll { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Proc { .. } => Ok(()),
         }
     }
 
@@ -517,6 +638,22 @@ impl Task {
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
                 Descriptor::Eventfd { .. } => todo!(),
                 Descriptor::Unix { .. } => todo!(),
+                Descriptor::Proc {
+                    content, position, ..
+                } => {
+                    // Read from proc file
+                    let read_pos = position.load(Ordering::Relaxed);
+                    if read_pos >= content.len() {
+                        0 // EOF
+                    } else {
+                        let remaining = content.len() - read_pos;
+                        let to_read = kernel_buffer.len().min(remaining);
+                        kernel_buffer[..to_read]
+                            .copy_from_slice(&content[read_pos..read_pos + to_read]);
+                        position.store(read_pos + to_read, Ordering::Relaxed);
+                        to_read
+                    }
+                }
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -603,6 +740,8 @@ impl Task {
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
+            // /proc files are read-only
+            Descriptor::Proc { .. } => Err(Errno::EBADF),
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -793,6 +932,23 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
+            Descriptor::Proc { content, .. } => FileStat {
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: (litebox_common_linux::InodeType::File as u32
+                    | Mode::RUSR.bits()
+                    | Mode::RGRP.bits()
+                    | Mode::ROTH.bits())
+                .truncate(),
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: content.len().try_into().unwrap_or(0),
+                st_blksize: 4096,
+                st_blocks: 0,
+                ..Default::default()
+            },
         };
         Ok(fstat)
     }
@@ -823,7 +979,8 @@ impl Descriptor {
             ),
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => Ok(
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Proc { close_on_exec, .. } => Ok(
                 if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                     FileDescriptorFlags::FD_CLOEXEC
                 } else {
@@ -858,7 +1015,8 @@ impl Descriptor {
             )?,
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => {
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Proc { close_on_exec, .. } => {
                 close_on_exec.store(
                     flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                     core::sync::atomic::Ordering::Relaxed,
@@ -872,6 +1030,31 @@ impl Descriptor {
 impl Task {
     fn do_stat(&self, pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
         let normalized_path = pathname.normalized()?;
+
+        // Check if this is a /proc path
+        if let Some(proc_file) = ProcFile::from_path(&normalized_path) {
+            // For /proc files, return a synthetic stat
+            let proc_ctx = self.get_proc_context();
+            let content = generate_proc_content(&proc_file, &proc_ctx);
+            return Ok(FileStat {
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: (litebox_common_linux::InodeType::File as u32
+                    | Mode::RUSR.bits()
+                    | Mode::RGRP.bits()
+                    | Mode::ROTH.bits())
+                .truncate(),
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: content.len().try_into().unwrap_or(0),
+                st_blksize: 4096,
+                st_blocks: 0,
+                ..Default::default()
+            });
+        }
+
         let path = if follow_symlink {
             // TODO: `do_readlink` assumes the path is absolute
             self.do_readlink(normalized_path.as_str())
@@ -1197,6 +1380,8 @@ impl Task {
                 Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
+                // Proc files are read-only
+                Descriptor::Proc { .. } => Ok(OFlags::RDONLY.bits()),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1278,6 +1463,8 @@ impl Task {
                     Descriptor::Unix { file, .. } => {
                         toggle_flags!(file);
                     }
+                    // Proc files don't support flag changes
+                    Descriptor::Proc { .. } => {}
                 }
                 Ok(0)
             }
@@ -1558,6 +1745,8 @@ impl Task {
                     Descriptor::Unix { file, .. } => {
                         file.set_status(OFlags::NONBLOCK, val != 0);
                     }
+                    // Proc files don't support FIONBIO
+                    Descriptor::Proc { .. } => {}
                 }
                 Ok(0)
             }
@@ -1577,7 +1766,8 @@ impl Task {
                 )?,
                 Descriptor::Eventfd { close_on_exec, .. }
                 | Descriptor::Epoll { close_on_exec, .. }
-                | Descriptor::Unix { close_on_exec, .. } => {
+                | Descriptor::Unix { close_on_exec, .. }
+                | Descriptor::Proc { close_on_exec, .. } => {
                     close_on_exec.store(true, core::sync::atomic::Ordering::Relaxed);
                     Ok(0)
                 }
@@ -1598,9 +1788,10 @@ impl Task {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
-                Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                    Err(Errno::ENOTTY)
-                }
+                Descriptor::Eventfd { .. }
+                | Descriptor::Epoll { .. }
+                | Descriptor::Unix { .. }
+                | Descriptor::Proc { .. } => Err(Errno::ENOTTY),
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1962,6 +2153,12 @@ impl Task {
             }),
             Descriptor::Unix { file, .. } => Ok(Descriptor::Unix {
                 file: file.clone(),
+                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+            }),
+            Descriptor::Proc { file, content, .. } => Ok(Descriptor::Proc {
+                file: file.clone(),
+                content: content.clone(),
+                position: core::sync::atomic::AtomicUsize::new(0),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),
         }
