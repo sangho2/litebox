@@ -27,7 +27,10 @@ fn cache_dir() -> PathBuf {
     std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), |h| PathBuf::from(h).join(".cache"))
+            std::env::var("HOME").map_or_else(
+                |_| PathBuf::from("/tmp"),
+                |h| PathBuf::from(h).join(".cache"),
+            )
         })
         .join("litebox-oci")
         .join("rewritten")
@@ -106,6 +109,14 @@ pub struct StdioRedirect {
     pub stderr: Option<PathBuf>,
 }
 
+/// Network configuration for container.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkConfig {
+    /// TUN device name to use for networking (e.g., "tun99").
+    /// If None, networking syscalls will fail.
+    pub tun_device: Option<String>,
+}
+
 /// Run an OCI container using LiteBox sandbox.
 ///
 /// This function:
@@ -120,7 +131,14 @@ pub struct StdioRedirect {
 /// - Path conversion to string fails for non-UTF8 paths
 /// - File creation in the sandbox fails
 pub fn run_container(bundle_path: &Path) -> Result<i32> {
-    run_container_internal(bundle_path, None, &[], &[], &StdioRedirect::default())
+    run_container_internal(
+        bundle_path,
+        None,
+        &[],
+        &[],
+        &StdioRedirect::default(),
+        &NetworkConfig::default(),
+    )
 }
 
 /// Run a container with additional environment variables and mounts.
@@ -135,6 +153,7 @@ pub fn run_container_with_options(
         extra_env,
         mounts,
         &StdioRedirect::default(),
+        &NetworkConfig::default(),
     )
 }
 
@@ -154,23 +173,32 @@ pub fn run_container_with_all_options(
         extra_env,
         mounts,
         &StdioRedirect::default(),
+        &NetworkConfig::default(),
     )
 }
 
-/// Run a container with full control over all options including stdio redirection.
+/// Run a container with full control over all options including stdio redirection and networking.
 pub fn run_container_full(
     bundle_path: &Path,
     override_args: Option<&[String]>,
     extra_env: &[String],
     mounts: &[Mount],
     stdio: &StdioRedirect,
+    network: &NetworkConfig,
 ) -> Result<i32> {
     if let Some(args) = override_args
         && args.is_empty()
     {
         anyhow::bail!("exec command cannot be empty");
     }
-    run_container_internal(bundle_path, override_args, extra_env, mounts, stdio)
+    run_container_internal(
+        bundle_path,
+        override_args,
+        extra_env,
+        mounts,
+        stdio,
+        network,
+    )
 }
 
 /// Internal implementation that handles both regular run and exec.
@@ -180,6 +208,7 @@ fn run_container_internal(
     extra_env: &[String],
     mounts: &[Mount],
     stdio: &StdioRedirect,
+    network: &NetworkConfig,
 ) -> Result<i32> {
     // Set up stdio redirection before running
     let _stdout_guard = if let Some(path) = &stdio.stdout {
@@ -245,11 +274,12 @@ fn run_container_internal(
     tracing::info!(
         rootfs = %rootfs_path.display(),
         args = ?args,
+        tun_device = ?network.tun_device,
         "starting LiteBox OCI container"
     );
 
-    // Initialize LiteBox platform
-    let platform = Platform::new(None);
+    // Initialize LiteBox platform with optional TUN networking
+    let platform = Platform::new(network.tun_device.as_deref());
     litebox_platform_multiplex::set_platform(platform);
 
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();

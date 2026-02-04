@@ -144,6 +144,12 @@ enum Command {
         /// Redirect stderr to a file
         #[clap(long, value_name = "FILE")]
         stderr: Option<PathBuf>,
+
+        /// TUN device name for container networking (e.g., "tun99").
+        /// Requires a pre-configured TUN device on the host.
+        /// See litebox_platform_linux_userland/scripts/tun-setup.sh
+        #[clap(long, value_name = "DEVICE")]
+        tun_device: Option<String>,
     },
 
     /// Execute a command in a container's rootfs (simplified exec)
@@ -166,6 +172,11 @@ enum Command {
         /// Format: source=<path>,destination=<path>[,readonly]
         #[clap(short, long, value_name = "MOUNT_SPEC")]
         mount: Vec<String>,
+
+        /// TUN device name for container networking (e.g., "tun99").
+        /// Requires a pre-configured TUN device on the host.
+        #[clap(long, value_name = "DEVICE")]
+        tun_device: Option<String>,
 
         /// Command and arguments to execute
         #[clap(required = true, num_args = 1..)]
@@ -392,10 +403,12 @@ fn main() -> Result<()> {
             mount,
             stdout,
             stderr,
+            tun_device,
         } => {
             tracing::info!(
                 container_id = %container_id,
                 bundle = %bundle.display(),
+                tun_device = ?tun_device,
                 "running container"
             );
 
@@ -409,10 +422,16 @@ fn main() -> Result<()> {
                 stderr: stderr.clone(),
             };
 
+            // Set up network configuration
+            let network = litebox_runner_oci::NetworkConfig {
+                tun_device: tun_device.clone(),
+            };
+
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
             let mounts = parse_mounts(&mount)?;
-            let exit_code =
-                litebox_runner_oci::run_container_full(&bundle, None, &extra_env, &mounts, &stdio)?;
+            let exit_code = litebox_runner_oci::run_container_full(
+                &bundle, None, &extra_env, &mounts, &stdio, &network,
+            )?;
             std::process::exit(exit_code);
         }
 
@@ -421,11 +440,13 @@ fn main() -> Result<()> {
             env,
             env_file,
             mount,
+            tun_device,
             command,
         } => {
             tracing::info!(
                 container_id = %container_id,
                 command = ?command,
+                tun_device = ?tun_device,
                 "exec in container"
             );
 
@@ -435,11 +456,21 @@ fn main() -> Result<()> {
             // Container must exist (any status is fine for exec)
             let bundle = state.bundle;
 
+            // Set up network configuration
+            let network = litebox_runner_oci::NetworkConfig {
+                tun_device: tun_device.clone(),
+            };
+
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
             let mounts = parse_mounts(&mount)?;
-            // Run with overridden command, extra env, and mounts
-            let exit_code = litebox_runner_oci::run_container_with_all_options(
-                &bundle, &command, &extra_env, &mounts,
+            // Run with overridden command, extra env, mounts, and networking
+            let exit_code = litebox_runner_oci::run_container_full(
+                &bundle,
+                Some(&command),
+                &extra_env,
+                &mounts,
+                &litebox_runner_oci::StdioRedirect::default(),
+                &network,
             )?;
             std::process::exit(exit_code);
         }
@@ -452,6 +483,7 @@ fn main() -> Result<()> {
             println!("  - Userspace syscall emulation via LiteBox");
             println!("  - In-memory filesystem isolation");
             println!("  - Syscall rewriting for interception");
+            println!("  - TUN-based networking (--tun-device)");
             println!();
             println!("OCI Lifecycle Commands:");
             println!("  create  - Create a container");

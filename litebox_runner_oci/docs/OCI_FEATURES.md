@@ -106,7 +106,41 @@ LiteBox emulates syscalls in userspace. Most common syscalls are supported:
 ### Not Supported (warnings only)
 - `lgetxattr`, `listxattr` - Extended attributes
 - `inotify_*` - File watching
-- Network syscalls - No network emulation
+
+## Networking
+
+### TUN-based Networking
+
+Container networking is supported via TUN devices using the `--tun-device` flag:
+
+```bash
+# Set up TUN on host
+sudo litebox_platform_linux_userland/scripts/tun-setup.sh -t tun99 -i 10.0.0.1
+
+# Run with networking
+litebox-oci run -b /bundle --tun-device tun99 my-container
+```
+
+**How it works:**
+- LiteBox implements a TCP/IP stack using `smoltcp`
+- Socket syscalls (`socket`, `connect`, `bind`, `listen`, `accept`, etc.) are intercepted
+- IP packets are sent/received through the TUN device
+- Container IP: `10.0.0.2/24` (hardcoded)
+- Gateway: `10.0.0.1` (host TUN interface)
+
+**Supported socket operations:**
+- TCP: `socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`, `close`
+- UDP: `socket`, `bind`, `sendto`/`recvfrom`, `close`
+
+**Not yet supported:**
+- Raw sockets (SOCK_RAW) - ping won't work
+- Some socket state edge cases
+- `/proc/net/*` files
+
+**Limitations:**
+- No per-container IP isolation
+- No port mapping (requires host-side iptables)
+- No DNS resolution (needs `/etc/resolv.conf` in rootfs)
 
 ## Architectural Limitations
 
@@ -117,7 +151,7 @@ The `rtld_audit.so` library for dynamic library syscall interception is x86_64-s
 Symlinks in the rootfs are resolved and flattened to regular files during loading. This is because LiteBox's in-memory filesystem doesn't support symlinks.
 
 ### No Network Isolation
-Containers share the host's network stack. Network namespace emulation is not implemented.
+All containers using the same TUN device share the IP address `10.0.0.2`. There is no per-container network namespace isolation.
 
 ### No Resource Limits
 cgroups are not used, so CPU, memory, and I/O limits are not enforced.

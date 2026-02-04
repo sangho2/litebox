@@ -151,6 +151,24 @@ sudo ctr run --rm --runc-binary /usr/local/bin/litebox-oci \
 - **--mount**: Bind mount host directories into container (snapshot)
 - **--stdout / --stderr**: Redirect container output to files
 - **Binary caching**: Rewritten ELF binaries are cached for ~3-4x faster subsequent runs
+- **--tun-device**: Enable TUN-based networking (TCP/UDP supported)
+
+## Networking
+
+TUN-based networking connects containers to the host network:
+
+```bash
+# Set up TUN device on host (requires root)
+sudo litebox_platform_linux_userland/scripts/tun-setup.sh -t tun99 -i 10.0.0.1
+
+# Run container with networking
+litebox-oci run -b /bundle --tun-device tun99 my-container
+```
+
+- Container IP: `10.0.0.2/24`
+- Gateway: `10.0.0.1`
+- Supported: TCP and UDP sockets
+- Not supported: Raw sockets (ping won't work)
 
 ## Performance
 
@@ -168,8 +186,9 @@ The cache is automatically invalidated when binary content changes.
 - [ ] Implement console-socket for TTY support
 - [ ] Kubernetes/CRI-O integration testing
 - [ ] Lazy file loading (load on first access)
-- [ ] Support for more syscalls
+- [ ] Raw socket support (ICMP/ping)
 - [ ] ARM64 support for rtld_audit.so
+- [ ] Per-container network isolation
 
 ## References
 

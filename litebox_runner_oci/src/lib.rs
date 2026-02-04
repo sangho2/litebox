@@ -20,6 +20,7 @@ mod runner;
 pub mod state;
 
 pub use runner::Mount;
+pub use runner::NetworkConfig;
 pub use runner::StdioRedirect;
 pub use runner::run_container;
 pub use runner::run_container_full;

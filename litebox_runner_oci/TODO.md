@@ -28,74 +28,40 @@
 - [x] `--mount` for additional bind mounts
 - [x] `--stdout` and `--stderr` for stdio redirection
 - [x] Cache rewritten binaries for faster subsequent runs
+- [x] TUN-based networking via `--tun-device` flag (TCP/UDP supported, raw sockets not yet)
 
-## In Progress
+## TODO
 
-*None - all items completed or moved to future work*
-
-## Short-term TODO
-
-### CLI Improvements
-- [x] Add `--version` output with git commit hash
-- [x] Add `exec` command for running commands in existing containers
-- [x] Improve error messages for common failures
-
-### Testing
-- [x] Add unit tests for state.rs
-- [x] Add unit tests for lifecycle.rs
+### Short-term
 - [ ] Test with more container images (debian, ubuntu, fedora)
 - [ ] Test with multi-process workloads
 
-### Documentation
-- [x] Add README.md with quick start guide
-- [x] Document supported/unsupported OCI features
-- [x] Add troubleshooting guide
-
-## Medium-term TODO
-
-### Features
+### Medium-term
 - [ ] Implement console-socket for TTY support
-- [x] Add proper stdio redirection for container logs
-- [x] Support `--env` and `--env-file` flags
-- [x] Support `--mount` for additional bind mounts
 - [ ] Implement `events` command for container metrics
-
-### Performance
 - [ ] Optimize rootfs loading for large images
 - [ ] Lazy file loading (load on first access)
-- [x] Cache rewritten binaries
-
-### Compatibility
 - [ ] Kubernetes/CRI-O integration testing
 - [ ] Podman integration testing
-- [ ] Docker integration via containerd
 
-## Long-term TODO
-
-### Architecture
+### Long-term
 - [ ] ARM64 support (requires rtld_audit.so port)
-- [ ] Network namespace emulation
+- [ ] Per-container network isolation (multiple TUN devices or veth pairs)
+- [ ] Raw socket support (SOCK_RAW for ping/ICMP)
 - [ ] Support for more syscalls
 - [ ] seccomp backend improvements
-
-### Security
 - [ ] Audit syscall emulation for security gaps
-- [ ] Add sandboxing for the runtime itself
 - [ ] Support for capabilities
-
-### Advanced Features
 - [ ] Checkpoint/restore support
-- [ ] Live migration
-- [ ] GPU passthrough
-- [ ] Nested container support
 
 ## Known Issues
 
 1. **Large rootfs slow**: Loading python:3.11-slim (~5000 files) takes several seconds
 2. **Some syscalls unsupported**: lgetxattr, listxattr show warnings but don't break execution
-3. ~~**Timestamps wrong**: Files show "Jan 1 1970" due to incomplete time syscall support~~ *Fixed: Now defaults to 2024-01-01*
-4. **whoami fails**: Needs proper /etc/passwd and utmp support
-5. **Alpine cleanup segfault**: Sometimes segfaults during cleanup (doesn't affect execution)
+3. **whoami fails**: Needs proper /etc/passwd and utmp support
+4. **Alpine cleanup segfault**: Sometimes segfaults during cleanup (doesn't affect execution)
+5. **Raw sockets not supported**: ping and other ICMP tools fail (SOCK_RAW not implemented in litebox)
+6. **Some TCP edge cases**: Certain socket state transitions cause panics in smoltcp stack
 
 ## Notes
 
@@ -116,3 +82,11 @@ Uses existing `io.containerd.runc.v2` shim - no custom shim needed. Critical fla
 - `--log` and `--log-format` (accepted for compatibility)
 - `-b` (short for --bundle)
 - `--pid-file` (write PID for shim)
+
+### Networking
+
+TUN-based networking uses LiteBox's smoltcp TCP/IP stack:
+- Container IP: `10.0.0.2/24` (hardcoded)
+- Gateway: `10.0.0.1` (host TUN interface)
+- Supports: TCP, UDP sockets
+- Not supported: Raw sockets (ICMP/ping)

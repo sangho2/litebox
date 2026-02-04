@@ -124,6 +124,48 @@ litebox-oci exec my-container /bin/ls /
 litebox-oci exec -e DEBUG=1 -m src=/tools,dst=/tools my-container /tools/script.sh
 ```
 
+### Networking (TUN Device)
+
+Enable container networking using a TUN device:
+
+```bash
+# First, set up a TUN device on the host (requires root)
+sudo litebox_platform_linux_userland/scripts/tun-setup.sh -t tun99 -i 10.0.0.1
+
+# Run container with networking enabled
+litebox-oci run -b /bundle --tun-device tun99 my-container
+
+# Container will have IP 10.0.0.2/24, gateway 10.0.0.1
+```
+
+**Requirements:**
+- TUN device must be pre-created on the host
+- Container gets IP `10.0.0.2/24` (hardcoded in LiteBox)
+- Gateway is `10.0.0.1` (host side of TUN)
+
+**Supported:**
+- TCP sockets (`socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`)
+- UDP sockets (`socket`, `bind`, `sendto`/`recvfrom`)
+
+**Not supported:**
+- Raw sockets (ICMP ping)
+- `/proc/net/*` files
+- Some edge cases in socket state transitions
+
+**Setup host NAT for internet access:**
+
+```bash
+# Enable IP forwarding
+sudo sysctl -w net.ipv4.ip_forward=1
+
+# NAT container traffic
+sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+sudo iptables -A FORWARD -i tun99 -o eth0 -j ACCEPT
+sudo iptables -A FORWARD -i eth0 -o tun99 -m state --state RELATED,ESTABLISHED -j ACCEPT
+```
+
+**Note:** All containers using the same TUN device share the IP `10.0.0.2`. There's no per-container network isolation.
+
 ## How It Works
 
 1. **Rootfs Loading**: Container filesystem is loaded into LiteBox's in-memory filesystem
@@ -154,11 +196,12 @@ rm -rf ~/.cache/litebox-oci/rewritten/
 - ✅ Exec command for running commands in container rootfs
 - ✅ Stdio redirection (`--stdout`, `--stderr`)
 - ✅ Binary caching for faster subsequent runs
+- ✅ TUN-based networking (`--tun-device`)
 
 ## Limitations
 
 - ❌ x86_64 only (ARM64 not yet supported)
-- ❌ No network namespace emulation
+- ❌ No per-container network isolation (all containers share same TUN IP)
 - ❌ No cgroup resource limits
 - ❌ Symlinks flattened to regular files
 - ❌ Some syscalls unsupported (lgetxattr, listxattr)
