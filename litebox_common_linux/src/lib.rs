@@ -386,6 +386,174 @@ impl From<FileStat> for FileStat64 {
     }
 }
 
+// ============================================================================
+// statx syscall structures and constants
+// ============================================================================
+
+/// Linux's `statx_timestamp` struct
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    #[doc(hidden)]
+    pub __reserved: i32,
+}
+
+/// Linux's `statx` struct (kernel 4.11+)
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct Statx {
+    /// Mask of bits indicating filled fields
+    pub stx_mask: u32,
+    /// Block size for filesystem I/O
+    pub stx_blksize: u32,
+    /// Extra file attribute indicators
+    pub stx_attributes: u64,
+    /// Number of hard links
+    pub stx_nlink: u32,
+    /// User ID of owner
+    pub stx_uid: u32,
+    /// Group ID of owner
+    pub stx_gid: u32,
+    /// File type and mode
+    pub stx_mode: u16,
+    #[doc(hidden)]
+    pub __spare0: [u16; 1],
+    /// Inode number
+    pub stx_ino: u64,
+    /// Total size in bytes
+    pub stx_size: u64,
+    /// Number of 512B blocks allocated
+    pub stx_blocks: u64,
+    /// Mask to show what's supported in stx_attributes
+    pub stx_attributes_mask: u64,
+    /// Last access timestamp
+    pub stx_atime: StatxTimestamp,
+    /// File creation timestamp
+    pub stx_btime: StatxTimestamp,
+    /// Last status change timestamp
+    pub stx_ctime: StatxTimestamp,
+    /// Last modification timestamp
+    pub stx_mtime: StatxTimestamp,
+    /// Major ID of device containing file
+    pub stx_rdev_major: u32,
+    /// Minor ID of device containing file
+    pub stx_rdev_minor: u32,
+    /// Major ID of device where file resides
+    pub stx_dev_major: u32,
+    /// Minor ID of device where file resides
+    pub stx_dev_minor: u32,
+    /// Mount ID
+    pub stx_mnt_id: u64,
+    /// Memory alignment for direct I/O
+    pub stx_dio_mem_align: u32,
+    /// Offset alignment for direct I/O
+    pub stx_dio_offset_align: u32,
+    #[doc(hidden)]
+    pub __spare3: [u64; 12],
+}
+
+// STATX mask bits
+bitflags::bitflags! {
+    /// Mask bits for statx syscall indicating which fields are requested/filled
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct StatxMask: u32 {
+        /// Want stx_mode & S_IFMT
+        const TYPE = 0x0001;
+        /// Want stx_mode & ~S_IFMT
+        const MODE = 0x0002;
+        /// Want stx_nlink
+        const NLINK = 0x0004;
+        /// Want stx_uid
+        const UID = 0x0008;
+        /// Want stx_gid
+        const GID = 0x0010;
+        /// Want stx_atime
+        const ATIME = 0x0020;
+        /// Want stx_mtime
+        const MTIME = 0x0040;
+        /// Want stx_ctime
+        const CTIME = 0x0080;
+        /// Want stx_ino
+        const INO = 0x0100;
+        /// Want stx_size
+        const SIZE = 0x0200;
+        /// Want stx_blocks
+        const BLOCKS = 0x0400;
+        /// [All of the above]
+        const BASIC_STATS = 0x07ff;
+        /// Want stx_btime
+        const BTIME = 0x0800;
+        /// Want stx_mnt_id
+        const MNT_ID = 0x1000;
+        /// Want stx_dio_mem_align and stx_dio_offset_align
+        const DIOALIGN = 0x2000;
+        /// Reserved for future struct statx expansion
+        const RESERVED = 0x8000_0000;
+    }
+}
+
+// STATX flags (passed in flags argument)
+bitflags::bitflags! {
+    /// Flags for statx syscall controlling path resolution
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct StatxFlags: i32 {
+        /// Don't follow symbolic links
+        const AT_SYMLINK_NOFOLLOW = 0x100;
+        /// Allow empty relative pathname
+        const AT_EMPTY_PATH = 0x1000;
+        /// Don't automount the terminal component
+        const AT_NO_AUTOMOUNT = 0x800;
+        /// Synchronize with server (force sync)
+        const AT_STATX_FORCE_SYNC = 0x2000;
+        /// Don't sync with server
+        const AT_STATX_DONT_SYNC = 0x4000;
+        /// Mask for sync type bits
+        const AT_STATX_SYNC_TYPE = 0x6000;
+    }
+}
+
+// ============================================================================
+// statfs syscall structures
+// ============================================================================
+
+/// Linux's `statfs` struct
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct Statfs {
+    /// Type of filesystem
+    pub f_type: i64,
+    /// Optimal transfer block size
+    pub f_bsize: i64,
+    /// Total data blocks in filesystem
+    pub f_blocks: u64,
+    /// Free blocks in filesystem
+    pub f_bfree: u64,
+    /// Free blocks available to unprivileged user
+    pub f_bavail: u64,
+    /// Total file nodes in filesystem
+    pub f_files: u64,
+    /// Free file nodes in filesystem
+    pub f_ffree: u64,
+    /// Filesystem ID
+    pub f_fsid: [i32; 2],
+    /// Maximum length of filenames
+    pub f_namelen: i64,
+    /// Fragment size
+    pub f_frsize: i64,
+    /// Mount flags of filesystem
+    pub f_flags: i64,
+    /// Padding bytes reserved for future use
+    pub f_spare: [i64; 4],
+}
+
+// Filesystem type magic numbers
+/// tmpfs magic number
+pub const TMPFS_MAGIC: i64 = 0x0102_1994;
+/// In-memory filesystem (ramfs) magic
+pub const RAMFS_MAGIC: i64 = 0x858458f6;
+
 /// Linux's `iovec` struct for `writev`
 #[derive(FromBytes, IntoBytes)]
 #[repr(C, packed)]
@@ -1883,6 +2051,21 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         buf: Platform::RawMutPointer<FileStat>,
     },
+    Statx {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        flags: i32,
+        mask: u32,
+        buf: Platform::RawMutPointer<Statx>,
+    },
+    Statfs {
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<Statfs>,
+    },
+    Fstatfs {
+        fd: i32,
+        buf: Platform::RawMutPointer<Statfs>,
+    },
     Mkdir {
         pathname: Platform::RawConstPointer<i8>,
         mode: u32,
@@ -2815,8 +2998,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::statx => sys_req!(Statx { dirfd, pathname:*, flags, mask, buf:* }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
             // Noisy unsupported syscalls.
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {

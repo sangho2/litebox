@@ -18,7 +18,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, Statfs, Statx, StatxFlags, StatxMask, StatxTimestamp, TMPFS_MAGIC,
+    TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -938,6 +939,200 @@ impl Task {
             FsPath::FdRelative { .. } => todo!(),
         };
         Ok(fstat)
+    }
+
+    /// Handle syscall `statx`
+    ///
+    /// statx is a more extensible version of stat that allows requesting
+    /// specific fields and returns additional information like birth time.
+    pub fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: i32,
+        mask: u32,
+    ) -> Result<Statx, Errno> {
+        let flags = StatxFlags::from_bits(flags).ok_or(Errno::EINVAL)?;
+
+        // Check for reserved mask bit
+        if mask & StatxMask::RESERVED.bits() != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        // Get the file status using existing infrastructure
+        let files = self.files.borrow();
+        let fs_path = FsPath::new(dirfd, pathname)?;
+        let status = match fs_path {
+            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+                let follow_symlinks = !flags.contains(StatxFlags::AT_SYMLINK_NOFOLLOW);
+                // TODO: respect follow_symlinks when symlinks are supported
+                let _ = follow_symlinks;
+                let normalized = path.normalized()?;
+                self.global.fs.file_status(normalized)?
+            }
+            FsPath::Cwd => self.global.fs.file_status("")?,
+            FsPath::Fd(fd) => {
+                if !flags.contains(StatxFlags::AT_EMPTY_PATH) {
+                    return Err(Errno::ENOENT);
+                }
+                let locked_fds = files.file_descriptors.read();
+                let desc = locked_fds.get_fd(fd).ok_or(Errno::EBADF)?;
+                return desc
+                    .stat(self)
+                    .map(|fstat| Self::fstat_to_statx(&fstat, mask));
+            }
+            FsPath::FdRelative { .. } => {
+                log_unsupported!("statx with FsPath::FdRelative");
+                return Err(Errno::ENOSYS);
+            }
+        };
+
+        Ok(Self::file_status_to_statx(status, mask))
+    }
+
+    /// Convert FileStat to Statx
+    fn fstat_to_statx(fstat: &FileStat, mask: u32) -> Statx {
+        // Use a fixed reasonable timestamp (2024-01-01 00:00:00 UTC)
+        const DEFAULT_TIMESTAMP: i64 = 1704067200;
+
+        let mut filled_mask = 0u32;
+
+        // Only set mask bits for fields we actually fill
+        if mask & StatxMask::TYPE.bits() != 0 {
+            filled_mask |= StatxMask::TYPE.bits();
+        }
+        if mask & StatxMask::MODE.bits() != 0 {
+            filled_mask |= StatxMask::MODE.bits();
+        }
+        if mask & StatxMask::NLINK.bits() != 0 {
+            filled_mask |= StatxMask::NLINK.bits();
+        }
+        if mask & StatxMask::UID.bits() != 0 {
+            filled_mask |= StatxMask::UID.bits();
+        }
+        if mask & StatxMask::GID.bits() != 0 {
+            filled_mask |= StatxMask::GID.bits();
+        }
+        if mask & StatxMask::INO.bits() != 0 {
+            filled_mask |= StatxMask::INO.bits();
+        }
+        if mask & StatxMask::SIZE.bits() != 0 {
+            filled_mask |= StatxMask::SIZE.bits();
+        }
+        if mask & StatxMask::BLOCKS.bits() != 0 {
+            filled_mask |= StatxMask::BLOCKS.bits();
+        }
+        if mask & StatxMask::ATIME.bits() != 0 {
+            filled_mask |= StatxMask::ATIME.bits();
+        }
+        if mask & StatxMask::MTIME.bits() != 0 {
+            filled_mask |= StatxMask::MTIME.bits();
+        }
+        if mask & StatxMask::CTIME.bits() != 0 {
+            filled_mask |= StatxMask::CTIME.bits();
+        }
+        if mask & StatxMask::BTIME.bits() != 0 {
+            filled_mask |= StatxMask::BTIME.bits();
+        }
+
+        let timestamp = StatxTimestamp {
+            tv_sec: DEFAULT_TIMESTAMP,
+            tv_nsec: 0,
+            __reserved: 0,
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Statx {
+            stx_mask: filled_mask,
+            stx_blksize: fstat.st_blksize as u32,
+            stx_attributes: 0,
+            #[cfg(target_arch = "x86_64")]
+            stx_nlink: fstat.st_nlink as u32,
+            #[cfg(target_arch = "x86")]
+            stx_nlink: u32::from(fstat.st_nlink),
+            stx_uid: fstat.st_uid,
+            stx_gid: fstat.st_gid,
+            #[cfg(target_arch = "x86_64")]
+            stx_mode: fstat.st_mode as u16,
+            #[cfg(target_arch = "x86")]
+            stx_mode: fstat.st_mode,
+            __spare0: [0],
+            stx_ino: fstat.st_ino,
+            stx_size: fstat.st_size as u64,
+            #[cfg(target_arch = "x86_64")]
+            stx_blocks: fstat.st_blocks as u64,
+            #[cfg(target_arch = "x86")]
+            stx_blocks: u64::from(fstat.st_blocks),
+            stx_attributes_mask: 0,
+            stx_atime: timestamp.clone(),
+            stx_btime: timestamp.clone(),
+            stx_ctime: timestamp.clone(),
+            stx_mtime: timestamp,
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+            __spare3: [0; 12],
+        }
+    }
+
+    /// Convert FileStatus to Statx
+    fn file_status_to_statx(status: litebox::fs::FileStatus, mask: u32) -> Statx {
+        let fstat = FileStat::from(status);
+        Self::fstat_to_statx(&fstat, mask)
+    }
+
+    /// Handle syscall `statfs`
+    ///
+    /// Returns filesystem statistics. Since LiteBox uses an in-memory
+    /// filesystem, we return values appropriate for a tmpfs-like filesystem.
+    pub fn sys_statfs(&self, pathname: impl path::Arg) -> Result<Statfs, Errno> {
+        // Verify the path exists
+        let normalized = pathname.normalized()?;
+        let _ = self.global.fs.file_status(normalized)?;
+
+        Ok(Self::get_statfs())
+    }
+
+    /// Handle syscall `fstatfs`
+    ///
+    /// Returns filesystem statistics for a file descriptor.
+    pub fn sys_fstatfs(&self, fd: i32) -> Result<Statfs, Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        // Verify the fd exists
+        let files = self.files.borrow();
+        let _ = files
+            .file_descriptors
+            .read()
+            .get_fd(fd)
+            .ok_or(Errno::EBADF)?;
+
+        Ok(Self::get_statfs())
+    }
+
+    /// Get statfs information for the in-memory filesystem
+    fn get_statfs() -> Statfs {
+        // Return values appropriate for an in-memory tmpfs-like filesystem
+        Statfs {
+            f_type: TMPFS_MAGIC,
+            f_bsize: 4096,     // Block size
+            f_blocks: 1048576, // Total blocks (4GB worth)
+            f_bfree: 1048576,  // Free blocks (report all as free)
+            f_bavail: 1048576, // Available blocks
+            f_files: 1048576,  // Total inodes
+            f_ffree: 1048576,  // Free inodes
+            f_fsid: [0, 0],    // Filesystem ID
+            f_namelen: 255,    // Max filename length
+            f_frsize: 4096,    // Fragment size
+            f_flags: 0,        // Mount flags
+            f_spare: [0; 4],
+        }
     }
 
     pub(crate) fn sys_fcntl(

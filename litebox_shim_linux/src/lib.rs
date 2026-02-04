@@ -1020,6 +1020,33 @@ impl Task {
                         .map(|()| 0)
                 })
             }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                buf,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.sys_statx(dirfd, path, flags, mask).and_then(|statx| {
+                    buf.write_at_offset(0, statx)
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }),
+            SyscallRequest::Statfs { pathname, buf } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.sys_statfs(path).and_then(|statfs| {
+                        buf.write_at_offset(0, statfs)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                })
+            }
+            SyscallRequest::Fstatfs { fd, buf } => self.sys_fstatfs(fd).and_then(|statfs| {
+                buf.write_at_offset(0, statfs)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }),
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
