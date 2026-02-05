@@ -184,7 +184,7 @@ sudo iptables -A FORWARD -i eth0 -o tun99 -m state --state RELATED,ESTABLISHED -
 | Python 3.11-slim | 130MB | 0.38s | Debian-based |
 | Large data | 574MB | 0.37s | Memory-efficient |
 
-*Benchmarks on Ubuntu 24.04 Azure VM. See [TODO.md](TODO.md) for comprehensive results.*
+*Benchmarks on Ubuntu 24.04 Azure VM. See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results.*
 
 ### Binary Caching
 
