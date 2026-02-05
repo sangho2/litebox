@@ -6,7 +6,7 @@
 //! This runner is specifically designed for ARM64 (aarch64) architecture and supports
 //! both systrap (seccomp SIGSYS-based) and rewriter backends for syscall interception.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
@@ -122,33 +122,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             })
             .collect();
         let data = mmapped_file_data(prog)?;
-        let original_len = data.len();
         let data = if cli_args.rewrite_syscalls {
-            eprintln!(
-                "DEBUG: Rewriting syscalls in binary (original size: {})",
-                original_len
-            );
             let rewritten = litebox_syscall_rewriter_arm64::hook_syscalls_in_elf(data, None)
                 .map_err(|e| anyhow!("Failed to rewrite syscalls: {e}"))?;
-            eprintln!("DEBUG: Rewritten binary size: {}", rewritten.len());
-            // DEBUG: Write rewritten binary to disk for inspection
-            std::fs::write("/tmp/rewritten_binary", &rewritten).ok();
-            eprintln!("DEBUG: Written rewritten binary to /tmp/rewritten_binary");
-            // DEBUG: Verify trampoline at end of file
-            // Debug: check if trampoline looks correct
-            // The trampoline is at the end of the file, size is in section header sh_entsize
-            // For now, read the last section header to get the actual size
-            if rewritten.len() > 64 {
-                // Just show the last 40 bytes to verify structure
-                let start = rewritten.len() - 40;
-                eprintln!(
-                    "DEBUG: Last 40 bytes of rewritten: {:02x?}",
-                    &rewritten[start..]
-                );
-            }
             rewritten.into()
         } else {
-            eprintln!("DEBUG: NOT rewriting syscalls");
             data.into()
         };
         (modes, data)
@@ -205,54 +183,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         mode,
                     )
                     .unwrap();
-                // Debug: verify the last section header has the trampoline magic
-                if prog_data.len() > 64 {
-                    // Read e_shoff and e_shnum from ELF header
-                    let e_shoff = u64::from_le_bytes(prog_data[40..48].try_into().unwrap());
-                    let e_shentsize = u16::from_le_bytes(prog_data[58..60].try_into().unwrap());
-                    let e_shnum = u16::from_le_bytes(prog_data[60..62].try_into().unwrap());
-                    let last_sh_offset =
-                        e_shoff as usize + (e_shnum as usize - 1) * e_shentsize as usize;
-                    if last_sh_offset + 64 <= prog_data.len() {
-                        let sh_addr = u64::from_le_bytes(
-                            prog_data[last_sh_offset + 16..last_sh_offset + 24]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let sh_size = u64::from_le_bytes(
-                            prog_data[last_sh_offset + 32..last_sh_offset + 40]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        eprintln!(
-                            "DEBUG: Last section sh_addr=0x{:x}, sh_size={}",
-                            sh_addr, sh_size
-                        );
-                        eprintln!("DEBUG: Expected magic: 0x5842544c (LTBX), sh_size=0");
-                    }
-                }
                 fs.initialize_primarily_read_heavy_file(&fd, prog_data.clone());
                 fs.close(&fd).unwrap();
-                // DEBUG: Verify we can read the file back
-                let read_fd = fs
-                    .open(path, litebox::fs::OFlags::RDONLY, Mode::empty())
-                    .unwrap();
-                let file_size = fs.fd_file_status(&read_fd).unwrap().size;
-                eprintln!("DEBUG: File stored at {} with size {}", path, file_size);
-                // Read last section header to verify trampoline magic is accessible
-                if file_size >= 64 {
-                    // Read ELF header to get section header info
-                    let mut ehdr = [0u8; 64];
-                    fs.read(&read_fd, &mut ehdr, None).unwrap();
-                    let e_shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
-                    let e_shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap());
-                    let e_shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap());
-                    eprintln!(
-                        "DEBUG: e_shoff={}, e_shentsize={}, e_shnum={}",
-                        e_shoff, e_shentsize, e_shnum
-                    );
-                }
-                fs.close(&read_fd).unwrap();
             };
         let last = ancestor_modes_and_users.last().unwrap();
         if prev_user == 0 {

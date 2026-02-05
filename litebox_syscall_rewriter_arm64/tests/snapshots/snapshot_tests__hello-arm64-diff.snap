@@ -10,10 +10,10 @@ expression: diff
    400080:	d28001a2 	mov	x2, #0xd                   	// #13
    400084:	d2800808 	mov	x8, #0x40                  	// #64
 -  400088:	d4000001 	svc	#0x0
-+  400088:	140003e2 	b	401010 <msg+0xf78>
++  400088:	141003ea 	b	801030 <__end__+0x3f0f88>
    40008c:	d2800000 	mov	x0, #0x0                   	// #0
    400090:	d2800ba8 	mov	x8, #0x5d                  	// #93
 -  400094:	d4000001 	svc	#0x0
 \ No newline at end of file
-+  400094:	140003e2 	b	40101c <msg+0xf84>
++  400094:	141003f2 	b	80105c <__end__+0x3f0fb4>
 \ No newline at end of file

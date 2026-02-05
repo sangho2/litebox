@@ -240,57 +240,41 @@ STR X16, [X17, #32]      ; Save guest x17
 
 ---
 
-## Current Blocker
+## Resolved Bugs
 
-### Bug 7: Guest Crashes at PC=0 After Resuming (UNRESOLVED)
+### Bug 7: Guest Crashes at PC=0 After Resuming (FIXED)
 
 **Symptoms**:
 - Two brk syscalls complete successfully
 - Guest resumes at valid PC (0x40bd58)
 - Guest then crashes trying to execute at PC=0
 
-**Debug Output**:
-```
-DEBUG: syscall #214 at PC=0x40bd4c, x0=0x0, x16=0x0, x17=0x400c88, x30=0x400cbc
-DEBUG: call_shim END: PC=0x40bd4c, x0=0x8f9000, x30=0x400cbc, sp=0xffffffffedb0
-DEBUG: syscall #214 at PC=0x40bd58, x0=0x8f9ae8, x16=0x0, x17=0x400c88, x30=0x400cbc
-DEBUG: call_shim END: PC=0x40bd58, x0=0x8f9ae8, x30=0x400cbc, sp=0xffffffffeda0
-timeout: the monitored command dumped core
-```
+**Root Cause**:
+The LDR post-index instruction for restoring SP was incorrectly encoded:
+- Bug: `0xF840_43F0` decoded to `LDR X16, [SP], #4` (immediate = 4)
+- Fix: `0xF841_07F0` decodes to `LDR X16, [SP], #16` (immediate = 16)
 
-**Observations**:
-1. ctx.pc is valid (0x40bd58) before switch_to_guest - verified with assertion
-2. No pending signals being delivered - checked with debug output
-3. Trampoline encoding verified correct - manually decoded instructions
-4. Guest SP changes between syscalls: 0xffffffffedb0 → 0xffffffffeda0 (diff = 16 bytes)
-5. Crash is from RET with x30=0 (loaded from corrupted stack)
+The trampoline's push/pop sequence was:
+1. `STR X17, [SP, #-16]!` - decrements SP by 16
+2. `LDR X16, [SP], #4` (BUG) - increments SP by only 4
 
-**Analysis**:
-The guest code at 0x40bd58 (after brk return) does:
-```asm
-CMP X2, X0           ; Compare old brk with new brk
-B.NE 0x40bd2c        ; Branch if different
-...
-0x40bd2c:
-CBZ X2, ...          ; Check if x2 is zero
-LDR X19, [SP, #16]   ; Load from stack
-MOV X0, X2
-LDP X29, X30, [SP], #32  ; <-- This loads x30 from stack
-RET                  ; <-- If x30 is 0, we crash at PC=0
+This left SP unbalanced by 12 bytes per syscall, eventually corrupting the guest's
+stack frame and causing the `LDP X29, X30, [SP], #32` to load x30=0.
+
+**Fix**:
+Changed `litebox_syscall_rewriter_arm64/src/lib.rs`:
+```rust
+// BEFORE (wrong):
+let ldr_pop = 0xF840_43F0u32; // LDR X16, [SP], #4 (incorrect!)
+
+// AFTER (fixed):
+let ldr_pop = 0xF841_07F0u32; // LDR X16, [SP], #16
 ```
 
-The LDP instruction loads x30 from [SP+8]. If that stack location contains 0, the subsequent RET jumps to address 0.
-
-**Suspected Root Cause**:
-The 16-byte SP difference suggests the trampoline's push/pop is not fully balanced, OR the function's stack frame (saved x29/x30) is being corrupted.
-
-**Investigation Status**:
-- Verified trampoline encoding is correct
-- Verified push/pop sequence balances SP
-- Need to investigate if trampoline's push writes over saved LR location
-
-**Files with Debug Code**:
-- `litebox_platform_linux_userland/src/lib.rs` - prints syscall info, verifies ctx.pc
+**Verification**:
+- Hello world test now runs successfully
+- SP remains stable across multiple syscalls
+- All unit tests pass
 
 ---
 
@@ -357,20 +341,16 @@ litebox_syscall_rewriter_arm64/
 - Each bug fix revealed the next bug
 - Coredump analysis with GDB was essential
 - Adding verification assertions caught issues early
+- **Hardcoded instruction encodings should always be verified with an assembler**
 
 ---
 
 ## Future Work
 
-### Immediate (to fix current blocker)
-1. Add instrumentation to verify SP is balanced after trampoline
-2. Consider alternative scratch register strategy that doesn't use stack
-3. Verify trampoline doesn't overlap with caller's stack frame
-
 ### Short-term
-1. Clean up debug output once working
+1. Clean up debug output
 2. Run full test suite
-3. Update documentation
+3. Enable runner tests (currently ignored pending backend fixes)
 
 ### Medium-term
 1. Fix seccomp backend timing issues

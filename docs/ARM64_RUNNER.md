@@ -12,8 +12,8 @@ This document describes the ARM64 (aarch64) support for LiteBox, implemented in 
 | Syscall rewriter crate | ✅ Complete | ELF rewriting, trampoline generation |
 | Runner integration | ✅ Complete | CLI with backend selection |
 | Seccomp backend | ⚠️ Issues | Timing bug with SIGSYS outside guest mode |
-| Rewriter backend | 🔄 In Progress | Crash after syscall resumption |
-| Tests | ⏸️ Blocked | Waiting for backend fixes |
+| Rewriter backend | ✅ Working | Basic static binaries work |
+| Tests | 🔄 In Progress | Hello world passes, full suite pending |
 
 ## Quick Start
 

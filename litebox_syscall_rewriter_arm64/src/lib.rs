@@ -312,7 +312,7 @@ mod encoder {
     pub fn encode_str_imm(rt: u8, rn: u8, pimm: u16) -> Option<[u8; 4]> {
         assert!(rt < 32 && rn < 32);
         // pimm must be a multiple of 8 and fit in 12 bits (0-32760)
-        if pimm % 8 != 0 || pimm > 32760 {
+        if !pimm.is_multiple_of(8) || pimm > 32760 {
             return None;
         }
         let imm12 = (pimm / 8) as u32;
@@ -326,7 +326,7 @@ mod encoder {
     pub fn encode_ldr_imm(rt: u8, rn: u8, pimm: u16) -> Option<[u8; 4]> {
         assert!(rt < 32 && rn < 32);
         // pimm must be a multiple of 8 and fit in 12 bits (0-32760)
-        if pimm % 8 != 0 || pimm > 32760 {
+        if !pimm.is_multiple_of(8) || pimm > 32760 {
             return None;
         }
         let imm12 = (pimm / 8) as u32;
@@ -427,7 +427,6 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     let control_transfer_targets = get_control_transfer_targets(&builder, &text_sections);
 
     let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
-    eprintln!("DEBUG: trampoline_base_addr=0x{:x}", trampoline_base_addr);
     let mut trampoline_data = vec![];
 
     // Trampoline section layout:
@@ -804,7 +803,9 @@ fn generate_trampoline_direct(
     }
 
     // 5. LDR X16, [SP], #16 - pop original x17 into x16 (post-index)
-    let ldr_pop = 0xF840_43F0u32; // LDR X16, [SP], #16
+    // Encoding: 11 111 000 010 imm9 01 Rn Rt
+    // imm9=16 (0x010), Rn=SP(31), Rt=X16(16)
+    let ldr_pop = 0xF841_07F0u32; // LDR X16, [SP], #16
     trampoline_data.extend_from_slice(&ldr_pop.to_le_bytes());
 
     // 6. STR X16, [X17, #32] - save guest x17 (was in x16 after pop)

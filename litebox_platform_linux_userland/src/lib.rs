@@ -788,6 +788,7 @@ interrupt:
 );
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 fn set_guest_tpidr(value: usize) {
     unsafe {
         // Store guest TPIDR_EL0 in TLS
@@ -799,6 +800,7 @@ fn set_guest_tpidr(value: usize) {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 fn get_guest_tpidr() -> usize {
     unsafe {
         let tls_base: usize;
@@ -809,6 +811,7 @@ fn get_guest_tpidr() -> usize {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 fn guest_tpidr_offset() -> isize {
     // SAFETY: accessing a symbol defined in TLS
     unsafe extern "C" {
@@ -835,6 +838,7 @@ pub fn set_trampoline_base(addr: usize) {
 
 /// Get the trampoline base address (ARM64 only).
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 fn get_trampoline_base() -> usize {
     let result: usize;
     unsafe {
@@ -1953,35 +1957,6 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Debug: print syscall number and guest PC
-        let syscallno = thread_ctx.ctx.syscallno;
-        let pc = thread_ctx.ctx.pc;
-        let x0 = thread_ctx.ctx.regs[0];
-        let x16 = thread_ctx.ctx.regs[16];
-        let x17 = thread_ctx.ctx.regs[17];
-        let x30 = thread_ctx.ctx.regs[30];
-
-        // Debug: read directly from trampoline header to verify stores
-        let tb = get_trampoline_base();
-        if tb != 0 {
-            unsafe {
-                let saved_x16 = core::ptr::read_unaligned((tb + 24) as *const usize);
-                let saved_x17 = core::ptr::read_unaligned((tb + 32) as *const usize);
-                let saved_x30 = core::ptr::read_unaligned((tb + 40) as *const usize);
-                eprintln!(
-                    "DEBUG: tb=0x{:x}, header x16=0x{:x}, x17=0x{:x}, x30=0x{:x}",
-                    tb, saved_x16, saved_x17, saved_x30
-                );
-            }
-        }
-
-        eprintln!(
-            "DEBUG: syscall #{} at PC=0x{:x}, x0=0x{:x}, x16=0x{:x}, x17=0x{:x}, x30=0x{:x}",
-            syscallno, pc, x0, x16, x17, x30
-        );
-    }
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
@@ -2027,19 +2002,6 @@ impl ThreadContext<'_> {
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
     ) {
-        // Debug: Check trampoline_base before switching to guest
-        #[cfg(target_arch = "aarch64")]
-        {
-            let tb = get_trampoline_base();
-            let saved_pc = self.ctx.pc;
-            let saved_x0 = self.ctx.regs[0];
-            let saved_x30 = self.ctx.regs[30];
-            eprintln!(
-                "DEBUG: call_shim START: PC=0x{:x}, x0=0x{:x}, x30=0x{:x}, tb=0x{:x}",
-                saved_pc, saved_x0, saved_x30, tb
-            );
-        }
-
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
@@ -2066,31 +2028,6 @@ impl ThreadContext<'_> {
             }
         }
         let op = f(self.shim, self.ctx);
-        #[cfg(target_arch = "aarch64")]
-        {
-            let saved_pc = self.ctx.pc;
-            let saved_x0 = self.ctx.regs[0];
-            let saved_x30 = self.ctx.regs[30];
-            let saved_sp = self.ctx.sp;
-            eprintln!(
-                "DEBUG: call_shim END: PC=0x{:x}, x0=0x{:x}, x30=0x{:x}, sp=0x{:x}",
-                saved_pc, saved_x0, saved_x30, saved_sp
-            );
-
-            // Verify PC is valid before resuming
-            if saved_pc == 0 || saved_pc > 0xFFFF_FFFF_FFFF {
-                panic!("DEBUG: Invalid PC 0x{:x} before switch_to_guest", saved_pc);
-            }
-
-            // Also verify that ctx.pc is what we expect
-            let actual_pc = self.ctx.pc;
-            if actual_pc != saved_pc {
-                panic!(
-                    "DEBUG: ctx.pc changed from 0x{:x} to 0x{:x}",
-                    saved_pc, actual_pc
-                );
-            }
-        }
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
             ContinueOperation::ExitThread => {}
