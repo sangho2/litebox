@@ -334,6 +334,32 @@ mod encoder {
         let insn = 0xF940_0000 | (imm12 << 10) | ((rn as u32) << 5) | (rt as u32);
         Some(insn.to_le_bytes())
     }
+
+    /// Encode SUB (immediate)
+    /// SUB Xd, Xn, #imm12
+    pub fn encode_sub_imm(rd: u8, rn: u8, imm12: u16) -> Option<[u8; 4]> {
+        assert!(rd < 32 && rn < 32);
+        if imm12 > 4095 {
+            return None;
+        }
+        // SUB (immediate): sf=1 op=1 S=0 10001 shift=00 imm12 Rn Rd
+        // 1 1 0 100010 0 imm12 Rn Rd = 0xD1000000
+        let insn = 0xD100_0000 | ((imm12 as u32) << 10) | ((rn as u32) << 5) | (rd as u32);
+        Some(insn.to_le_bytes())
+    }
+
+    /// Encode ADD (immediate)
+    /// ADD Xd, Xn, #imm12
+    pub fn encode_add_imm(rd: u8, rn: u8, imm12: u16) -> Option<[u8; 4]> {
+        assert!(rd < 32 && rn < 32);
+        if imm12 > 4095 {
+            return None;
+        }
+        // ADD (immediate): sf=1 op=0 S=0 10001 shift=00 imm12 Rn Rd
+        // 1 0 0 100010 0 imm12 Rn Rd = 0x91000000
+        let insn = 0x9100_0000 | ((imm12 as u32) << 10) | ((rn as u32) << 5) | (rd as u32);
+        Some(insn.to_le_bytes())
+    }
 }
 
 /// Decode all instructions in a section
@@ -432,8 +458,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Trampoline section layout:
     // Offset 0-7:   "LITEBOX0" magic/version
     // Offset 8-15:  Handler address (written by loader)
-    // Offset 16-23: Host TLS pointer (written by switch_to_guest at runtime)
+    // Offset 16-23: Host TLS pointer (written by switch_to_guest)
     // Offset 24+:   Per-SVC trampoline entries
+    //
+    // The trampoline code loads host TLS from offset 16 using PC-relative addressing.
+    // This slot is written by switch_to_guest before entering guest code.
+    // Note: This has a race condition for multi-threading, but is necessary.
 
     // The magic prefix for the trampoline section
     trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
@@ -443,14 +473,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
 
     // Placeholder for host TLS pointer (offset 16)
-    // This will be written by switch_to_guest before entering guest code
+    // Written by switch_to_guest, read by trampoline code via PC-relative LDR
     trampoline_data.extend_from_slice(&0u64.to_le_bytes());
-
-    // Placeholders for guest registers saved by trampoline before clobbering (offsets 24-47)
-    // These are written by each trampoline entry
-    trampoline_data.extend_from_slice(&0u64.to_le_bytes()); // offset 24: guest x16
-    trampoline_data.extend_from_slice(&0u64.to_le_bytes()); // offset 32: guest x17
-    trampoline_data.extend_from_slice(&0u64.to_le_bytes()); // offset 40: guest x30
 
     let mut syscall_insns_found = false;
     for s in &text_sections {
@@ -744,105 +768,88 @@ fn generate_trampoline_direct(
     let trampoline_entry = trampoline_base_addr + trampoline_data.len() as u64;
     let return_addr = svc_insn.next_ip();
 
-    // Trampoline sequence - we must preserve x16, x17, x30 which are clobbered by this trampoline.
-    // The trampoline header layout (offsets from trampoline_base):
-    //   0-7:   magic "LITEBOX0"
-    //   8-15:  handler address
-    //   16-23: host TLS (written by switch_to_guest)
-    //   24-31: saved guest x16
-    //   32-39: saved guest x17
-    //   40-47: saved guest x30
+    // Trampoline sequence that reserves stack space itself.
+    // The trampoline loads host TLS from the trampoline header (offset 16).
+    //
+    // Stack layout after SUB:
+    //   [SP+0]:  saved x16
+    //   [SP+8]:  saved x17
+    //   [SP+16]: saved x30
+    //   [SP+24]: unused (alignment)
     //
     // Sequence:
-    // 1. Compute trampoline_base into x17 (clobbers x17 - we'll save it first via different method)
-    // 2. STR X16, [X17, #24] - save guest x16
-    // 3. MOV X16, X17 - copy base to x16 (now x17 can be restored later)
-    // 4. STR X17_original... wait, we already clobbered x17
+    // 1. SUB SP, SP, #32  - reserve 32 bytes on stack
+    // 2. STR X16, [SP, #0]  - save guest x16
+    // 3. STR X17, [SP, #8]  - save guest x17
+    // 4. STR X30, [SP, #16] - save guest x30
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
+    // 6. ADR X30, return_addr - set return address
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    // 8. BR X16             - jump to handler
     //
-    // Problem: We need a scratch register to compute the base address, but all scratch registers
-    // need to be saved first. Solution: Use the stack briefly.
-    //
-    // Revised sequence using stack:
-    // 1. STR X17, [SP, #-16]! - push x17 onto stack (pre-decrement)
-    // 2. ADR X17, trampoline_base
-    // 3. LDR X18, [X17, #16] - load host TLS
-    // 4. STR X16, [X17, #24] - save guest x16
-    // 5. LDR X16, [SP], #16 - pop original x17 into x16
-    // 6. STR X16, [X17, #32] - save guest x17 (original value from stack)
-    // 7. STR X30, [X17, #40] - save guest x30
-    // 8. ADR X30, return_addr
-    // 9. LDR X16, [X17, #8] - load handler
-    // 10. BR X16
+    // syscall_callback knows: original guest SP = current SP + 32
 
-    // 1. Push x17 onto stack (pre-index)
-    // STR X17, [SP, #-16]!
-    let str_push = 0xF81F_0FF1u32; // STR X17, [SP, #-16]!
-    trampoline_data.extend_from_slice(&str_push.to_le_bytes());
-
-    // 2. ADR X17, trampoline_base
-    let base_offset =
-        trampoline_base_addr as i64 - (trampoline_base_addr + trampoline_data.len() as u64) as i64;
-    if let Some(adr) = encoder::encode_adr(17, base_offset as i32) {
-        trampoline_data.extend_from_slice(&adr);
+    // 1. SUB SP, SP, #32
+    if let Some(sub_insn) = encoder::encode_sub_imm(31, 31, 32) {
+        trampoline_data.extend_from_slice(&sub_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 3. LDR X18, [X17, #16] - load host TLS
-    if let Some(ldr) = encoder::encode_ldr_imm(18, 17, 16) {
+    // 2. STR X16, [SP, #0]
+    if let Some(str_insn) = encoder::encode_str_imm(16, 31, 0) {
+        trampoline_data.extend_from_slice(&str_insn);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 3. STR X17, [SP, #8]
+    if let Some(str_insn) = encoder::encode_str_imm(17, 31, 8) {
+        trampoline_data.extend_from_slice(&str_insn);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 4. STR X30, [SP, #16]
+    if let Some(str_insn) = encoder::encode_str_imm(30, 31, 16) {
+        trampoline_data.extend_from_slice(&str_insn);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
+    let host_tls_location = trampoline_base_addr + 16;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let ldr_tls_offset = host_tls_location as i64 - current_pc as i64;
+    if let Some(ldr) = encoder::encode_ldr_literal(18, ldr_tls_offset as i32) {
         trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 4. STR X16, [X17, #24] - save guest x16
-    if let Some(str_insn) = encoder::encode_str_imm(16, 17, 24) {
-        trampoline_data.extend_from_slice(&str_insn);
-    } else {
-        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
-    }
-
-    // 5. LDR X16, [SP], #16 - pop original x17 into x16 (post-index)
-    // Encoding: 11 111 000 010 imm9 01 Rn Rt
-    // imm9=16 (0x010), Rn=SP(31), Rt=X16(16)
-    let ldr_pop = 0xF841_07F0u32; // LDR X16, [SP], #16
-    trampoline_data.extend_from_slice(&ldr_pop.to_le_bytes());
-
-    // 6. STR X16, [X17, #32] - save guest x17 (was in x16 after pop)
-    if let Some(str_insn) = encoder::encode_str_imm(16, 17, 32) {
-        trampoline_data.extend_from_slice(&str_insn);
-    } else {
-        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
-    }
-
-    // 7. STR X30, [X17, #40] - save guest x30
-    if let Some(str_insn) = encoder::encode_str_imm(30, 17, 40) {
-        trampoline_data.extend_from_slice(&str_insn);
-    } else {
-        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
-    }
-
-    // 8. ADR X30, return_addr
+    // 6. ADR X30, return_addr
     let adr_offset =
         return_addr as i64 - (trampoline_base_addr + trampoline_data.len() as u64) as i64;
     if let Some(adr) = encoder::encode_adr(30, adr_offset as i32) {
         trampoline_data.extend_from_slice(&adr);
     } else {
-        // Fall back to loading return address via LDR literal
-        // This is more complex - use MOV sequence instead
+        // Fall back to MOV sequence for far addresses
         for insn in encoder::encode_mov_imm64(30, return_addr) {
             trampoline_data.extend_from_slice(&insn);
         }
     }
 
-    // 9. LDR X16, [X17, #8] - load handler address from trampoline header
-    if let Some(ldr) = encoder::encode_ldr_imm(16, 17, 8) {
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    let handler_addr_location = trampoline_base_addr + 8;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let ldr_offset = handler_addr_location as i64 - current_pc as i64;
+    if let Some(ldr) = encoder::encode_ldr_literal(16, ldr_offset as i32) {
         trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 10. BR X16
+    // 8. BR X16
     trampoline_data.extend_from_slice(&encoder::encode_br(16));
 
     // Replace SVC with B to trampoline
@@ -874,45 +881,79 @@ fn generate_trampoline_indirect(
         trampoline_data.extend_from_slice(&insn.bytes);
     }
 
-    // LDR X18, [PC, #offset] - load host TLS from offset 16 in trampoline section
+    // Trampoline sequence that reserves stack space itself.
+    // The trampoline loads host TLS from the trampoline header (offset 16).
+    //
+    // Stack layout after SUB:
+    //   [SP+0]:  saved x16
+    //   [SP+8]:  saved x17
+    //   [SP+16]: saved x30
+    //   [SP+24]: unused (alignment)
+    //
+    // Sequence:
+    // 1. SUB SP, SP, #32  - reserve 32 bytes on stack
+    // 2. STR X16, [SP, #0]  - save guest x16
+    // 3. STR X17, [SP, #8]  - save guest x17
+    // 4. STR X30, [SP, #16] - save guest x30
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
+    // 6. ADR X30, return_addr - set return address
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    // 8. BR X16             - jump to handler
+    //
+    // syscall_callback knows: original guest SP = current SP + 32
+
+    // 1. SUB SP, SP, #32
+    if let Some(sub_insn) = encoder::encode_sub_imm(31, 31, 32) {
+        trampoline_data.extend_from_slice(&sub_insn);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 2. STR X16, [SP, #0]
+    if let Some(str_insn) = encoder::encode_str_imm(16, 31, 0) {
+        trampoline_data.extend_from_slice(&str_insn);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 3. STR X17, [SP, #8]
+    if let Some(str_insn) = encoder::encode_str_imm(17, 31, 8) {
+        trampoline_data.extend_from_slice(&str_insn);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 4. STR X30, [SP, #16]
+    if let Some(str_insn) = encoder::encode_str_imm(30, 31, 16) {
+        trampoline_data.extend_from_slice(&str_insn);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
     let host_tls_location = trampoline_base_addr + 16;
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_tls_offset = host_tls_location as i64 - current_pc as i64;
-
     if let Some(ldr) = encoder::encode_ldr_literal(18, ldr_tls_offset as i32) {
         trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // Save guest's X30 to trampoline header at offset 24 before clobbering it
-    let base_relative_to_current =
-        trampoline_base_addr as i64 - (trampoline_base_addr + trampoline_data.len() as u64) as i64;
-    if let Some(adr) = encoder::encode_adr(17, base_relative_to_current as i32) {
-        trampoline_data.extend_from_slice(&adr);
-    } else {
-        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
-    }
-
-    if let Some(str_insn) = encoder::encode_str_imm(30, 17, 24) {
-        trampoline_data.extend_from_slice(&str_insn);
-    } else {
-        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
-    }
-
     // Calculate where after_insns will be (after the syscall call sequence)
-    // The syscall call sequence now has additional instructions for saving X30
-    let after_insns_start = trampoline_base_addr + trampoline_data.len() as u64 + 12;
+    // Current position + ADR/MOV + LDR + BR = variable depending on ADR success
+    // We'll compute it more precisely after knowing return_addr encoding size
+    let tentative_after_insns_start = trampoline_base_addr + trampoline_data.len() as u64 + 12;
 
     // Put return address in X30 (LR) - matching systrap handler convention
     let return_addr = if after_insns.is_empty() {
         svc_insn.next_ip()
     } else {
         // Need to return to trampoline continuation (after the syscall sequence)
-        after_insns_start
+        tentative_after_insns_start
     };
 
-    // ADR X30, return_addr
+    // 6. ADR X30, return_addr
     let adr_offset =
         return_addr as i64 - (trampoline_base_addr + trampoline_data.len() as u64) as i64;
     if let Some(adr) = encoder::encode_adr(30, adr_offset as i32) {
@@ -924,18 +965,17 @@ fn generate_trampoline_indirect(
         }
     }
 
-    // LDR X16, [PC, #offset] - load handler address from offset 8 in trampoline section
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
     let handler_addr_location = trampoline_base_addr + 8;
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_offset = handler_addr_location as i64 - current_pc as i64;
-
     if let Some(ldr) = encoder::encode_ldr_literal(16, ldr_offset as i32) {
         trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // BR X16
+    // 8. BR X16
     trampoline_data.extend_from_slice(&encoder::encode_br(16));
 
     // Copy instructions after SVC (if any)

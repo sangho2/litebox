@@ -18,6 +18,7 @@ use x86 as arch;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 use zerocopy::FromZeros;
+use zerocopy::IntoBytes;
 
 use crate::syscalls::process::ExitStatus;
 use crate::{ConstPtr, MutPtr, Task};
@@ -32,10 +33,10 @@ use litebox::{
     utils::ReinterpretUnsignedExt as _,
 };
 use litebox_common_linux::signal::{
-    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
-    SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
+    SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags,
+    Ucontext, MINSIGSTKSZ, NSIG, SIG_DFL, SIG_IGN, SI_KERNEL, SI_USER,
 };
-use litebox_common_linux::{PtRegs, errno::Errno};
+use litebox_common_linux::{errno::Errno, PtRegs};
 use litebox_platform_multiplex::Platform;
 
 pub(crate) struct SignalState {
@@ -566,12 +567,20 @@ impl Task {
                             // STOP is not currently supported, so treat as
                             // terminate. Core dumps are also not currently
                             // supported.
+                            // Extract fault address from siginfo data (first 8 bytes)
+                            // Copy pad to avoid unaligned reference to packed struct
+                            let pad_copy = siginfo.data.pad;
+                            let fault_addr = u64::from_ne_bytes(
+                                pad_copy.as_bytes()[..8].try_into().unwrap_or([0u8; 8]),
+                            );
                             litebox::log_println!(
                                 self.global.platform,
-                                "-- Fatal signal {:?}: terminating task {}:{}",
+                                "-- Fatal signal {:?}: terminating task {}:{} (PC=0x{:x}, fault_addr=0x{:x})",
                                 signal,
                                 self.pid,
                                 self.tid,
+                                ctx.pc,
+                                fault_addr,
                             );
                             self.exit_group(ExitStatus::Signal(signal));
                         }

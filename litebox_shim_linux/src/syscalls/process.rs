@@ -84,6 +84,11 @@ impl ThreadState {
             self.process.detach_thread(tid);
         }
     }
+
+    /// Returns a reference to the process this thread belongs to.
+    pub(crate) fn process(&self) -> &Process {
+        &self.process
+    }
 }
 
 impl Drop for ThreadState {
@@ -125,6 +130,10 @@ pub(crate) struct Process {
     inner: Mutex<Platform, ProcessInner>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
+    /// The trampoline base address for syscall rewriting (ARM64 only).
+    /// This is shared across all threads in the process.
+    #[cfg(target_arch = "aarch64")]
+    trampoline_addr: core::sync::atomic::AtomicUsize,
 }
 
 /// The locked portion of the process state.
@@ -160,12 +169,28 @@ impl Process {
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
             limits: ResourceLimits::default(),
+            #[cfg(target_arch = "aarch64")]
+            trampoline_addr: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Returns the current number of threads in this process.
     pub fn nr_threads(&self) -> u32 {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
+    }
+
+    /// Sets the trampoline base address for syscall rewriting (ARM64 only).
+    /// This is called when the process is first started.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_trampoline_addr(&self, addr: usize) {
+        self.trampoline_addr.store(addr, Ordering::Release);
+    }
+
+    /// Gets the trampoline base address for syscall rewriting (ARM64 only).
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_trampoline_addr(&self) -> Option<usize> {
+        let addr = self.trampoline_addr.load(Ordering::Acquire);
+        if addr == 0 { None } else { Some(addr) }
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
@@ -1482,6 +1507,8 @@ impl Task {
                     // This is done through the global platform instance.
                     #[cfg(all(target_arch = "aarch64", feature = "platform_linux_userland"))]
                     if let Some(trampoline_addr) = load_info.trampoline_addr {
+                        // Store in the Process for new threads to inherit
+                        self.thread.process().set_trampoline_addr(trampoline_addr);
                         // Use the platform's function through the multiplex layer
                         use litebox::platform::RawConstPointer as _;
                         litebox_platform_multiplex::platform()
@@ -1515,6 +1542,15 @@ impl Task {
                         ctx.sp = stack;
                     }
                     ctx.regs[0] = 0; // x0 = return value from clone
+
+                    // For ARM64 rewriter backend, inherit the trampoline address from the process.
+                    // New threads need this set in their TLS for syscall interception to work.
+                    #[cfg(feature = "platform_linux_userland")]
+                    if let Some(trampoline_addr) = self.thread.process().get_trampoline_addr() {
+                        use litebox::platform::RawConstPointer as _;
+                        litebox_platform_multiplex::platform()
+                            .set_trampoline_base_addr(trampoline_addr);
+                    }
                 }
 
                 // Set the TLS for the new thread.

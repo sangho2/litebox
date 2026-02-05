@@ -12,8 +12,8 @@ This document describes the ARM64 (aarch64) support for LiteBox, implemented in 
 | Syscall rewriter crate | ✅ Complete | ELF rewriting, trampoline generation |
 | Runner integration | ✅ Complete | CLI with backend selection |
 | Seccomp backend | ⚠️ Issues | Timing bug with SIGSYS outside guest mode |
-| Rewriter backend | ✅ Working | Basic static binaries work |
-| Tests | 🔄 In Progress | Hello world passes, full suite pending |
+| Rewriter backend | ✅ Working | Static binaries work |
+| Tests | ✅ Basic tests passing | Threading/signal tests still have issues |
 
 ## Quick Start
 
@@ -97,11 +97,13 @@ These x86 syscalls don't exist on ARM64 and must use alternatives:
 
 **Fix needed**: Use raw syscalls with backdoor magic for all operations between filter application and guest entry.
 
-### 2. Rewriter Backend Crash (In Progress)
+### 2. Threading/Signal Tests
 
-**Problem**: Guest crashes at PC=0 after resuming from syscall.
+**Problem**: Tests involving threading (thread.c, thread_exit.c) and signals (signal.c) are currently skipped due to host TLS race condition in multi-threaded scenarios.
 
-**Status**: Under investigation. See [ARM64_REWRITER_DEVELOPMENT.md](./ARM64_REWRITER_DEVELOPMENT.md) for detailed debugging notes.
+**Root Cause**: The host TLS pointer stored at `trampoline_base+16` is a single global location. In multi-threaded scenarios, one thread can overwrite another thread's TLS pointer.
+
+**Workaround**: These tests are skipped in the test suite until per-thread TLS storage is implemented.
 
 ## Files
 
@@ -142,10 +144,13 @@ litebox_syscall_rewriter_arm64/
 
 ## Testing
 
-Tests are currently ignored pending backend fixes:
+Basic tests pass with the rewriter backend:
 
 ```bash
-# Run tests (will show ignored)
+# Run rewriter tests
+cargo test -p litebox_runner_linux_arm64_userland test_static_exec_with_rewriter
+
+# Run all tests (some are ignored)
 cargo test -p litebox_runner_linux_arm64_userland
 
 # For TUN/TAP tests, set up network first:

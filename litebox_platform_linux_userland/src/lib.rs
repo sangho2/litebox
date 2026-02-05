@@ -778,6 +778,16 @@ guest_tpidr:
 .globl trampoline_base
 trampoline_base:
     .xword 0
+// Per-thread save areas for guest registers clobbered by trampoline
+.globl saved_guest_x16
+saved_guest_x16:
+    .xword 0
+.globl saved_guest_x17
+saved_guest_x17:
+    .xword 0
+.globl saved_guest_x30
+saved_guest_x30:
+    .xword 0
 .globl in_guest
 in_guest:
     .byte 0
@@ -821,10 +831,21 @@ fn guest_tpidr_offset() -> isize {
     unsafe { (&raw const guest_tpidr as isize).wrapping_sub(0) }
 }
 
+/// Global storage for trampoline base address (ARM64 only).
+/// This is used by signal handlers to find the host TLS when TPIDR_EL0 points to guest TLS.
+/// All threads in a process share the same trampoline section, so this is safe.
+#[cfg(target_arch = "aarch64")]
+static GLOBAL_TRAMPOLINE_BASE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Set the trampoline base address for syscall rewriting (ARM64 only).
 /// This must be called before entering guest code when using the rewriter backend.
 #[cfg(target_arch = "aarch64")]
 pub fn set_trampoline_base(addr: usize) {
+    // Store in global for signal handler access
+    GLOBAL_TRAMPOLINE_BASE.store(addr, core::sync::atomic::Ordering::Release);
+
+    // Also store in TLS for fast access in switch_to_guest
     unsafe {
         core::arch::asm!(
             "mrs {tmp}, tpidr_el0",
@@ -907,7 +928,14 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // or directly from the trampoline in rewriter mode.
 .globl syscall_callback
 syscall_callback:
-    // x18 contains the host's TPIDR_EL0 (set by switch_to_guest from x19).
+    // x18 contains the host's TPIDR_EL0 (loaded by trampoline from header).
+    // In rewriter mode, the trampoline did SUB SP, SP, #32, so:
+    //   [SP+0]:  saved x16
+    //   [SP+8]:  saved x17
+    //   [SP+16]: saved x30
+    //   [SP+24]: unused
+    // Original guest SP = current SP + 32
+    //
     // Use x18 for all TLS accesses to support both systrap and rewriter modes.
     
     // First, save guest's x9 and x10 to TLS scratch areas so we can use them
@@ -945,23 +973,30 @@ syscall_callback:
     stp x14, x15, [x10, #112]
     
     // For x16, x17, x30 we need to get the ORIGINAL guest values.
-    // The trampoline saved them to trampoline_base+24, +32, +40 before clobbering.
-    // x16, x17, x30 currently contain trampoline scratch values.
-    // Load trampoline_base from TLS, then load guest values from header.
+    // In rewriter mode, they're saved on the stack at [SP+0], [SP+8], [SP+16].
+    // In systrap mode, x16, x17, x30 are guest's actual values.
     ldr x9, [x18, #:tprel_lo12:trampoline_base]
     cbz x9, 1f                   // If no trampoline (systrap mode), use current values
     
-    // Rewriter mode: load guest x16, x17, x30 from trampoline header
-    ldr x11, [x9, #24]           // Load guest's original x16
-    ldr x12, [x9, #32]           // Load guest's original x17
-    ldr x13, [x9, #40]           // Load guest's original x30
+    // Rewriter mode: load guest x16, x17, x30 from stack save area
+    // Current SP points to save area: [SP+0]=x16, [SP+8]=x17, [SP+16]=x30
+    ldr x11, [sp, #0]            // Load guest's original x16
+    ldr x12, [sp, #8]            // Load guest's original x17
+    ldr x13, [sp, #16]           // Load guest's original x30
     stp x11, x12, [x10, #128]    // Store guest's x16, x17 to regs[16], regs[17]
     str x13, [x10, #240]         // Store guest's x30 to regs[30]
+    // Compute original guest SP (current SP + 32) and save x30 as return address
+    add x9, sp, #32              // Original guest SP
+    str x9, [x10, #248]          // sp
+    str x30, [x10, #256]         // pc = return address from trampoline (where to resume)
     b 2f
 1:
     // Systrap mode: x16, x17, x30 are guest's actual values
     stp x16, x17, [x10, #128]
     str x30, [x10, #240]
+    mov x9, sp
+    str x9, [x10, #248]          // sp
+    str x30, [x10, #256]         // pc = return address
 2:
     // x18 is clobbered (used for host TLS) - store 0 for guest x18 slot
     mov x9, #0
@@ -973,9 +1008,6 @@ syscall_callback:
     // x28 is the guest's actual value (not clobbered by trampoline)
     stp x28, x29, [x10, #224]
     
-    mov x9, sp
-    str x9, [x10, #248]  // sp
-    str x30, [x10, #256]  // pc = return address from trampoline (where to resume)
     mrs x9, nzcv
     str x9, [x10, #264]  // pstate (simplified)
     str x0, [x10, #272]   // orig_x0
@@ -993,7 +1025,9 @@ syscall_callback:
 
 .globl exception_callback
 exception_callback:
-    // Restore host sp and fp (x18 holds host TLS base)
+    // Restore host sp and fp
+    // Read TLS base from TPIDR_EL0 (should have been restored by signal_handler_exit_guest)
+    mrs x18, tpidr_el0
     ldr x11, [x18, #:tprel_lo12:host_sp]
     mov sp, x11
     ldr x29, [x18, #:tprel_lo12:host_fp]
@@ -1005,7 +1039,9 @@ exception_callback:
 
 .globl interrupt_callback
 interrupt_callback:
-    // Restore host sp and fp (x18 holds host TLS base)
+    // Restore host sp and fp
+    // Read TLS base from TPIDR_EL0 (should have been restored by signal_handler_exit_guest)
+    mrs x18, tpidr_el0
     ldr x11, [x18, #:tprel_lo12:host_sp]
     mov sp, x11
     ldr x29, [x18, #:tprel_lo12:host_fp]
@@ -1044,27 +1080,35 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "switch_to_guest_start:",
         // At this point, tpidr_el0 still has host TLS.
         "mrs x18, tpidr_el0",
-        // Write host TLS to trampoline section at offset 16.
-        // This is used by the trampoline to restore x18 before calling the handler.
-        // trampoline_base is stored in TLS at a known offset.
-        "ldr x10, [x18, #:tprel_lo12:trampoline_base]",
-        "cbz x10, 1f",         // Skip if no trampoline (systrap mode)
-        "str x18, [x10, #16]", // Write host TLS to trampoline_base + 16
-        "1:",
         // Set in_guest flag (using x18 for TLS access)
         "mov w10, #1",
         "strb w10, [x18, #:tprel_lo12:in_guest]",
         // Check for pending interrupt
         "ldrb w10, [x18, #:tprel_lo12:interrupt]",
         "cbnz w10, interrupt_callback",
+        // Check if we're using rewriter mode (trampoline_base != 0)
+        "ldr x11, [x18, #:tprel_lo12:trampoline_base]",
         // Restore guest context from ctx (x0 points to PtRegs)
-        // First, load guest PC into x18 since we don't restore x18 anyway
+        // Load guest SP (offset 248)
+        "ldr x1, [x0, #248]",
+        // If rewriter mode, store host TLS at trampoline_base+16 for signal handler access.
+        // The trampoline will load host TLS from there (not from stack).
+        // Note: This has a race condition for multi-threading, but is needed for
+        // signal handlers which can't safely access the guest stack.
+        // We do NOT modify guest SP here - the trampoline will subtract 32 before saving.
+        "cbz x11, 1f",         // Skip if no trampoline (systrap mode)
+        "str x18, [x11, #16]", // Store host TLS at trampoline_base+16
+        "1:",
+        // Set SP to guest SP (unmodified)
+        "mov sp, x1",
+        // Load guest PC into x1 temporarily (will use x18 after we're done with it for TLS)
         // pc is at offset 256
-        "ldr x18, [x0, #256]",
+        "ldr x1, [x0, #256]",
         // Load guest TPIDR and switch
-        "mrs x10, tpidr_el0", // Get host TLS
-        "ldr x10, [x10, #:tprel_lo12:guest_tpidr]",
+        "ldr x10, [x18, #:tprel_lo12:guest_tpidr]",
         "msr tpidr_el0, x10", // Switch to guest TPIDR
+        // x18 is now free, use it for guest PC
+        "mov x18, x1",
         // Restore general purpose registers from PtRegs
         // regs[0..30] at offsets 0..240, then sp at 248, pc at 256
         "ldp x2, x3, [x0, #16]",
@@ -1075,7 +1119,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "ldp x12, x13, [x0, #96]",
         "ldp x14, x15, [x0, #112]",
         "ldp x16, x17, [x0, #128]",
-        // x18 at offset 144 - skip (used for PC jump)
+        // x18 at offset 144 - skip (already holds guest PC)
         "ldr x19, [x0, #152]",
         "ldp x20, x21, [x0, #160]",
         "ldp x22, x23, [x0, #176]",
@@ -1085,11 +1129,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "ldp x28, x29, [x0, #224]",
         // x30 at offset 240
         "ldr x30, [x0, #240]",
-        // Load sp at offset 248
-        "ldr x1, [x0, #248]",
-        "mov sp, x1",
-        // Load x0 and x1 last
-        "ldp x0, x1, [x0, #0]",
+        // x1 needs to be restored from PtRegs (we clobbered it)
+        "ldr x1, [x0, #8]",
+        // Load x0 last
+        "ldr x0, [x0, #0]",
         // Jump to guest pc (in x18)
         "br x18",
         "switch_to_guest_end:",
@@ -2482,23 +2525,78 @@ fn signal_handler_exit_guest(
     set_interrupt: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     unsafe {
-        // Read and clear in_guest flag using linker-resolved TLS offsets
+        // On ARM64, when we're in guest mode, TPIDR_EL0 points to guest TLS.
+        // We need to use the global trampoline base to find the host TLS.
+        let trampoline_base =
+            GLOBAL_TRAMPOLINE_BASE.load(core::sync::atomic::Ordering::Acquire);
+
+        if trampoline_base == 0 {
+            // No trampoline set up (systrap mode or not initialized).
+            // In systrap mode, TPIDR_EL0 always points to host TLS.
+            let in_guest: u8;
+            core::arch::asm!(
+                "mrs {tmp}, tpidr_el0",
+                "ldrb {out:w}, [{tmp}, #:tprel_lo12:in_guest]",
+                "strb wzr, [{tmp}, #:tprel_lo12:in_guest]",
+                tmp = out(reg) _,
+                out = out(reg) in_guest,
+                options(nostack)
+            );
+
+            if set_interrupt {
+                core::arch::asm!(
+                    "mrs {tmp}, tpidr_el0",
+                    "mov {one:w}, #1",
+                    "strb {one:w}, [{tmp}, #:tprel_lo12:interrupt]",
+                    tmp = out(reg) _,
+                    one = out(reg) _,
+                    options(nostack)
+                );
+            }
+
+            if in_guest == 0 {
+                return None;
+            }
+
+            // Get guest context pointer from host TLS
+            let guest_context_top: *mut litebox_common_linux::PtRegs;
+            core::arch::asm!(
+                "mrs {tmp}, tpidr_el0",
+                "ldr {out}, [{tmp}, #:tprel_lo12:guest_context_top]",
+                tmp = out(reg) _,
+                out = out(reg) guest_context_top,
+                options(nostack, preserves_flags, readonly)
+            );
+            return Some(guest_context_top.offset(-1));
+        }
+
+        // Rewriter mode: Read host TLS from trampoline header (offset 16).
+        // The host TLS is stored there by switch_to_guest before entering guest mode.
+        // Note: This has a race condition for multi-threading (another thread could
+        // overwrite this value), but we need this for signal handlers which can't
+        // safely access the guest stack.
+        let host_tls = core::ptr::read_volatile((trampoline_base + 16) as *const usize);
+
+        if host_tls == 0 {
+            // Host TLS not yet saved (we're not in guest mode yet)
+            return None;
+        }
+
+        // Read in_guest flag from host TLS
         let in_guest: u8;
         core::arch::asm!(
-            "mrs {tmp}, tpidr_el0",
-            "ldrb {out:w}, [{tmp}, #:tprel_lo12:in_guest]",
-            "strb wzr, [{tmp}, #:tprel_lo12:in_guest]",
-            tmp = out(reg) _,
+            "ldrb {out:w}, [{tls}, #:tprel_lo12:in_guest]",
+            "strb wzr, [{tls}, #:tprel_lo12:in_guest]",
+            tls = in(reg) host_tls,
             out = out(reg) in_guest,
             options(nostack)
         );
 
         if set_interrupt {
             core::arch::asm!(
-                "mrs {tmp}, tpidr_el0",
                 "mov {one:w}, #1",
-                "strb {one:w}, [{tmp}, #:tprel_lo12:interrupt]",
-                tmp = out(reg) _,
+                "strb {one:w}, [{tls}, #:tprel_lo12:interrupt]",
+                tls = in(reg) host_tls,
                 one = out(reg) _,
                 options(nostack)
             );
@@ -2508,12 +2606,18 @@ fn signal_handler_exit_guest(
             return None;
         }
 
-        // Get guest context pointer using linker-resolved TLS offset
+        // Restore host TPIDR_EL0 so we can use normal TLS access
+        core::arch::asm!(
+            "msr tpidr_el0, {host_tls}",
+            host_tls = in(reg) host_tls,
+            options(nostack)
+        );
+
+        // Get guest context pointer from host TLS
         let guest_context_top: *mut litebox_common_linux::PtRegs;
         core::arch::asm!(
-            "mrs {tmp}, tpidr_el0",
-            "ldr {out}, [{tmp}, #:tprel_lo12:guest_context_top]",
-            tmp = out(reg) _,
+            "ldr {out}, [{tls}, #:tprel_lo12:guest_context_top]",
+            tls = in(reg) host_tls,
             out = out(reg) guest_context_top,
             options(nostack, preserves_flags, readonly)
         );
@@ -2554,6 +2658,19 @@ fn set_signal_return(
     context.uc_mcontext.regs[1] = p1 as u64;
     context.uc_mcontext.regs[2] = p2 as u64;
     context.uc_mcontext.regs[3] = p3 as u64;
+
+    // Set x18 to host TLS so that exception_callback/interrupt_callback can access
+    // host TLS correctly when the signal handler returns. signal_handler_exit_guest
+    // has already restored TPIDR_EL0 to host TLS, so we read it here.
+    let host_tls: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {out}, tpidr_el0",
+            out = out(reg) host_tls,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    context.uc_mcontext.regs[18] = host_tls;
 }
 
 /// Updates a Linux signal context to return to `f` with the given arguments.

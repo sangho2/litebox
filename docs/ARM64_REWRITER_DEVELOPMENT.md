@@ -44,10 +44,11 @@ Add ARM64 (aarch64) support to LiteBox using a syscall rewriter backend that:
 - Implemented manual instruction encoding (ARM64 has fixed 4-byte instructions)
 - Created trampoline generation logic
 
-### Phase 3: Integration and Debugging (In Progress)
+### Phase 3: Integration and Debugging (Completed)
 - Integrated rewriter with runner CLI
 - Fixed multiple register preservation issues
-- Currently debugging a crash after syscall resumption
+- Fixed stack corruption bug on initial guest entry
+- All basic tests now passing
 
 ---
 
@@ -58,17 +59,14 @@ Add ARM64 (aarch64) support to LiteBox using a syscall rewriter backend that:
 ```
 Trampoline Section (mapped at high address, e.g., 0x8f7000):
 ┌─────────────────────────────────────────────────────────────┐
-│ Header (48 bytes)                                           │
+│ Header (24 bytes)                                           │
 │ ├── Offset 0-7:   "LITEBOX0" magic                         │
 │ ├── Offset 8-15:  Handler address (syscall_callback)       │
-│ ├── Offset 16-23: Host TLS (written by switch_to_guest)    │
-│ ├── Offset 24-31: Saved guest x16                          │
-│ ├── Offset 32-39: Saved guest x17                          │
-│ └── Offset 40-47: Saved guest x30                          │
+│ └── Offset 16-23: Host TLS (written by switch_to_guest)    │
 ├─────────────────────────────────────────────────────────────┤
-│ Entry 0 (for first SVC, ~44 bytes)                         │
+│ Entry 0 (for first SVC, ~32 bytes)                         │
 ├─────────────────────────────────────────────────────────────┤
-│ Entry 1 (for second SVC, ~44 bytes)                        │
+│ Entry 1 (for second SVC, ~32 bytes)                        │
 ├─────────────────────────────────────────────────────────────┤
 │ ... more entries ...                                        │
 └─────────────────────────────────────────────────────────────┘
@@ -77,37 +75,44 @@ Trampoline Section (mapped at high address, e.g., 0x8f7000):
 ### Per-SVC Trampoline Entry Sequence
 
 ```asm
-; 1. Save x17 to stack (we need a scratch register)
-STR X17, [SP, #-16]!     ; Push x17, SP -= 16
+; 1. Reserve stack space for saving registers
+SUB SP, SP, #32          ; SP -= 32 (16-byte aligned)
 
-; 2. Compute trampoline base address
-ADR X17, trampoline_base ; X17 = address of header
+; 2. Save guest registers that trampoline will clobber
+STR X16, [SP, #0]        ; Save guest x16
+STR X17, [SP, #8]        ; Save guest x17
+STR X30, [SP, #16]       ; Save guest x30
 
-; 3. Load host TLS from header
-LDR X18, [X17, #16]      ; X18 = host TPIDR_EL0
+; 3. Load host TLS from header (PC-relative)
+LDR X18, [PC, #offset]   ; X18 = host TPIDR_EL0 from header offset 16
 
-; 4. Save guest x16 to header
-STR X16, [X17, #24]      ; header.saved_x16 = guest x16
+; 4. Set return address (where to resume after syscall)
+ADR X30, return_addr     ; X30 = instruction after original SVC
+; (or MOVZ/MOVK sequence for far addresses)
 
-; 5. Pop original x17 into x16
-LDR X16, [SP], #16       ; X16 = original x17, SP += 16
+; 5. Load syscall handler address
+LDR X16, [PC, #offset]   ; X16 = syscall_callback from header offset 8
 
-; 6. Save guest x17 (now in x16) to header
-STR X16, [X17, #32]      ; header.saved_x17 = guest x17
-
-; 7. Save guest x30 to header
-STR X30, [X17, #40]      ; header.saved_x30 = guest x30
-
-; 8. Set return address (where to resume after syscall)
-MOVZ X30, #return_lo     ; X30 = return address (2-instruction sequence)
-MOVK X30, #return_hi, LSL #16
-
-; 9. Load syscall handler address
-LDR X16, [X17, #8]       ; X16 = syscall_callback address
-
-; 10. Jump to handler
+; 6. Jump to handler
 BR X16                   ; Begin syscall processing
 ```
+
+### Stack Layout During Syscall
+
+When `syscall_callback` is entered, the guest stack has:
+```
+┌─────────────────────────────────────────┐
+│ [SP+0]:  Saved guest X16               │
+│ [SP+8]:  Saved guest X17               │
+│ [SP+16]: Saved guest X30               │
+│ [SP+24]: (unused, alignment padding)   │
+├─────────────────────────────────────────┤
+│ [SP+32]: Original guest stack...       │
+│          (argc, argv, envp for _start) │
+└─────────────────────────────────────────┘
+```
+
+`syscall_callback` computes `original_guest_sp = SP + 32` and stores this in `ctx.sp`.
 
 ### Register Usage
 
@@ -116,12 +121,12 @@ BR X16                   ; Begin syscall processing
 | x0-x7    | Syscall arguments    | Preserved for syscall handling |
 | x8       | Syscall number       | Preserved |
 | x9-x15   | Guest values         | x9, x10 used as scratch |
-| x16      | Scratch, then handler addr | Loaded from header (saved guest value) |
-| x17      | Scratch (base addr)  | Loaded from header (saved guest value) |
-| x18      | Host TLS             | Host TLS for all operations |
+| x16      | Scratch, then handler addr | Loaded from stack [SP+0] |
+| x17      | Scratch              | Loaded from stack [SP+8] |
+| x18      | Host TLS (from header) | Host TLS for all operations |
 | x19-x29  | Guest callee-saved   | Preserved |
-| x30      | Scratch (return addr)| Loaded from header (saved guest value) |
-| SP       | Guest stack          | Saved to ctx, switched to host stack |
+| x30      | Scratch (return addr)| Loaded from stack [SP+16] |
+| SP       | Decremented by 32    | Original SP = current SP + 32 |
 
 ---
 
@@ -278,6 +283,68 @@ let ldr_pop = 0xF841_07F0u32; // LDR X16, [SP], #16
 
 ---
 
+### Bug 8: Initial Stack Corruption - argc Overwritten (FIXED)
+
+**Symptoms**:
+- Guest crashes with SIGSEGV at PC=0x400b98 (inside `__libc_start_main`)
+- Fault address is garbage: 0x1000081ae2ed0
+- Crash occurs before any syscall is made
+
+**Root Cause**:
+The original design had `switch_to_guest` subtract 32 bytes from SP before entering guest code,
+storing host TLS at `[SP+0]`. This worked for subsequent syscalls but corrupted the initial
+stack layout.
+
+On Linux, when a process starts, the stack looks like:
+```
+[SP+0]:  argc
+[SP+8]:  argv[0]
+[SP+16]: argv[1]
+...
+```
+
+By subtracting 32 and storing host TLS at `[SP+0]`, we overwrote `argc` with a pointer.
+When `_start` executed `ldr x1, [sp]` to load argc, it got the host TLS pointer instead,
+causing downstream code to crash when dereferencing this garbage value.
+
+**Solution**:
+Changed the design so the **trampoline** reserves stack space, not `switch_to_guest`:
+
+1. **Trampoline now does**:
+   ```asm
+   SUB SP, SP, #32          ; Reserve space
+   STR X16, [SP, #0]        ; Save x16
+   STR X17, [SP, #8]        ; Save x17
+   STR X30, [SP, #16]       ; Save x30
+   LDR X18, [PC, #offset]   ; Load host TLS from header (not stack!)
+   ```
+
+2. **switch_to_guest now does**:
+   ```asm
+   ; Just store host TLS at header offset 16 for trampoline to read
+   str x18, [x11, #16]      ; trampoline_base+16 = host TLS
+   ; Do NOT modify SP
+   mov sp, x1               ; SP = ctx.sp (unmodified)
+   ```
+
+3. **syscall_callback offsets updated**:
+   ```asm
+   ldr x11, [sp, #0]        ; Load guest x16 (was [SP+8])
+   ldr x12, [sp, #8]        ; Load guest x17 (was [SP+16])
+   ldr x13, [sp, #16]       ; Load guest x30 (was [SP+24])
+   ```
+
+**Files Changed**:
+- `litebox_syscall_rewriter_arm64/src/lib.rs` - Added SUB SP, load TLS from header
+- `litebox_platform_linux_userland/src/lib.rs` - Removed SP modification from switch_to_guest
+
+**Verification**:
+- Hello world test runs successfully
+- Initial stack (argc, argv) preserved correctly
+- All rewriter tests pass
+
+---
+
 ## Code Artifacts
 
 ### New Crates Created
@@ -304,7 +371,10 @@ litebox_syscall_rewriter_arm64/
 | `encoder::encode_adr()` | Encodes ADR instruction |
 | `encoder::encode_b()` | Encodes B (branch) instruction |
 | `encoder::encode_ldr_imm()` | Encodes LDR with immediate offset |
+| `encoder::encode_ldr_literal()` | Encodes LDR with PC-relative offset |
 | `encoder::encode_str_imm()` | Encodes STR with immediate offset |
+| `encoder::encode_sub_imm()` | Encodes SUB with immediate |
+| `encoder::encode_add_imm()` | Encodes ADD with immediate |
 | `encoder::encode_mov_imm64()` | Encodes 64-bit immediate load (MOVZ+MOVK) |
 
 ### Modified Platform Files
@@ -327,7 +397,7 @@ litebox_syscall_rewriter_arm64/
 ### 2. Trampoline Design Challenges
 - Can't assume any register is available as scratch
 - Must save registers BEFORE using them, but need a register to compute where to save
-- Solution: Use stack temporarily, then restore
+- Solution: Use PC-relative addressing to load host TLS from trampoline header
 
 ### 3. Switch_to_guest Must Use PC, Not LR
 - ARM64 `ret` jumps to x30 (LR), not to a "return address" from stack
@@ -337,7 +407,11 @@ litebox_syscall_rewriter_arm64/
 - Any SP modification in trampoline must be perfectly balanced
 - Even 16-byte misalignment can corrupt caller's saved frame
 
-### 5. Debug Incrementally
+### 5. Don't Modify Guest Stack Before First Syscall
+- Initial guest stack has argc, argv, envp - modifying it corrupts process startup
+- Let the trampoline reserve stack space when syscall occurs, not on initial entry
+
+### 6. Debug Incrementally
 - Each bug fix revealed the next bug
 - Coredump analysis with GDB was essential
 - Adding verification assertions caught issues early
@@ -348,9 +422,8 @@ litebox_syscall_rewriter_arm64/
 ## Future Work
 
 ### Short-term
-1. Clean up debug output
-2. Run full test suite
-3. Enable runner tests (currently ignored pending backend fixes)
+1. Fix threading/signal issues in rewriter mode
+2. Enable more runner tests
 
 ### Medium-term
 1. Fix seccomp backend timing issues
