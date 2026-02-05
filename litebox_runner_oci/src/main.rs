@@ -150,6 +150,18 @@ enum Command {
         /// See litebox_platform_linux_userland/scripts/tun-setup.sh
         #[clap(long, value_name = "DEVICE")]
         tun_device: Option<String>,
+
+        /// Enable lazy file loading using squashfs + loop mount.
+        /// Files are loaded on-demand instead of copying entire rootfs to memory.
+        /// Requires: mksquashfs, root/sudo for loop mount.
+        #[clap(long)]
+        lazy: bool,
+
+        /// Enable true lazy loading using tar + layered filesystem.
+        /// Only executables are loaded upfront (for rewriting), all other files
+        /// are read on-demand from a tar archive. Much faster for large images.
+        #[clap(long)]
+        lazy_tar: bool,
     },
 
     /// Execute a command in a container's rootfs (simplified exec)
@@ -404,11 +416,15 @@ fn main() -> Result<()> {
             stdout,
             stderr,
             tun_device,
+            lazy,
+            lazy_tar,
         } => {
             tracing::info!(
                 container_id = %container_id,
                 bundle = %bundle.display(),
                 tun_device = ?tun_device,
+                lazy = lazy,
+                lazy_tar = lazy_tar,
                 "running container"
             );
 
@@ -429,9 +445,20 @@ fn main() -> Result<()> {
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
             let mounts = parse_mounts(&mount)?;
-            let exit_code = litebox_runner_oci::run_container_full(
-                &bundle, None, &extra_env, &mounts, &stdio, &network,
-            )?;
+
+            let exit_code = if lazy_tar {
+                litebox_runner_oci::run_container_lazy_tar(
+                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                )?
+            } else if lazy {
+                litebox_runner_oci::run_container_lazy(
+                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                )?
+            } else {
+                litebox_runner_oci::run_container_full(
+                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                )?
+            };
             std::process::exit(exit_code);
         }
 

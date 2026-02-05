@@ -24,5 +24,7 @@ pub use runner::NetworkConfig;
 pub use runner::StdioRedirect;
 pub use runner::run_container;
 pub use runner::run_container_full;
+pub use runner::run_container_lazy;
+pub use runner::run_container_lazy_tar;
 pub use runner::run_container_with_all_options;
 pub use runner::run_container_with_options;

@@ -175,15 +175,83 @@ sudo iptables -A FORWARD -i eth0 -o tun99 -m state --state RELATED,ESTABLISHED -
 
 ## Performance
 
-**Binary Caching**: Rewritten executables are cached in `~/.cache/litebox-oci/rewritten/`. Subsequent runs of the same container image are ~3-4x faster as cached binaries are loaded directly.
+### Quick Benchmarks
+
+| Image | Size | Startup Time | Notes |
+|-------|------|--------------|-------|
+| Alpine (echo) | 12MB | 0.23-0.27s | Lazy-tar fastest |
+| Python hello | 74MB | 0.13s | Eager fastest |
+| Python 3.11-slim | 130MB | 0.38s | Debian-based |
+| Large data | 574MB | 0.37s | Memory-efficient |
+
+*Benchmarks on Ubuntu 24.04 Azure VM. See [TODO.md](TODO.md) for comprehensive results.*
+
+### Binary Caching
+
+Rewritten executables are cached in `~/.cache/litebox-oci/rewritten/`. Subsequent runs of the same container image are faster as cached binaries are loaded directly.
 
 ```bash
-# First run (no cache): ~50ms
-# Second run (cached):  ~14ms
-
 # Clear cache if needed
 rm -rf ~/.cache/litebox-oci/rewritten/
 ```
+
+### Lazy Loading Modes
+
+For large container images, lazy loading can significantly reduce startup time and memory usage:
+
+```bash
+# Default: eager mode (loads all files upfront)
+litebox-oci run -b /bundle my-container
+
+# Lazy-tar mode: only loads executables, reads other files on-demand
+litebox-oci run -b /bundle --lazy-tar my-container
+
+# Squashfs mode: uses loop-mounted squashfs (requires root)
+litebox-oci run -b /bundle --lazy my-container
+```
+
+**Performance by image type:**
+
+| Image | Size | Eager | Lazy-tar | Best Mode |
+|-------|------|-------|----------|-----------|
+| Alpine (simple) | 12MB | 0.27s | **0.23s** | Lazy-tar |
+| Python (complex) | 74MB | **0.13s** | 0.54s | Eager |
+| Large data | 174MB | **0.18s** | 0.60s | Eager |
+
+**When to use each mode:**
+- **`--lazy-tar`**: Simple containers (busybox, Alpine), memory-constrained environments
+- **Default (eager)**: Complex containers with many libraries (Python, Node, Go)
+- **ublk+squashfs**: Repeated access to same image, lowest overhead after setup
+
+**Lazy-tar benefits:**
+- Faster startup for simple images (fewer file lookups)
+- Lower memory usage (only accessed files loaded)
+- No external dependencies
+
+**Lazy-tar limitations:**
+- Slower for complex images due to tar O(n) parsing overhead
+- File writes to read-only layer fail (use `PYTHONDONTWRITEBYTECODE=1` for Python)
+
+### Advanced: ublk + Squashfs
+
+For lowest overhead with repeated access to the same image, use kernel ublk block device:
+
+```bash
+# One-time setup (requires linux-modules-extra package)
+sudo apt install linux-modules-extra-$(uname -r)
+sudo modprobe ublk_drv
+cargo install rublk
+
+# Create and mount squashfs-backed block device
+mksquashfs /path/to/rootfs /tmp/rootfs.squashfs
+rublk add loop -f /tmp/rootfs.squashfs
+sudo mount -t squashfs /dev/ublkb0 /mnt/rootfs
+
+# Point bundle to mounted rootfs
+litebox-oci run -b /bundle my-container
+```
+
+See [TODO.md](TODO.md) for detailed performance analysis and virtual block device options.
 
 ## Supported Features
 
@@ -196,6 +264,7 @@ rm -rf ~/.cache/litebox-oci/rewritten/
 - ✅ Exec command for running commands in container rootfs
 - ✅ Stdio redirection (`--stdout`, `--stderr`)
 - ✅ Binary caching for faster subsequent runs
+- ✅ Lazy file loading (`--lazy-tar`, `--lazy`)
 - ✅ TUN-based networking (`--tun-device`)
 - ✅ Virtual /proc filesystem (cpuinfo, meminfo, mounts, etc.)
 
