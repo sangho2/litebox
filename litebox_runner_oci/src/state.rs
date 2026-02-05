@@ -95,8 +95,11 @@ impl StateManager {
     }
 
     /// Get the sync pipe path for a container.
+    /// Uses /tmp with truncated ID to avoid Unix socket path length limits (108 chars).
     pub fn sync_pipe(&self, id: &str) -> PathBuf {
-        self.container_dir(id).join("sync.pipe")
+        // Truncate ID to 16 chars to keep path short
+        let short_id = if id.len() > 16 { &id[..16] } else { id };
+        PathBuf::from(format!("/tmp/litebox-{}.sock", short_id))
     }
 
     /// Check if a container exists.

@@ -44,7 +44,7 @@
 - [ ] Implement `events` command for container metrics
 - [x] Optimize rootfs loading for large images (lazy loading implemented)
 - [x] Lazy file loading (`--lazy-tar`, `--lazy` flags)
-- [ ] Kubernetes/CRI-O integration testing
+- [x] Kubernetes/CRI-O integration testing (crictl ✓, containerd ✓)
 - [ ] Podman integration testing
 - [ ] Tar indexing for O(1) lookups (improve lazy-tar for complex images)
 

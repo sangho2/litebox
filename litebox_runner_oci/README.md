@@ -52,6 +52,36 @@ sudo ctr run --rm --runc-binary /usr/local/bin/litebox-oci \
     /bin/echo "Hello via containerd"
 ```
 
+### Kubernetes/CRI Integration
+
+Configure containerd to use litebox-oci as an alternative runtime:
+
+```toml
+# /etc/containerd/config.toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.litebox]
+  runtime_type = "io.containerd.runc.v2"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.litebox.options]
+    BinaryName = "/usr/local/bin/litebox-oci"
+```
+
+Then run containers with the `litebox` runtime:
+
+```bash
+# Using crictl (CRI)
+sudo crictl runp --runtime=litebox pod.json
+sudo crictl create <pod-id> container.json pod.json
+sudo crictl start <container-id>
+
+# Using ctr (containerd)
+sudo ctr run --runc-binary /usr/local/bin/litebox-oci \
+    docker.io/library/alpine:latest test /bin/echo "Hello"
+```
+
+**Tested configurations:**
+- containerd 1.7+ with CRI plugin
+- crictl v1.28+
+- Alpine, Debian, Ubuntu, Fedora images
+
 ### Rootless Operation
 
 ```bash
