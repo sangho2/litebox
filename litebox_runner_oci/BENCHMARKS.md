@@ -13,9 +13,12 @@ Comprehensive performance benchmarks for litebox_runner_oci.
 | Image | Size | Files | Eager | Lazy-tar | Winner | Notes |
 |-------|------|-------|-------|----------|--------|-------|
 | Alpine (busybox) | 12MB | 432 | 0.27s | **0.23s** | Lazy-tar | Simple, few libs |
+| Debian stable-slim | 84MB | 2,670 | **0.28s** | - | Eager | glibc-based |
+| Ubuntu 24.04 | 84MB | ~2,700 | **0.29s** | - | Eager | glibc-based |
 | Python 3.12 (bundle) | 74MB | 1,226 | **0.13s** | 0.54s | Eager | Many stdlib probes |
 | Python 3.11-alpine | 57MB | 2,941 | 0.32s | 0.55s | Eager | Many small files |
 | Python 3.11-slim | 130MB | 6,000+ | **0.38s** | 0.80s | Eager | Debian-based |
+| Fedora 43 | 192MB | ~8,000 | **0.93s** | - | Eager | Large, many symlinks |
 | Large data (synthetic) | 174MB | 1,230 | **0.18s** | 0.60s | Eager | 100MB data file |
 | Huge data (synthetic) | 574MB | 1,235 | **0.37s** | 0.78s | Eager | 500MB data files |
 
@@ -24,6 +27,7 @@ Comprehensive performance benchmarks for litebox_runner_oci.
 - Lazy-tar has fixed tar parsing overhead (~0.5s for complex images)
 - Lazy-tar only wins for simple images with minimal file lookups
 - LiteBox's in-memory filesystem is very efficient at bulk loading
+- Symlink-heavy distros (Fedora) have additional overhead for symlink resolution
 
 ## Loading Mode Comparison
 

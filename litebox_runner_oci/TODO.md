@@ -36,16 +36,17 @@
 ## TODO
 
 ### Short-term
-- [ ] Test with more container images (debian, ubuntu, fedora)
+- [x] Test with more container images (debian ✓, ubuntu ✓, fedora ✓)
 - [x] Test with multi-process workloads (pthreads ✓, execve ✓, fork ✗)
 
 ### Medium-term
 - [ ] Implement console-socket for TTY support
 - [ ] Implement `events` command for container metrics
-- [ ] Optimize rootfs loading for large images
-- [ ] Lazy file loading (see notes below)
+- [x] Optimize rootfs loading for large images (lazy loading implemented)
+- [x] Lazy file loading (`--lazy-tar`, `--lazy` flags)
 - [ ] Kubernetes/CRI-O integration testing
 - [ ] Podman integration testing
+- [ ] Tar indexing for O(1) lookups (improve lazy-tar for complex images)
 
 ### Long-term
 - [ ] ARM64 support (requires rtld_audit.so port)

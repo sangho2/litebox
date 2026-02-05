@@ -856,10 +856,59 @@ fn run_container_internal(
                                 file_mode,
                             );
                         } else if resolved.is_dir() {
-                            // Symlink to directory - create the directory
+                            // Symlink to directory - create the directory AND copy all files
+                            // from target dir to both locations (e.g., /lib64 -> /usr/lib64)
                             in_mem.with_root_privileges(|fs| {
                                 let _ = fs.mkdir(target_str, exec_mode);
                             });
+
+                            // Walk the target directory and add files at symlink paths
+                            // This handles cases like /lib64/ld-linux-x86-64.so.2
+                            for sub_entry in WalkDir::new(&resolved)
+                                .follow_links(false)
+                                .into_iter()
+                                .filter_map(std::result::Result::ok)
+                            {
+                                let sub_rel = sub_entry
+                                    .path()
+                                    .strip_prefix(&resolved)
+                                    .unwrap_or(sub_entry.path());
+                                if sub_rel == Path::new("") {
+                                    continue;
+                                }
+
+                                let symlink_target = Path::new(target_str).join(sub_rel);
+                                let symlink_target_str = symlink_target.to_str().unwrap_or("/");
+
+                                if sub_entry.file_type().is_dir() {
+                                    in_mem.with_root_privileges(|fs| {
+                                        let _ = fs.mkdir(symlink_target_str, exec_mode);
+                                    });
+                                } else if sub_entry.file_type().is_file() {
+                                    load_file_from_host(
+                                        &mut in_mem,
+                                        sub_entry.path(),
+                                        symlink_target_str,
+                                        exec_mode,
+                                        file_mode,
+                                    );
+                                } else if sub_entry.file_type().is_symlink() {
+                                    // Resolve nested symlink
+                                    if let Ok(nested_target) = sub_entry.path().canonicalize() {
+                                        if nested_target.is_file()
+                                            && nested_target.starts_with(&effective_rootfs)
+                                        {
+                                            load_file_from_host(
+                                                &mut in_mem,
+                                                &nested_target,
+                                                symlink_target_str,
+                                                exec_mode,
+                                                file_mode,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
