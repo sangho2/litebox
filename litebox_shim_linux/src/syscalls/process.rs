@@ -540,6 +540,11 @@ impl Task {
 #[cfg(target_arch = "x86_64")]
 type ThreadLocalDescriptor = MutPtr<u8>;
 
+/// On `aarch64`, this is represented as a `*mut u8`. The TLS pointer can point to
+/// an arbitrary-sized memory region (similar to x86_64).
+#[cfg(target_arch = "aarch64")]
+type ThreadLocalDescriptor = MutPtr<u8>;
+
 /// A descriptor for thread-local storage (TLS).
 ///
 /// On `x86`, this is represented as a `UserDesc`, which provides a more
@@ -666,6 +671,8 @@ impl Task {
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.truncate();
             #[cfg(target_arch = "x86_64")]
+            let desc = MutPtr::from_usize(addr);
+            #[cfg(target_arch = "aarch64")]
             let desc = MutPtr::from_usize(addr);
             #[cfg(target_arch = "x86")]
             let desc = {
@@ -1280,19 +1287,19 @@ impl Task {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: crate::ConstPtr<i8>,
-        argv: crate::ConstPtr<crate::ConstPtr<i8>>,
-        envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+        pathname: crate::ConstPtr<crate::CChar>,
+        argv: crate::ConstPtr<crate::ConstPtr<crate::CChar>>,
+        envp: crate::ConstPtr<crate::ConstPtr<crate::CChar>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         fn copy_vector(
-            mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+            mut base: crate::ConstPtr<crate::ConstPtr<crate::CChar>>,
             _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: crate::ConstPtr<i8> = {
+                let p: crate::ConstPtr<crate::CChar> = {
                     // read pointer-sized entries
                     match base.read_at_offset(0) {
                         Some(ptr) => ptr,

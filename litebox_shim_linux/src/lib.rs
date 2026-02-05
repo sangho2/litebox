@@ -61,6 +61,13 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
 
 pub(crate) type FileFd = litebox::fd::TypedFd<LinuxFS>;
 
+/// Type alias for C character type, which differs between architectures.
+/// ARM64 uses unsigned char (u8), while x86/x86_64 use signed char (i8).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) type CChar = i8;
+#[cfg(target_arch = "aarch64")]
+pub(crate) type CChar = u8;
+
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     use litebox::platform::DebugLogProvider as _;
@@ -630,6 +637,8 @@ impl Task {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = ctx.syscallno;
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
@@ -1037,6 +1046,11 @@ impl Task {
                 {
                     let _ = user_desc;
                     Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let _ = user_desc;
+                    Err(Errno::ENOSYS) // aarch64 does not support set_thread_area
                 }
                 #[cfg(target_arch = "x86")]
                 {

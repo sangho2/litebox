@@ -28,6 +28,13 @@ extern crate alloc;
 
 // TODO(jayb): Should errno::Errno be publicly re-exported?
 
+/// Type alias for C character type. ARM64 uses unsigned char (u8),
+/// while x86/x86_64 use signed char (i8).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub type CChar = i8;
+#[cfg(target_arch = "aarch64")]
+pub type CChar = u8;
+
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
 pub const STDERR_FILENO: i32 = 2;
@@ -279,7 +286,7 @@ impl From<litebox::fs::FileType> for DirentType {
 }
 
 /// Linux's `stat` struct
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[repr(C, packed)]
 #[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
@@ -772,7 +779,7 @@ cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "x86"))] {
         pub type time_t = i32;
         pub type suseconds_t = u32;
-    } else if #[cfg(all(target_arch = "x86_64"))] {
+    } else if #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] {
         pub type time_t = i64;
         pub type suseconds_t = u64;
     } else {
@@ -1857,7 +1864,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
     },
     Stat {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         buf: Platform::RawMutPointer<FileStat>,
     },
     Fstat {
@@ -1865,11 +1872,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat>,
     },
     Lstat {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         buf: Platform::RawMutPointer<FileStat>,
     },
     Mkdir {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         mode: u32,
     },
     Mmap {
@@ -1958,7 +1965,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         iovcnt: usize,
     },
     Access {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         mode: AccessFlags,
     },
     Madvise {
@@ -2100,19 +2107,19 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         arg: ArchPrctlArg<Platform>,
     },
     Readlink {
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         buf: Platform::RawMutPointer<u8>,
         bufsiz: usize,
     },
     Readlinkat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         buf: Platform::RawMutPointer<u8>,
         bufsiz: usize,
     },
     Openat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         flags: litebox::fs::OFlags,
         mode: litebox::fs::Mode,
     },
@@ -2122,20 +2129,20 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Unlinkat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         flags: AtFlags,
     },
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     Newfstatat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         buf: Platform::RawMutPointer<FileStat>,
         flags: AtFlags,
     },
     #[cfg(target_arch = "x86")]
     Fstatat64 {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<i8>,
+        pathname: Platform::RawConstPointer<CChar>,
         buf: Platform::RawMutPointer<FileStat64>,
         flags: AtFlags,
     },
@@ -2243,9 +2250,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         args: FutexArgs<Platform>,
     },
     Execve {
-        pathname: Platform::RawConstPointer<i8>,
-        argv: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
-        envp: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        pathname: Platform::RawConstPointer<CChar>,
+        argv: Platform::RawConstPointer<Platform::RawConstPointer<CChar>>,
+        envp: Platform::RawConstPointer<Platform::RawConstPointer<CChar>>,
     },
     Umask {
         mask: u32,
@@ -2356,11 +2363,23 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
             Sysno::close => sys_req!(Close { fd }),
             Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
             #[cfg(target_arch = "x86_64")]
+            Sysno::mmap => sys_req!(Mmap {
+                addr,
+                length,
+                prot,
+                flags,
+                fd,
+                offset,
+            }),
+            #[cfg(target_arch = "aarch64")]
             Sysno::mmap => sys_req!(Mmap {
                 addr,
                 length,
@@ -2449,7 +2468,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::access => sys_req!(Access { pathname:*, mode }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
@@ -2458,6 +2479,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 newfd: None,
                 flags: None,
             },
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::dup2 => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: Some(ctx.sys_req_arg(1)),
@@ -2575,14 +2597,17 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 clockid: { ClockId::Monotonic.into() },
                 flags: { TimerFlags::empty() },
             }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::time => sys_req!(Time { tloc:* }),
             Sysno::getcwd => sys_req!(Getcwd { buf:*, size }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
             Sysno::readlinkat => sys_req!(Readlinkat { dirfd, pathname:*, buf:*, bufsiz }),
             #[cfg(target_arch = "x86_64")]
             Sysno::getrlimit => sys_req!(Getrlimit { resource:?, rlim:* }),
             #[cfg(target_arch = "x86")]
             Sysno::ugetrlimit => sys_req!(Getrlimit { resource:?, rlim:* }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::setrlimit => sys_req!(Setrlimit { resource:?, rlim:* }),
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
@@ -2592,12 +2617,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::epoll_wait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask: { None }, sigsetsize: { 0 }, })
             }
             Sysno::epoll_pwait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask:*, sigsetsize })
             }
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::epoll_create => sys_req!(EpollCreate {
                 size,
                 flags: { EpollCreateFlags::empty() }
@@ -2610,6 +2637,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::ppoll_time64 => {
                 sys_req!(Ppoll { fds:*, nfds, timeout: { =*> TimeParam::timespec64 }, sigmask:*, sigsetsize })
             }
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::poll => {
                 sys_req!(Ppoll { fds:*, nfds, timeout: { => TimeParam::Milliseconds }, sigmask: { None }, sigsetsize: { 0 } })
             }
@@ -2678,6 +2706,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     return Err(errno::Errno::EINVAL);
                 }
             }
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::arch_prctl => {
                 let code: u32 = ctx.sys_req_arg(0);
                 let code = ArchPrctlCode::try_from(code)
@@ -2694,9 +2723,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 SyscallRequest::ArchPrctl { arg }
             }
             Sysno::gettid => SyscallRequest::Gettid,
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::set_thread_area => sys_req!(SetThreadArea { user_desc:* }),
             Sysno::set_tid_address => sys_req!(SetTidAddress { tidptr:* }),
             Sysno::openat => sys_req!(Openat { dirfd,pathname:*,flags,mode }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::open => {
                 // open is equivalent to openat with dirfd AT_FDCWD
                 SyscallRequest::Openat {
@@ -2707,6 +2738,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::unlink => {
                 // unlink is equivalent to unlinkat with dirfd AT_FDCWD and flags 0
                 SyscallRequest::Unlinkat {
@@ -2715,6 +2747,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     flags: AtFlags::empty(),
                 }
             }
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::creat => {
                 // creat is equivalent to open with flags O_CREAT|O_WRONLY|O_TRUNC
                 SyscallRequest::Openat {
@@ -2729,8 +2762,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
+            #[cfg(target_arch = "aarch64")]
+            Sysno::fstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
             Sysno::fstatat64 => sys_req!(Fstatat64 { dirfd,pathname:*,buf:*,flags }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::eventfd => SyscallRequest::Eventfd2 {
                 initval: ctx.sys_req_arg(0),
                 flags: EfdFlags::empty(),
@@ -2743,8 +2779,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     flags: CloneFlags::from_bits_retain(ctx.syscall_arg(0) as u64 & 0xffffff00),
                     stack: ctx.sys_req_arg(1),
                     parent_tid: ctx.sys_req_arg(2),
-                    child_tid: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 3 } else { 4 }),
-                    tls: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 4 } else { 3 }),
+                    #[cfg(target_arch = "x86_64")]
+                    child_tid: ctx.sys_req_arg(3),
+                    #[cfg(target_arch = "x86")]
+                    child_tid: ctx.sys_req_arg(4),
+                    #[cfg(target_arch = "aarch64")]
+                    child_tid: ctx.sys_req_arg(3),
+                    #[cfg(target_arch = "x86_64")]
+                    tls: ctx.sys_req_arg(4),
+                    #[cfg(target_arch = "x86")]
+                    tls: ctx.sys_req_arg(3),
+                    #[cfg(target_arch = "aarch64")]
+                    tls: ctx.sys_req_arg(4),
                     pidfd: ctx.sys_req_arg(2), // aliases parent_tid
                     exit_signal: ctx.syscall_arg(0) as u64 & 0xff,
                     stack_size: 0,
@@ -2798,10 +2844,16 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             // Noisy unsupported syscalls.
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+                return Err(errno::Errno::ENOSYS);
+            }
+            #[cfg(target_arch = "aarch64")]
+            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
@@ -2909,6 +2961,13 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
     #[cfg(target_arch = "x86")]
     pub fn timespec_old(tp: Option<Platform::RawMutPointer<Timespec32>>) -> Self {
         Self::timespec32(tp)
+    }
+
+    /// Return a `TimeParam` for the old timespec pointer type, which is
+    /// architecture dependent (ARM64 uses 64-bit timespec).
+    #[cfg(target_arch = "aarch64")]
+    pub fn timespec_old(tp: Option<Platform::RawMutPointer<Timespec>>) -> Self {
+        Self::timespec64(tp)
     }
 
     /// Return a `TimeParam` for a timeval pointer.
@@ -3044,6 +3103,27 @@ pub struct PtRegs {
     pub xss: usize,
 }
 
+/// Context saved when entering the kernel
+///
+/// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/asm/ptrace.h#L178)
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Debug, Default)]
+pub struct PtRegs {
+    /// General purpose registers x0-x30
+    pub regs: [usize; 31],
+    /// Stack pointer
+    pub sp: usize,
+    /// Program counter
+    pub pc: usize,
+    /// Processor state (PSTATE)
+    pub pstate: usize,
+    /// Original syscall number (for syscall restart)
+    pub orig_x0: usize,
+    /// Syscall number
+    pub syscallno: usize,
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 pub const EFLAGS_DF: usize = 0x400;
 
@@ -3084,6 +3164,20 @@ impl PtRegs {
         }
     }
 
+    /// Get the `idx`th syscall argument.
+    ///
+    /// # Panics
+    ///
+    /// If `idx` is greater than 5, this function will panic.
+    #[cfg(target_arch = "aarch64")]
+    pub fn syscall_arg(&self, idx: usize) -> usize {
+        // ARM64 uses x0-x5 for syscall arguments
+        match idx {
+            0..=5 => self.regs[idx],
+            _ => panic!("Invalid syscall argument index: {}", idx),
+        }
+    }
+
     // (Private-only, only to be used via `SyscallRequest::try_from_raw`), get the `idx`th syscall
     // argument, reinterpret-truncated to the necessary type.
     fn sys_req_arg<T: ReinterpretTruncatedFromUsize>(&self, idx: usize) -> T {
@@ -3105,6 +3199,12 @@ impl PtRegs {
     #[cfg(target_arch = "x86")]
     pub fn get_ip(&self) -> usize {
         self.eip
+    }
+
+    /// Get the instruction pointer (IP)
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_ip(&self) -> usize {
+        self.pc
     }
 }
 

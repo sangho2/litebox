@@ -3,9 +3,12 @@
 
 //! Linux signal handling definitions.
 
+pub mod aarch64;
 pub mod x86;
 pub mod x86_64;
 
+#[cfg(target_arch = "aarch64")]
+use aarch64::Sigcontext;
 #[cfg(target_arch = "x86")]
 use x86::Sigcontext;
 #[cfg(target_arch = "x86_64")]

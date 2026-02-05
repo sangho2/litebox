@@ -3,11 +3,15 @@
 
 //! Signal handling syscalls and support.
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 #[cfg(target_arch = "x86")]
 pub(crate) mod x86;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+#[cfg(target_arch = "aarch64")]
+use aarch64 as arch;
 use litebox_common_linux::signal::SignalDisposition;
 #[cfg(target_arch = "x86")]
 use x86 as arch;
@@ -20,9 +24,10 @@ use crate::{ConstPtr, MutPtr, Task};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+use litebox::shim::Exception;
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
-    shim::Exception,
     sync::Mutex,
     utils::ReinterpretUnsignedExt as _,
 };
@@ -43,6 +48,9 @@ pub(crate) struct SignalState {
     /// Alternate signal stack.
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    last_exception: Cell<litebox::shim::ExceptionInfo>,
+    #[cfg(target_arch = "aarch64")]
     last_exception: Cell<litebox::shim::ExceptionInfo>,
 }
 
@@ -56,14 +64,17 @@ impl SignalState {
                 sp: 0,
                 flags: SsFlags::DISABLE,
                 size: 0,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             }),
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             last_exception: Cell::new(litebox::shim::ExceptionInfo {
                 exception: litebox::shim::Exception(0),
                 error_code: 0,
                 cr2: 0,
             }),
+            #[cfg(target_arch = "aarch64")]
+            last_exception: Cell::new(litebox::shim::ExceptionInfo { esr: 0, far: 0 }),
         }
     }
 
@@ -80,7 +91,7 @@ impl SignalState {
                 flags: SsFlags::DISABLE,
                 sp: 0,
                 size: 0,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             }
             .into(),
@@ -105,7 +116,7 @@ impl SignalState {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             };
         }
@@ -160,7 +171,7 @@ impl SignalHandlers {
                         restorer: 0,
                         flags: SaFlags::empty(),
                         mask: SigSet::empty(),
-                        #[cfg(target_arch = "x86_64")]
+                        #[cfg(target_pointer_width = "64")]
                         __pad: 0,
                     },
                     immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
@@ -272,7 +283,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_addr(fault_address),
     }
@@ -285,7 +296,7 @@ fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_zeroed(),
     }
@@ -317,7 +328,7 @@ impl SignalState {
                 sp: ss.sp,
                 flags: ss.flags & SsFlags::AUTODISARM,
                 size: ss.size,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             });
             Ok(())
@@ -330,7 +341,7 @@ impl SignalState {
             sp: 0,
             flags: SsFlags::DISABLE,
             size: 0,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(target_pointer_width = "64")]
             __pad: 0,
         });
     }
@@ -599,7 +610,7 @@ impl Task {
             signo: signal.as_i32(),
             errno: 0,
             code: SI_KERNEL,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(target_pointer_width = "64")]
             __pad: 0,
             data: SiginfoData::new_zeroed(),
         };
@@ -630,7 +641,7 @@ impl Task {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             };
             // Don't allow further changes to this action.
@@ -638,6 +649,7 @@ impl Task {
         }
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
         let signal = match info.exception {
             Exception::DIVIDE_ERROR => Signal::SIGFPE,
@@ -653,6 +665,16 @@ impl Task {
         } else {
             0
         };
+        self.signals.last_exception.set(*info);
+        self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
+        // ARM64: map ESR exception class to signal
+        // For now, all exceptions map to SIGSEGV with fault address
+        let signal = Signal::SIGSEGV;
+        let fault_address = info.far;
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }

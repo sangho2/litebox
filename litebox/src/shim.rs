@@ -130,3 +130,35 @@ impl Exception {
     /// #PF
     pub const PAGE_FAULT: Self = Self(14);
 }
+
+/// Information about a hardware exception (ARM64).
+#[cfg(target_arch = "aarch64")]
+#[derive(Copy, Clone, Debug)]
+pub struct ExceptionInfo {
+    /// The exception syndrome register value (ESR_EL1).
+    pub esr: u64,
+    /// The fault address register value (FAR_EL1).
+    pub far: usize,
+}
+
+/// An ARM64 exception class.
+#[cfg(target_arch = "aarch64")]
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ExceptionClass(pub u8);
+
+#[cfg(target_arch = "aarch64")]
+impl ExceptionClass {
+    /// Unknown exception
+    pub const UNKNOWN: Self = Self(0x00);
+    /// SVC instruction execution (system call)
+    pub const SVC: Self = Self(0x15);
+    /// Instruction abort from lower EL
+    pub const INSTRUCTION_ABORT_LOWER: Self = Self(0x20);
+    /// Instruction abort from same EL
+    pub const INSTRUCTION_ABORT_SAME: Self = Self(0x21);
+    /// Data abort from lower EL
+    pub const DATA_ABORT_LOWER: Self = Self(0x24);
+    /// Data abort from same EL
+    pub const DATA_ABORT_SAME: Self = Self(0x25);
+}

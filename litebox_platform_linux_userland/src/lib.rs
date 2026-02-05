@@ -3,9 +3,12 @@
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Linux.
 
-// Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
+// Restrict this crate to only work on Linux. For now, we are restricting this to x86/x86-64/aarch64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")
+))]
 
 use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -108,16 +111,38 @@ impl LinuxUserland {
         let tun_socket_fd = tun_device_name
             .map(|tun_device_name| {
                 let tun_path = b"/dev/net/tun\0";
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                let open_sysno = syscalls::Sysno::open;
+                #[cfg(target_arch = "aarch64")]
+                let open_sysno = syscalls::Sysno::openat;
+                #[cfg(target_arch = "aarch64")]
+                let at_fdcwd: usize = (-100isize) as usize;
                 let tun_fd = unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::open,
-                        tun_path.as_ptr() as usize,
-                        (litebox::fs::OFlags::RDWR
-                            | litebox::fs::OFlags::CLOEXEC
-                            | litebox::fs::OFlags::NONBLOCK)
-                            .bits() as usize,
-                        litebox::fs::Mode::empty().bits() as usize,
-                    )
+                    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                    {
+                        syscalls::syscall3(
+                            open_sysno,
+                            tun_path.as_ptr() as usize,
+                            (litebox::fs::OFlags::RDWR
+                                | litebox::fs::OFlags::CLOEXEC
+                                | litebox::fs::OFlags::NONBLOCK)
+                                .bits() as usize,
+                            litebox::fs::Mode::empty().bits() as usize,
+                        )
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        syscalls::syscall4(
+                            open_sysno,
+                            at_fdcwd,
+                            tun_path.as_ptr() as usize,
+                            (litebox::fs::OFlags::RDWR
+                                | litebox::fs::OFlags::CLOEXEC
+                                | litebox::fs::OFlags::NONBLOCK)
+                                .bits() as usize,
+                            litebox::fs::Mode::empty().bits() as usize,
+                        )
+                    }
                 }
                 .expect("failed to open tun device");
 
@@ -193,14 +218,28 @@ impl LinuxUserland {
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
-        let path = "/proc/self/maps";
+        let path = "/proc/self/maps\0";
         let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
-                path.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+            {
+                syscalls::syscall3(
+                    syscalls::Sysno::open,
+                    path.as_ptr() as usize,
+                    OFlags::RDONLY.bits() as usize,
+                    0,
+                )
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                const AT_FDCWD: usize = (-100isize) as usize;
+                syscalls::syscall4(
+                    syscalls::Sysno::openat,
+                    AT_FDCWD,
+                    path.as_ptr() as usize,
+                    OFlags::RDONLY.bits() as usize,
+                    0,
+                )
+            }
         };
         let Ok(fd) = fd else {
             return (alloc::vec::Vec::new(), None);
@@ -713,6 +752,256 @@ interrupt_callback:
 #[cfg(target_arch = "x86")]
 unsafe extern "fastcall-unwind" fn syscall_handler_fast(thread_ctx: &mut ThreadContext) {
     unsafe { syscall_handler(thread_ctx) }
+}
+
+// ARM64 TLS variables for context switching
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    "
+    .section .tbss
+    .align 8
+scratch:
+    .xword 0
+host_sp:
+    .xword 0
+host_fp:
+    .xword 0
+guest_context_top:
+    .xword 0
+.globl guest_tpidr
+guest_tpidr:
+    .xword 0
+.globl in_guest
+in_guest:
+    .byte 0
+.globl interrupt
+interrupt:
+    .byte 0
+    "
+);
+
+#[cfg(target_arch = "aarch64")]
+fn set_guest_tpidr(value: usize) {
+    unsafe {
+        // Store guest TPIDR_EL0 in TLS
+        let tls_base: usize;
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
+        let ptr = (tls_base as *mut usize).byte_offset(guest_tpidr_offset());
+        ptr.write_volatile(value);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn get_guest_tpidr() -> usize {
+    unsafe {
+        let tls_base: usize;
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
+        let ptr = (tls_base as *const usize).byte_offset(guest_tpidr_offset());
+        ptr.read_volatile()
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn guest_tpidr_offset() -> isize {
+    // SAFETY: accessing a symbol defined in TLS
+    unsafe extern "C" {
+        static guest_tpidr: u8;
+    }
+    // Calculate TLS offset - this is a simplification
+    unsafe { (&raw const guest_tpidr as isize).wrapping_sub(0) }
+}
+
+/// Runs the guest thread until it terminates (ARM64 version).
+///
+/// This saves all non-volatile register state then switches to the guest
+/// context. When the guest makes a syscall, it returns via the SIGSYS handler
+/// which redirects to `syscall_callback`.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C-unwind" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+    reenter: u8,
+) {
+    core::arch::naked_asm!(
+    "
+    .cfi_startproc
+    // Save callee-saved registers
+    stp x29, x30, [sp, #-16]!
+    .cfi_def_cfa_offset 16
+    .cfi_offset x29, -16
+    .cfi_offset x30, -8
+    mov x29, sp
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    stp x27, x28, [sp, #-16]!
+    str x0, [sp, #-16]!  // save thread_ctx
+
+    // Save host sp and fp in TLS
+    mrs x9, tpidr_el0
+    mov x10, sp
+    str x10, [x9, #:tprel_lo12:host_sp]
+    str x29, [x9, #:tprel_lo12:host_fp]
+
+    // Calculate guest context top and store in TLS
+    add x10, x1, {GUEST_CONTEXT_SIZE}
+    str x10, [x9, #:tprel_lo12:guest_context_top]
+
+    // Save host TPIDR in a callee-saved register for later restoration
+    // We'll use x28 to hold the host TPIDR
+
+    // Call init_handler or reenter_handler based on reenter flag
+    mov w3, w2  // reenter flag
+    cbz w3, 1f
+    bl {reenter_handler}
+    b .Ldone_aarch64
+1:
+    bl {init_handler}
+    b .Ldone_aarch64
+
+    // This entry point is called from the SIGSYS handler when guest issues svc
+.globl syscall_callback
+syscall_callback:
+    // Clear in_guest flag
+    mrs x9, tpidr_el0
+    strb wzr, [x9, #:tprel_lo12:in_guest]
+
+    // x30 contains the return address (set by SIGSYS handler)
+    // Save return address to scratch
+    str x30, [x9, #:tprel_lo12:scratch]
+
+    // Get guest context pointer
+    ldr x10, [x9, #:tprel_lo12:guest_context_top]
+    sub x10, x10, {GUEST_CONTEXT_SIZE}
+
+    // Save guest registers to PtRegs structure
+    // PtRegs layout: regs[31], sp, pc, pstate, orig_x0, syscallno
+    stp x0, x1, [x10, #0]
+    stp x2, x3, [x10, #16]
+    stp x4, x5, [x10, #32]
+    stp x6, x7, [x10, #48]
+    stp x8, x9, [x10, #64]
+    stp x10, x11, [x10, #80]
+    stp x12, x13, [x10, #96]
+    stp x14, x15, [x10, #112]
+    stp x16, x17, [x10, #128]
+    stp x18, x19, [x10, #144]
+    stp x20, x21, [x10, #160]
+    stp x22, x23, [x10, #176]
+    stp x24, x25, [x10, #192]
+    stp x26, x27, [x10, #208]
+    stp x28, x29, [x10, #224]
+    str x30, [x10, #240]  // x30/lr
+    mov x11, sp
+    str x11, [x10, #248]  // sp
+    ldr x11, [x9, #:tprel_lo12:scratch]
+    str x11, [x10, #256]  // pc
+    mrs x11, nzcv
+    str x11, [x10, #264]  // pstate (simplified)
+    str x0, [x10, #272]   // orig_x0
+    str x8, [x10, #280]   // syscallno
+
+    // Restore host sp and fp
+    ldr x11, [x9, #:tprel_lo12:host_sp]
+    mov sp, x11
+    ldr x29, [x9, #:tprel_lo12:host_fp]
+
+    // Load thread_ctx and call syscall handler
+    ldr x0, [sp]
+    bl {syscall_handler}
+    b .Ldone_aarch64
+
+.globl exception_callback
+exception_callback:
+    // Restore host sp and fp
+    mrs x9, tpidr_el0
+    ldr x11, [x9, #:tprel_lo12:host_sp]
+    mov sp, x11
+    ldr x29, [x9, #:tprel_lo12:host_fp]
+
+    // Call exception handler with thread_ctx
+    ldr x0, [sp]
+    bl {exception_handler}
+    b .Ldone_aarch64
+
+.globl interrupt_callback
+interrupt_callback:
+    // Restore host sp and fp
+    mrs x9, tpidr_el0
+    ldr x11, [x9, #:tprel_lo12:host_sp]
+    mov sp, x11
+    ldr x29, [x9, #:tprel_lo12:host_fp]
+
+    // Call interrupt handler
+    ldr x0, [sp]
+    bl {interrupt_handler}
+
+.Ldone_aarch64:
+    // Restore callee-saved registers
+    ldr x0, [sp], #16    // pop thread_ctx (discard)
+    ldp x27, x28, [sp], #16
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+",
+    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    init_handler = sym init_handler,
+    reenter_handler = sym reenter_handler,
+    syscall_handler = sym syscall_handler,
+    exception_handler = sym exception_handler,
+    interrupt_handler = sym interrupt_handler,
+    );
+}
+
+/// Switches to the provided guest context (ARM64 version).
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    core::arch::naked_asm!(
+        "switch_to_guest_start:",
+        // Set in_guest flag
+        "mrs x9, tpidr_el0",
+        "mov w10, #1",
+        "strb w10, [x9, #:tprel_lo12:in_guest]",
+        // Check for pending interrupt
+        "ldrb w10, [x9, #:tprel_lo12:interrupt]",
+        "cbnz w10, interrupt_callback",
+        // Restore guest context from ctx (x0 points to PtRegs)
+        // Load guest TPIDR and switch (if needed)
+        "ldr x10, [x9, #:tprel_lo12:guest_tpidr]",
+        "msr tpidr_el0, x10",
+        // Restore general purpose registers
+        "ldp x2, x3, [x0, #16]",
+        "ldp x4, x5, [x0, #32]",
+        "ldp x6, x7, [x0, #48]",
+        "ldp x8, x9, [x0, #64]",
+        "ldp x10, x11, [x0, #80]",
+        "ldp x12, x13, [x0, #96]",
+        "ldp x14, x15, [x0, #112]",
+        "ldp x16, x17, [x0, #128]",
+        "ldp x18, x19, [x0, #144]",
+        "ldp x20, x21, [x0, #160]",
+        "ldp x22, x23, [x0, #176]",
+        "ldp x24, x25, [x0, #192]",
+        "ldp x26, x27, [x0, #208]",
+        "ldp x28, x29, [x0, #224]",
+        "ldr x30, [x0, #240]",
+        // Load sp and pc
+        "ldr x1, [x0, #248]", // sp
+        "mov sp, x1",
+        // Load x0 and x1 last
+        "ldp x0, x1, [x0, #0]",
+        // Jump to guest pc (stored in x30)
+        "ret",
+        "switch_to_guest_end:",
+    );
 }
 
 /// Switches to the provided guest context.
@@ -1268,7 +1557,7 @@ fn futex_timeout(
     unsafe {
         syscalls::syscall6(
             {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
                     syscalls::Sysno::futex
                 }
@@ -1307,7 +1596,7 @@ fn futex_val2(
     unsafe {
         syscalls::syscall6(
             {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
                     syscalls::Sysno::futex
                 }
@@ -1356,6 +1645,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
     #[cfg(all(target_arch = "x86", feature = "x86_on_x64"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_F000; // Note running 32-bit programs on x86_64 kernel has a different limit than native x86
+    #[cfg(target_arch = "aarch64")]
+    const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // (1 << 48) - PAGE_SIZE for 48-bit VA
 
     fn allocate_pages(
         &self,
@@ -1385,7 +1676,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let r = unsafe {
             syscalls::syscall6(
                 {
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                     {
                         syscalls::Sysno::mmap
                     }
@@ -1577,6 +1868,7 @@ unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 extern "C-unwind" fn exception_handler(
     thread_ctx: &mut ThreadContext,
     trapno: usize,
@@ -1587,6 +1879,20 @@ extern "C-unwind" fn exception_handler(
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
+    };
+    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C-unwind" fn exception_handler(
+    thread_ctx: &mut ThreadContext,
+    _trapno: usize,
+    _error: usize,
+    far: usize,
+) {
+    let info = litebox::shim::ExceptionInfo {
+        esr: 0, // Would be extracted from signal context in a full implementation
+        far,
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
@@ -1618,6 +1924,15 @@ impl ThreadContext<'_> {
                 "mov BYTE PTR gs:interrupt@ntpoff, 0",
                 options(nostack, preserves_flags)
             );
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Clear interrupt flag in TLS
+                let tls_base: usize;
+                core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
+                let interrupt_ptr =
+                    (tls_base as *mut u8).byte_add(core::mem::offset_of!(TlsVars, interrupt));
+                interrupt_ptr.write_volatile(0);
+            }
         }
         let op = f(self.shim, self.ctx);
         match op {
@@ -1752,36 +2067,57 @@ fn register_exception_handlers() {
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
     let guard_page_size = 0x1000;
+
+    // Use raw syscalls with magic flags to bypass seccomp filter
     let stack_base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        let flags =
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | syscall_intercept::MMAP_FLAG_MAGIC as i32;
+        let r = syscalls::raw::syscall6(
+            syscalls::Sysno::mmap,
+            0, // addr
             guard_page_size + alt_stack_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
+            (libc::PROT_READ | libc::PROT_WRITE) as usize,
+            flags as usize,
+            usize::MAX, // fd = -1
+            0,          // offset
+        );
+        if (r as isize) < 0 {
+            panic!(
+                "failed to allocate memory for alternate signal stack: {}",
+                syscalls::Errno::from_ret(r).unwrap_err()
+            );
+        }
+        r as *mut libc::c_void
     };
-    assert!(
-        stack_base != libc::MAP_FAILED,
-        "failed to allocate memory for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
     let _unmap_guard = litebox::utils::defer(|| {
-        let r = unsafe { libc::munmap(stack_base, guard_page_size + alt_stack_size) };
+        // Use raw munmap with backdoor
+        let r = unsafe {
+            syscalls::raw::syscall3(
+                syscalls::Sysno::munmap,
+                stack_base as usize,
+                guard_page_size + alt_stack_size,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        };
         assert!(
-            r == 0,
-            "failed to free memory for alternate signal stack: {}",
-            std::io::Error::last_os_error()
+            (r as isize) >= 0,
+            "failed to free memory for alternate signal stack"
         );
     });
 
-    // Set up a guard page to catch stack overflows.
-    let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
+    // Set up a guard page to catch stack overflows (use backdoor)
+    let r = unsafe {
+        syscalls::raw::syscall4(
+            syscalls::Sysno::mprotect,
+            stack_base as usize,
+            guard_page_size,
+            libc::PROT_NONE as usize,
+            syscall_intercept::SYSCALL_ARG_MAGIC,
+        )
+    };
     assert!(
-        r == 0,
-        "failed to set guard page for alternate signal stack: {}",
-        std::io::Error::last_os_error()
+        (r as isize) >= 0,
+        "failed to set guard page for alternate signal stack"
     );
 
     let alt_stack = libc::stack_t {
@@ -2011,6 +2347,87 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     *orig_eax = *eax;
 }
 
+/// Called from signal handlers to fix up thread state after potentially running
+/// in the guest (ARM64 version).
+#[cfg(target_arch = "aarch64")]
+fn signal_handler_exit_guest(
+    _context: &libc::ucontext_t,
+    set_interrupt: bool,
+) -> Option<*mut litebox_common_linux::PtRegs> {
+    unsafe {
+        // Get TLS base
+        let tls_base: usize;
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
+
+        // Check in_guest flag and clear it
+        let in_guest_ptr = (tls_base as *mut u8).byte_add(core::mem::offset_of!(TlsVars, in_guest));
+        let is_in_guest = in_guest_ptr.read_volatile() != 0;
+        in_guest_ptr.write_volatile(0);
+
+        if set_interrupt {
+            let interrupt_ptr =
+                (tls_base as *mut u8).byte_add(core::mem::offset_of!(TlsVars, interrupt));
+            interrupt_ptr.write_volatile(1);
+        }
+
+        if !is_in_guest {
+            return None;
+        }
+
+        // Get guest context pointer from TLS
+        let guest_context_top_ptr =
+            (tls_base as *const usize).byte_add(core::mem::offset_of!(TlsVars, guest_context_top));
+        let guest_context_top =
+            guest_context_top_ptr.read_volatile() as *mut litebox_common_linux::PtRegs;
+        Some(guest_context_top.offset(-1))
+    }
+}
+
+// Placeholder struct for TLS offset calculations (ARM64)
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct TlsVars {
+    scratch: usize,
+    host_sp: usize,
+    host_fp: usize,
+    guest_context_top: usize,
+    guest_tpidr: usize,
+    in_guest: u8,
+    interrupt: u8,
+}
+
+/// Copies register state from a Linux signal context to a LiteBox PtRegs
+/// structure (ARM64 version).
+#[cfg(target_arch = "aarch64")]
+fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::ucontext_t) {
+    // Copy general purpose registers x0-x30
+    for i in 0..31 {
+        regs.regs[i] = context.uc_mcontext.regs[i] as usize;
+    }
+    regs.sp = context.uc_mcontext.sp as usize;
+    regs.pc = context.uc_mcontext.pc as usize;
+    regs.pstate = context.uc_mcontext.pstate as usize;
+    regs.orig_x0 = regs.regs[0];
+    regs.syscallno = regs.regs[8]; // x8 contains syscall number on ARM64
+}
+
+/// Updates a Linux signal context to return to `f` with the given arguments (ARM64 version).
+#[cfg(target_arch = "aarch64")]
+fn set_signal_return(
+    context: &mut libc::ucontext_t,
+    f: unsafe extern "C" fn(),
+    p0: isize,
+    p1: isize,
+    p2: isize,
+    p3: isize,
+) {
+    context.uc_mcontext.pc = f as u64;
+    context.uc_mcontext.regs[0] = p0 as u64;
+    context.uc_mcontext.regs[1] = p1 as u64;
+    context.uc_mcontext.regs[2] = p2 as u64;
+    context.uc_mcontext.regs[3] = p3 as u64;
+}
+
 /// Updates a Linux signal context to return to `f` with the given arguments.
 #[cfg(target_arch = "x86_64")]
 fn set_signal_return(
@@ -2064,19 +2481,31 @@ unsafe extern "C" fn exception_signal_handler(
     let _ = run_thread_arch as *const () as usize;
 
     // Jump to exception_callback.
-    let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
-    let (trapno, err, cr2) = (
-        sigctx.gregs[libc::REG_TRAPNO as usize].truncate(),
-        sigctx.gregs[libc::REG_ERR as usize].truncate(),
-        sigctx.gregs[libc::REG_CR2 as usize].truncate(),
-    );
+    let (trapno, err, cr2) = {
+        let sigctx = &context.uc_mcontext;
+        (
+            sigctx.gregs[libc::REG_TRAPNO as usize].truncate(),
+            sigctx.gregs[libc::REG_ERR as usize].truncate(),
+            sigctx.gregs[libc::REG_CR2 as usize].truncate(),
+        )
+    };
     #[cfg(target_arch = "x86")]
-    let (trapno, err, cr2) = (
-        sigctx.gregs[libc::REG_TRAPNO as usize] as isize,
-        sigctx.gregs[libc::REG_ERR as usize] as isize,
-        sigctx.cr2.reinterpret_as_signed() as isize,
-    );
+    let (trapno, err, cr2) = {
+        let sigctx = &context.uc_mcontext;
+        (
+            sigctx.gregs[libc::REG_TRAPNO as usize] as isize,
+            sigctx.gregs[libc::REG_ERR as usize] as isize,
+            sigctx.cr2.reinterpret_as_signed() as isize,
+        )
+    };
+    #[cfg(target_arch = "aarch64")]
+    let (trapno, err, cr2) = {
+        // ARM64 doesn't have these x86-specific registers
+        // Use fault_address from sigcontext
+        let fault_addr = context.uc_mcontext.fault_address as isize;
+        (0isize, 0isize, fault_addr)
+    };
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
 
@@ -2098,6 +2527,10 @@ unsafe fn next_signal_handler(
             {
                 context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc as usize
+            }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
             #[cfg(target_arch = "x86_64")]
@@ -2109,6 +2542,10 @@ unsafe fn next_signal_handler(
             {
                 context.uc_mcontext.gregs[libc::REG_EIP as usize] =
                     fixup_addr.reinterpret_as_signed().truncate();
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc = fixup_addr as u64;
             }
             return;
         }
@@ -2173,6 +2610,8 @@ unsafe fn interrupt_signal_handler(
         .truncate();
     #[cfg(target_arch = "x86")]
     let ip = context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize;
+    #[cfg(target_arch = "aarch64")]
+    let ip = context.uc_mcontext.pc as usize;
 
     // Case 1: at the beginning of the syscall handler.
     //

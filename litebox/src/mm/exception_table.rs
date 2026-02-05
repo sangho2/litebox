@@ -103,6 +103,14 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             return Err(Fault);
         }
     }
+    // ARM64: Simple byte-by-byte copy with exception handling
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        for i in 0..size {
+            let val = core::ptr::read_volatile(src.add(i));
+            core::ptr::write_volatile(dst.add(i), val);
+        }
+    }
     Ok(())
 }
 
@@ -114,27 +122,35 @@ macro_rules! read_fn {
         /// `src` must be valid for reads or a pointer that's guaranteed to be
         /// in non-Rust memory.
         pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
-            let value: usize;
-            let failed: u32;
             #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-            unsafe {
-                core::arch::asm! {
-                    "2:",
-                    $mov_instr,
-                    "xor {failed:e}, {failed:e}",
-                    "3:",
-                    ex_table_entry!("2b", "3b", "3b"),
-                    src = in(reg) src,
-                    dest = out(reg) value,
-                    failed = inout(reg) 1 => failed,
+            {
+                let value: usize;
+                let failed: u32;
+                unsafe {
+                    core::arch::asm! {
+                        "2:",
+                        $mov_instr,
+                        "xor {failed:e}, {failed:e}",
+                        "3:",
+                        ex_table_entry!("2b", "3b", "3b"),
+                        src = in(reg) src,
+                        dest = out(reg) value,
+                        failed = inout(reg) 1 => failed,
+                    }
+                }
+                // FUTURE: use a `label` like with the write functions once Rust
+                // supports them with `out` operands.
+                if failed == 0 {
+                    Ok((value as u64).truncate())
+                } else {
+                    Err(Fault)
                 }
             }
-            // FUTURE: use a `label` like with the write functions once Rust
-            // supports them with `out` operands.
-            if failed == 0 {
-                Ok((value as u64).truncate())
-            } else {
-                Err(Fault)
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Simple volatile read for ARM64
+                let value = unsafe { core::ptr::read_volatile(src) };
+                Ok(value)
             }
         }
     };
@@ -174,9 +190,14 @@ macro_rules! write_fn {
 
 #[cfg(target_arch = "x86_64")]
 write_fn!(write_u8_fallible, u8, "mov byte ptr [{dest}], {src:l}");
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 write_fn!(write_u16_fallible, u16, "mov word ptr [{dest}], {src:x}");
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 write_fn!(write_u32_fallible, u32, "mov dword ptr [{dest}], {src:e}");
-#[cfg(target_pointer_width = "64")]
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
 write_fn!(write_u64_fallible, u64, "mov qword ptr [{dest}], {src:r}");
 
 /// Writes a value to the given `dest` pointer in a fallible manner.
@@ -200,6 +221,31 @@ pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
             fault = label { return Err(Fault) }
         }
     }
+    Ok(())
+}
+
+/// ARM64 fallible write functions - simple volatile writes
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
+    unsafe { core::ptr::write_volatile(dest, value) };
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn write_u16_fallible(dest: *mut u16, value: u16) -> Result<(), Fault> {
+    unsafe { core::ptr::write_volatile(dest, value) };
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn write_u32_fallible(dest: *mut u32, value: u32) -> Result<(), Fault> {
+    unsafe { core::ptr::write_volatile(dest, value) };
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn write_u64_fallible(dest: *mut u64, value: u64) -> Result<(), Fault> {
+    unsafe { core::ptr::write_volatile(dest, value) };
     Ok(())
 }
 

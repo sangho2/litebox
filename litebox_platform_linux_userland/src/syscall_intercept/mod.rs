@@ -6,8 +6,14 @@
 #[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
 pub(crate) mod systrap;
 
+#[cfg(all(target_arch = "aarch64", feature = "systrap_backend"))]
+pub(crate) mod systrap_aarch64;
+
 #[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
 pub(crate) use systrap::init_sys_intercept;
+
+#[cfg(all(target_arch = "aarch64", feature = "systrap_backend"))]
+pub(crate) use systrap_aarch64::init_sys_intercept;
 
 #[cfg(target_arch = "x86")]
 pub(crate) fn init_sys_intercept() {
@@ -22,5 +28,7 @@ pub(crate) fn init_sys_intercept() {
 pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LITE BOX");
 #[cfg(target_arch = "x86")]
 pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LtBx");
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SYSCALL_ARG_MAGIC: usize = usize::from_le_bytes(*b"LITE BOX");
 
 pub(crate) const MMAP_FLAG_MAGIC: u32 = 1 << 31;
