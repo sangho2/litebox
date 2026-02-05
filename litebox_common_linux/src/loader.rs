@@ -45,8 +45,10 @@ pub struct MappingInfo {
     pub phdrs_addr: usize,
     /// The number of program headers.
     pub num_phdrs: usize,
-    /// The mapped address of the trampoline section, if present.
+    /// The mapped address of the trampoline data section, if present.
+    /// This points to the data section (RW) containing magic, handler, and host TLS.
     /// On ARM64, switch_to_guest writes host TLS to offset 16 of this address.
+    /// The code section (R-X) is at trampoline_addr + 0x1000.
     pub trampoline_addr: Option<usize>,
 }
 
@@ -62,11 +64,12 @@ impl MappingInfo {
 
 #[derive(Debug)]
 struct TrampolineInfo {
-    /// The virtual memory of the trampoline code.
+    /// The virtual memory address where the data section should be mapped.
+    /// This is where magic, handler address, and host TLS pointer are stored.
     vaddr: usize,
-    /// The file offset of the trampoline code in the ELF file.
+    /// The file offset of the trampoline (data + code) in the ELF file.
     file_offset: u64,
-    /// Size of the trampoline code in the ELF file.
+    /// Total size of the trampoline (data page + code section).
     size: usize,
     /// The entry point to jump to in the trampoline.
     syscall_entry_point: usize,
@@ -475,6 +478,13 @@ impl ElfParsedFile {
     }
 
     /// Load the LiteBox trampoline into memory.
+    ///
+    /// The trampoline uses a W^X layout with two sections:
+    /// - Data section (first page, RW): Contains magic, handler address, host TLS pointer
+    /// - Code section (remaining pages, R-X): Contains per-SVC trampoline entries
+    ///
+    /// The data section is mapped as RW (not executable) and the code section is
+    /// mapped as R-X (not writable), achieving proper W^X separation.
     fn load_trampoline<M: MapMemory>(
         &self,
         mapper: &mut M,
@@ -482,12 +492,21 @@ impl ElfParsedFile {
         info: &mut MappingInfo,
     ) -> Result<(), ElfLoadError<M::Error>> {
         let trampoline = self.trampoline.as_ref().unwrap();
-        let trampoline_start = info.base_addr + trampoline.vaddr;
-        let trampoline_end = page_align_up(info.base_addr + trampoline.vaddr + trampoline.size);
+
+        // Data section is first page (0x1000 bytes)
+        let data_start = info.base_addr + trampoline.vaddr;
+        let data_size = 0x1000; // One page for data section
+
+        // Code section starts after data section
+        let code_start = data_start + data_size;
+        let code_size = trampoline.size.saturating_sub(data_size);
+        let code_end = page_align_up(code_start + code_size);
+
+        // Map data section as RW (not executable)
         mapper
             .map_file(
-                trampoline_start,
-                trampoline_end - trampoline_start,
+                data_start,
+                data_size,
                 trampoline.file_offset,
                 &Protection {
                     read: true,
@@ -497,20 +516,20 @@ impl ElfParsedFile {
             )
             .map_err(ElfLoadError::Map)?;
 
-        // Validate the trampoline version number.
+        // Validate the trampoline version number (at start of data section).
         let mut version = 0u64;
-        mem.read(trampoline_start, version.as_mut_bytes())?;
+        mem.read(data_start, version.as_mut_bytes())?;
         if version != REWRITER_VERSION_NUMBER {
             return Err(ElfLoadError::InvalidTrampolineVersion);
         }
 
-        // Write the trampoline entry point.
+        // Write the syscall handler entry point to data section offset 8.
         debug_assert_ne!(
             trampoline.syscall_entry_point, 0,
             "syscall_entry_point must not be 0"
         );
         mem.write(
-            trampoline_start + 8,
+            data_start + 8,
             &trampoline.syscall_entry_point.to_ne_bytes(),
         )?;
 
@@ -518,34 +537,32 @@ impl ElfParsedFile {
         #[cfg(debug_assertions)]
         {
             let mut verify = 0usize;
-            mem.read(trampoline_start + 8, verify.as_mut_bytes())?;
+            mem.read(data_start + 8, verify.as_mut_bytes())?;
             debug_assert_eq!(
                 verify, trampoline.syscall_entry_point,
                 "Write verification failed"
             );
         }
 
-        // Now that the write is done, protect the trampoline code.
-        // On ARM64, we need write access for switch_to_guest to store host TLS at offset 16.
-        // This is a limitation of the rewriter backend on ARM64 (single-threaded only).
-        #[cfg(target_arch = "aarch64")]
-        let prot = Protection {
-            read: true,
-            write: true,
-            execute: true,
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        let prot = Protection {
-            read: true,
-            write: false,
-            execute: true,
-        };
-        mapper
-            .protect(trampoline_start, trampoline_end - trampoline_start, &prot)
-            .map_err(ElfLoadError::Map)?;
+        // Map code section as R-X (not writable) if there is any code
+        if code_size > 0 {
+            mapper
+                .map_file(
+                    code_start,
+                    code_end - code_start,
+                    trampoline.file_offset + data_size as u64,
+                    &Protection {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                )
+                .map_err(ElfLoadError::Map)?;
+        }
 
-        info.brk = info.brk.max(trampoline_end);
-        info.trampoline_addr = Some(trampoline_start);
+        info.brk = info.brk.max(code_end);
+        // Store the data section address - this is where switch_to_guest writes host TLS
+        info.trampoline_addr = Some(data_start);
         Ok(())
     }
 
@@ -624,7 +641,7 @@ pub trait MapMemory {
     ///
     /// Fails if any of the parameters are not page-aligned.
     fn protect(&mut self, address: usize, len: usize, prot: &Protection)
-    -> Result<(), Self::Error>;
+        -> Result<(), Self::Error>;
 }
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].
