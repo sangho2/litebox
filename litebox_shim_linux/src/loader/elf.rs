@@ -153,6 +153,9 @@ impl litebox_common_linux::loader::MapMemory for ElfFile<'_> {
 pub struct ElfLoadInfo {
     pub entry_point: usize,
     pub user_stack_top: usize,
+    /// The address of the trampoline section for syscall rewriting.
+    /// This is used by ARM64 to store host TLS at offset 16.
+    pub trampoline_addr: Option<usize>,
 }
 
 /// Loader for ELF files
@@ -172,7 +175,8 @@ impl<'a> FileAndParsed<'a> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
+        let entry_point = task.global.platform.get_syscall_entry_point();
+        parsed.parse_trampoline(&mut &file, entry_point)?;
         Ok(Self { file, parsed })
     }
 }
@@ -250,6 +254,7 @@ impl<'a> ElfLoader<'a> {
         Ok(ElfLoadInfo {
             entry_point: entry,
             user_stack_top: stack.get_cur_stack_top(),
+            trampoline_addr: info.trampoline_addr,
         })
     }
 

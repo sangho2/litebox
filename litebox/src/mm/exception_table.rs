@@ -103,12 +103,39 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             return Err(Fault);
         }
     }
-    // ARM64: Simple byte-by-byte copy with exception handling
+    // ARM64: Byte-by-byte copy with exception table for fallible access
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        for i in 0..size {
-            let val = core::ptr::read_volatile(src.add(i));
-            core::ptr::write_volatile(dst.add(i), val);
+        let mut remaining = size;
+        let mut src_ptr = src;
+        let mut dst_ptr = dst;
+
+        while remaining > 0 {
+            // Copy one byte at a time with exception handling
+            let result: u64;
+            core::arch::asm! {
+                "2:",
+                "ldrb {tmp:w}, [{src}]",
+                "strb {tmp:w}, [{dst}]",
+                "mov {result}, #0",  // success
+                "3:",
+                ex_table_entry!("2b", "3b", "4f"),
+                "b 5f",
+                "4:",
+                "mov {result}, #1",  // fault
+                "5:",
+                src = in(reg) src_ptr,
+                dst = in(reg) dst_ptr,
+                tmp = out(reg) _,
+                result = out(reg) result,
+                options(nostack),
+            }
+            if result != 0 {
+                return Err(Fault);
+            }
+            src_ptr = src_ptr.add(1);
+            dst_ptr = dst_ptr.add(1);
+            remaining -= 1;
         }
     }
     Ok(())
@@ -121,46 +148,92 @@ macro_rules! read_fn {
         /// # Safety
         /// `src` must be valid for reads or a pointer that's guaranteed to be
         /// in non-Rust memory.
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
-            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-            {
-                let value: usize;
-                let failed: u32;
-                unsafe {
-                    core::arch::asm! {
-                        "2:",
-                        $mov_instr,
-                        "xor {failed:e}, {failed:e}",
-                        "3:",
-                        ex_table_entry!("2b", "3b", "3b"),
-                        src = in(reg) src,
-                        dest = out(reg) value,
-                        failed = inout(reg) 1 => failed,
-                    }
-                }
-                // FUTURE: use a `label` like with the write functions once Rust
-                // supports them with `out` operands.
-                if failed == 0 {
-                    Ok((value as u64).truncate())
-                } else {
-                    Err(Fault)
+            let value: usize;
+            let failed: u32;
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $mov_instr,
+                    "xor {failed:e}, {failed:e}",
+                    "3:",
+                    ex_table_entry!("2b", "3b", "3b"),
+                    src = in(reg) src,
+                    dest = out(reg) value,
+                    failed = inout(reg) 1 => failed,
                 }
             }
-            #[cfg(target_arch = "aarch64")]
-            {
-                // Simple volatile read for ARM64
-                let value = unsafe { core::ptr::read_volatile(src) };
-                Ok(value)
+            // FUTURE: use a `label` like with the write functions once Rust
+            // supports them with `out` operands.
+            if failed == 0 {
+                Ok((value as u64).truncate())
+            } else {
+                Err(Fault)
             }
         }
     };
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 read_fn!(read_u8_fallible, u8, "movzx {dest:e}, byte ptr [{src}]");
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 read_fn!(read_u16_fallible, u16, "movzx {dest:e}, word ptr [{src}]");
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 read_fn!(read_u32_fallible, u32, "mov {dest:e}, dword ptr [{src}]");
-#[cfg(target_pointer_width = "64")]
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
 read_fn!(read_u64_fallible, u64, "mov {dest:r}, qword ptr [{src}]");
+
+/// ARM64 fallible read functions
+#[cfg(target_arch = "aarch64")]
+macro_rules! read_fn_aarch64 {
+    ($name:ident, $ty:ty, $ldr_instr:expr) => {
+        /// Reads a value from the given `src` pointer in a fallible manner.
+        ///
+        /// # Safety
+        /// `src` must be valid for reads or a pointer that's guaranteed to be
+        /// in non-Rust memory.
+        pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
+            let value: u64;
+            let result: u64;
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $ldr_instr,
+                    "mov {result}, #0",  // success
+                    "3:",
+                    ex_table_entry!("2b", "3b", "4f"),
+                    "b 5f",
+                    "4:",
+                    "mov {result}, #1",  // fault
+                    "mov {value}, #0",
+                    "5:",
+                    src = in(reg) src,
+                    value = out(reg) value,
+                    result = out(reg) result,
+                    options(nostack),
+                }
+            }
+            if result == 0 {
+                Ok(value as $ty)
+            } else {
+                Err(Fault)
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+read_fn_aarch64!(read_u8_fallible, u8, "ldrb {value:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn_aarch64!(read_u16_fallible, u16, "ldrh {value:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn_aarch64!(read_u32_fallible, u32, "ldr {value:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn_aarch64!(read_u64_fallible, u64, "ldr {value:x}, [{src}]");
 
 macro_rules! write_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
@@ -224,29 +297,97 @@ pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
     Ok(())
 }
 
-/// ARM64 fallible write functions - simple volatile writes
+/// ARM64 fallible write functions with exception table support
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
-    unsafe { core::ptr::write_volatile(dest, value) };
-    Ok(())
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "strb {value:w}, [{dest}]",
+            "mov {result}, #0",  // success
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",  // fault
+            "5:",
+            dest = in(reg) dest,
+            value = in(reg) value as u64,
+            result = out(reg) result,
+            options(nostack),
+        }
+    }
+    if result == 0 { Ok(()) } else { Err(Fault) }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u16_fallible(dest: *mut u16, value: u16) -> Result<(), Fault> {
-    unsafe { core::ptr::write_volatile(dest, value) };
-    Ok(())
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "strh {value:w}, [{dest}]",
+            "mov {result}, #0",  // success
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",  // fault
+            "5:",
+            dest = in(reg) dest,
+            value = in(reg) value as u64,
+            result = out(reg) result,
+            options(nostack),
+        }
+    }
+    if result == 0 { Ok(()) } else { Err(Fault) }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u32_fallible(dest: *mut u32, value: u32) -> Result<(), Fault> {
-    unsafe { core::ptr::write_volatile(dest, value) };
-    Ok(())
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "str {value:w}, [{dest}]",
+            "mov {result}, #0",  // success
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",  // fault
+            "5:",
+            dest = in(reg) dest,
+            value = in(reg) value as u64,
+            result = out(reg) result,
+            options(nostack),
+        }
+    }
+    if result == 0 { Ok(()) } else { Err(Fault) }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u64_fallible(dest: *mut u64, value: u64) -> Result<(), Fault> {
-    unsafe { core::ptr::write_volatile(dest, value) };
-    Ok(())
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "str {value:x}, [{dest}]",
+            "mov {result}, #0",  // success
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",  // fault
+            "5:",
+            dest = in(reg) dest,
+            value = in(reg) value,
+            result = out(reg) result,
+            options(nostack),
+        }
+    }
+    if result == 0 { Ok(()) } else { Err(Fault) }
 }
 
 /// Exception table entry with relative offsets
@@ -275,6 +416,7 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
     // generated.
     //
     // SAFETY: just a no-op asm block to force the section to be created.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
     unsafe {
         core::arch::asm!(concat!(
             ".pushsection ",
@@ -285,6 +427,7 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
     }
 
     // SAFETY: accessing the section as defined above.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
     unsafe {
         core::slice::from_raw_parts(
             START_EX_TABLE.as_ptr(),

@@ -762,6 +762,10 @@ core::arch::global_asm!(
     .align 8
 scratch:
     .xword 0
+scratch2:
+    .xword 0
+guest_lr:
+    .xword 0
 host_sp:
     .xword 0
 host_fp:
@@ -770,6 +774,9 @@ guest_context_top:
     .xword 0
 .globl guest_tpidr
 guest_tpidr:
+    .xword 0
+.globl trampoline_base
+trampoline_base:
     .xword 0
 .globl in_guest
 in_guest:
@@ -811,6 +818,37 @@ fn guest_tpidr_offset() -> isize {
     unsafe { (&raw const guest_tpidr as isize).wrapping_sub(0) }
 }
 
+/// Set the trampoline base address for syscall rewriting (ARM64 only).
+/// This must be called before entering guest code when using the rewriter backend.
+#[cfg(target_arch = "aarch64")]
+pub fn set_trampoline_base(addr: usize) {
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el0",
+            "str {val}, [{tmp}, #:tprel_lo12:trampoline_base]",
+            tmp = out(reg) _,
+            val = in(reg) addr,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Get the trampoline base address (ARM64 only).
+#[cfg(target_arch = "aarch64")]
+fn get_trampoline_base() -> usize {
+    let result: usize;
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el0",
+            "ldr {result}, [{tmp}, #:tprel_lo12:trampoline_base]",
+            tmp = out(reg) _,
+            result = out(reg) result,
+            options(nostack, preserves_flags)
+        );
+    }
+    result
+}
+
 /// Runs the guest thread until it terminates (ARM64 version).
 ///
 /// This saves all non-volatile register state then switches to the guest
@@ -849,8 +887,8 @@ unsafe extern "C-unwind" fn run_thread_arch(
     add x10, x1, {GUEST_CONTEXT_SIZE}
     str x10, [x9, #:tprel_lo12:guest_context_top]
 
-    // Save host TPIDR in a callee-saved register for later restoration
-    // We'll use x28 to hold the host TPIDR
+    // Note: We no longer set x28 here because Rust code may clobber callee-saved
+    // registers. Instead, switch_to_guest reads host TLS from tpidr_el0 directly.
 
     // Call init_handler or reenter_handler based on reenter flag
     mov w3, w2  // reenter flag
@@ -861,52 +899,88 @@ unsafe extern "C-unwind" fn run_thread_arch(
     bl {init_handler}
     b .Ldone_aarch64
 
-    // This entry point is called from the SIGSYS handler when guest issues svc
+    // This entry point is called from the SIGSYS handler when guest issues svc,
+    // or directly from the trampoline in rewriter mode.
 .globl syscall_callback
 syscall_callback:
-    // Clear in_guest flag
+    // x18 contains the host's TPIDR_EL0 (set by switch_to_guest from x19).
+    // Use x18 for all TLS accesses to support both systrap and rewriter modes.
+    
+    // First, save guest's x9 and x10 to TLS scratch areas so we can use them
+    // We need two registers: one for TLS access (x9) and one for PtRegs base (x10)
+    str x9, [x18, #:tprel_lo12:scratch]
+    str x10, [x18, #:tprel_lo12:scratch2]
+    
+    // Save guest's TPIDR_EL0 before restoring host's
     mrs x9, tpidr_el0
-    strb wzr, [x9, #:tprel_lo12:in_guest]
+    str x9, [x18, #:tprel_lo12:guest_tpidr]
+    
+    // Restore host's TPIDR_EL0
+    msr tpidr_el0, x18
+    
+    // Clear in_guest flag (now using host TLS via x18)
+    strb wzr, [x18, #:tprel_lo12:in_guest]
 
-    // x30 contains the return address (set by SIGSYS handler)
-    // Save return address to scratch
-    str x30, [x9, #:tprel_lo12:scratch]
-
-    // Get guest context pointer
-    ldr x10, [x9, #:tprel_lo12:guest_context_top]
+    // Get guest context pointer and compute PtRegs base
+    ldr x10, [x18, #:tprel_lo12:guest_context_top]
     sub x10, x10, {GUEST_CONTEXT_SIZE}
 
-    // Save guest registers to PtRegs structure
-    // PtRegs layout: regs[31], sp, pc, pstate, orig_x0, syscallno
+    // Save guest registers to PtRegs structure at x10
+    // PtRegs layout: regs[0..30] at offsets 0..240, then sp, pc, pstate, orig_x0, syscallno
     stp x0, x1, [x10, #0]
     stp x2, x3, [x10, #16]
     stp x4, x5, [x10, #32]
     stp x6, x7, [x10, #48]
+    // x8 is valid, x9 was saved earlier - load it from scratch
+    ldr x9, [x18, #:tprel_lo12:scratch]
     stp x8, x9, [x10, #64]
-    stp x10, x11, [x10, #80]
+    // Load guest x10 from scratch2 and save with x11
+    ldr x9, [x18, #:tprel_lo12:scratch2]
+    stp x9, x11, [x10, #80]
     stp x12, x13, [x10, #96]
     stp x14, x15, [x10, #112]
+    
+    // For x16, x17, x30 we need to get the ORIGINAL guest values.
+    // The trampoline saved them to trampoline_base+24, +32, +40 before clobbering.
+    // x16, x17, x30 currently contain trampoline scratch values.
+    // Load trampoline_base from TLS, then load guest values from header.
+    ldr x9, [x18, #:tprel_lo12:trampoline_base]
+    cbz x9, 1f                   // If no trampoline (systrap mode), use current values
+    
+    // Rewriter mode: load guest x16, x17, x30 from trampoline header
+    ldr x11, [x9, #24]           // Load guest's original x16
+    ldr x12, [x9, #32]           // Load guest's original x17
+    ldr x13, [x9, #40]           // Load guest's original x30
+    stp x11, x12, [x10, #128]    // Store guest's x16, x17 to regs[16], regs[17]
+    str x13, [x10, #240]         // Store guest's x30 to regs[30]
+    b 2f
+1:
+    // Systrap mode: x16, x17, x30 are guest's actual values
     stp x16, x17, [x10, #128]
-    stp x18, x19, [x10, #144]
+    str x30, [x10, #240]
+2:
+    // x18 is clobbered (used for host TLS) - store 0 for guest x18 slot
+    mov x9, #0
+    stp x9, x19, [x10, #144]
     stp x20, x21, [x10, #160]
     stp x22, x23, [x10, #176]
     stp x24, x25, [x10, #192]
     stp x26, x27, [x10, #208]
+    // x28 is the guest's actual value (not clobbered by trampoline)
     stp x28, x29, [x10, #224]
-    str x30, [x10, #240]  // x30/lr
-    mov x11, sp
-    str x11, [x10, #248]  // sp
-    ldr x11, [x9, #:tprel_lo12:scratch]
-    str x11, [x10, #256]  // pc
-    mrs x11, nzcv
-    str x11, [x10, #264]  // pstate (simplified)
+    
+    mov x9, sp
+    str x9, [x10, #248]  // sp
+    str x30, [x10, #256]  // pc = return address from trampoline (where to resume)
+    mrs x9, nzcv
+    str x9, [x10, #264]  // pstate (simplified)
     str x0, [x10, #272]   // orig_x0
     str x8, [x10, #280]   // syscallno
 
-    // Restore host sp and fp
-    ldr x11, [x9, #:tprel_lo12:host_sp]
-    mov sp, x11
-    ldr x29, [x9, #:tprel_lo12:host_fp]
+    // Restore host sp and fp (using x18 as TLS base)
+    ldr x9, [x18, #:tprel_lo12:host_sp]
+    mov sp, x9
+    ldr x29, [x18, #:tprel_lo12:host_fp]
 
     // Load thread_ctx and call syscall handler
     ldr x0, [sp]
@@ -915,11 +989,10 @@ syscall_callback:
 
 .globl exception_callback
 exception_callback:
-    // Restore host sp and fp
-    mrs x9, tpidr_el0
-    ldr x11, [x9, #:tprel_lo12:host_sp]
+    // Restore host sp and fp (x18 holds host TLS base)
+    ldr x11, [x18, #:tprel_lo12:host_sp]
     mov sp, x11
-    ldr x29, [x9, #:tprel_lo12:host_fp]
+    ldr x29, [x18, #:tprel_lo12:host_fp]
 
     // Call exception handler with thread_ctx
     ldr x0, [sp]
@@ -928,11 +1001,10 @@ exception_callback:
 
 .globl interrupt_callback
 interrupt_callback:
-    // Restore host sp and fp
-    mrs x9, tpidr_el0
-    ldr x11, [x9, #:tprel_lo12:host_sp]
+    // Restore host sp and fp (x18 holds host TLS base)
+    ldr x11, [x18, #:tprel_lo12:host_sp]
     mov sp, x11
-    ldr x29, [x9, #:tprel_lo12:host_fp]
+    ldr x29, [x18, #:tprel_lo12:host_fp]
 
     // Call interrupt handler
     ldr x0, [sp]
@@ -966,18 +1038,31 @@ interrupt_callback:
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
         "switch_to_guest_start:",
-        // Set in_guest flag
-        "mrs x9, tpidr_el0",
+        // At this point, tpidr_el0 still has host TLS.
+        "mrs x18, tpidr_el0",
+        // Write host TLS to trampoline section at offset 16.
+        // This is used by the trampoline to restore x18 before calling the handler.
+        // trampoline_base is stored in TLS at a known offset.
+        "ldr x10, [x18, #:tprel_lo12:trampoline_base]",
+        "cbz x10, 1f",         // Skip if no trampoline (systrap mode)
+        "str x18, [x10, #16]", // Write host TLS to trampoline_base + 16
+        "1:",
+        // Set in_guest flag (using x18 for TLS access)
         "mov w10, #1",
-        "strb w10, [x9, #:tprel_lo12:in_guest]",
+        "strb w10, [x18, #:tprel_lo12:in_guest]",
         // Check for pending interrupt
-        "ldrb w10, [x9, #:tprel_lo12:interrupt]",
+        "ldrb w10, [x18, #:tprel_lo12:interrupt]",
         "cbnz w10, interrupt_callback",
         // Restore guest context from ctx (x0 points to PtRegs)
-        // Load guest TPIDR and switch (if needed)
-        "ldr x10, [x9, #:tprel_lo12:guest_tpidr]",
-        "msr tpidr_el0, x10",
-        // Restore general purpose registers
+        // First, load guest PC into x18 since we don't restore x18 anyway
+        // pc is at offset 256
+        "ldr x18, [x0, #256]",
+        // Load guest TPIDR and switch
+        "mrs x10, tpidr_el0", // Get host TLS
+        "ldr x10, [x10, #:tprel_lo12:guest_tpidr]",
+        "msr tpidr_el0, x10", // Switch to guest TPIDR
+        // Restore general purpose registers from PtRegs
+        // regs[0..30] at offsets 0..240, then sp at 248, pc at 256
         "ldp x2, x3, [x0, #16]",
         "ldp x4, x5, [x0, #32]",
         "ldp x6, x7, [x0, #48]",
@@ -986,20 +1071,23 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "ldp x12, x13, [x0, #96]",
         "ldp x14, x15, [x0, #112]",
         "ldp x16, x17, [x0, #128]",
-        "ldp x18, x19, [x0, #144]",
+        // x18 at offset 144 - skip (used for PC jump)
+        "ldr x19, [x0, #152]",
         "ldp x20, x21, [x0, #160]",
         "ldp x22, x23, [x0, #176]",
         "ldp x24, x25, [x0, #192]",
         "ldp x26, x27, [x0, #208]",
+        // x28 at offset 224
         "ldp x28, x29, [x0, #224]",
+        // x30 at offset 240
         "ldr x30, [x0, #240]",
-        // Load sp and pc
-        "ldr x1, [x0, #248]", // sp
+        // Load sp at offset 248
+        "ldr x1, [x0, #248]",
         "mov sp, x1",
         // Load x0 and x1 last
         "ldp x0, x1, [x0, #0]",
-        // Jump to guest pc (stored in x30)
-        "ret",
+        // Jump to guest pc (in x18)
+        "br x18",
         "switch_to_guest_end:",
     );
 }
@@ -1865,6 +1953,35 @@ unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
 unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Debug: print syscall number and guest PC
+        let syscallno = thread_ctx.ctx.syscallno;
+        let pc = thread_ctx.ctx.pc;
+        let x0 = thread_ctx.ctx.regs[0];
+        let x16 = thread_ctx.ctx.regs[16];
+        let x17 = thread_ctx.ctx.regs[17];
+        let x30 = thread_ctx.ctx.regs[30];
+
+        // Debug: read directly from trampoline header to verify stores
+        let tb = get_trampoline_base();
+        if tb != 0 {
+            unsafe {
+                let saved_x16 = core::ptr::read_unaligned((tb + 24) as *const usize);
+                let saved_x17 = core::ptr::read_unaligned((tb + 32) as *const usize);
+                let saved_x30 = core::ptr::read_unaligned((tb + 40) as *const usize);
+                eprintln!(
+                    "DEBUG: tb=0x{:x}, header x16=0x{:x}, x17=0x{:x}, x30=0x{:x}",
+                    tb, saved_x16, saved_x17, saved_x30
+                );
+            }
+        }
+
+        eprintln!(
+            "DEBUG: syscall #{} at PC=0x{:x}, x0=0x{:x}, x16=0x{:x}, x17=0x{:x}, x30=0x{:x}",
+            syscallno, pc, x0, x16, x17, x30
+        );
+    }
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
@@ -1910,6 +2027,19 @@ impl ThreadContext<'_> {
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
     ) {
+        // Debug: Check trampoline_base before switching to guest
+        #[cfg(target_arch = "aarch64")]
+        {
+            let tb = get_trampoline_base();
+            let saved_pc = self.ctx.pc;
+            let saved_x0 = self.ctx.regs[0];
+            let saved_x30 = self.ctx.regs[30];
+            eprintln!(
+                "DEBUG: call_shim START: PC=0x{:x}, x0=0x{:x}, x30=0x{:x}, tb=0x{:x}",
+                saved_pc, saved_x0, saved_x30, tb
+            );
+        }
+
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
@@ -1926,15 +2056,41 @@ impl ThreadContext<'_> {
             );
             #[cfg(target_arch = "aarch64")]
             {
-                // Clear interrupt flag in TLS
-                let tls_base: usize;
-                core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
-                let interrupt_ptr =
-                    (tls_base as *mut u8).byte_add(core::mem::offset_of!(TlsVars, interrupt));
-                interrupt_ptr.write_volatile(0);
+                // Clear interrupt flag in TLS using linker-resolved offset
+                core::arch::asm!(
+                    "mrs {tmp}, tpidr_el0",
+                    "strb wzr, [{tmp}, #:tprel_lo12:interrupt]",
+                    tmp = out(reg) _,
+                    options(nostack)
+                );
             }
         }
         let op = f(self.shim, self.ctx);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let saved_pc = self.ctx.pc;
+            let saved_x0 = self.ctx.regs[0];
+            let saved_x30 = self.ctx.regs[30];
+            let saved_sp = self.ctx.sp;
+            eprintln!(
+                "DEBUG: call_shim END: PC=0x{:x}, x0=0x{:x}, x30=0x{:x}, sp=0x{:x}",
+                saved_pc, saved_x0, saved_x30, saved_sp
+            );
+
+            // Verify PC is valid before resuming
+            if saved_pc == 0 || saved_pc > 0xFFFF_FFFF_FFFF {
+                panic!("DEBUG: Invalid PC 0x{:x} before switch_to_guest", saved_pc);
+            }
+
+            // Also verify that ctx.pc is what we expect
+            let actual_pc = self.ctx.pc;
+            if actual_pc != saved_pc {
+                panic!(
+                    "DEBUG: ctx.pc changed from 0x{:x} to 0x{:x}",
+                    saved_pc, actual_pc
+                );
+            }
+        }
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
             ContinueOperation::ExitThread => {}
@@ -1958,6 +2114,21 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
             return None;
         }
         self.vdso_address
+    }
+}
+
+impl LinuxUserland {
+    /// Set the trampoline base address for ARM64 syscall rewriting.
+    /// This must be called before entering guest code when using the rewriter backend.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_trampoline_base_addr(&self, addr: usize) {
+        set_trampoline_base(addr);
+    }
+
+    /// No-op on non-ARM64 platforms.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn set_trampoline_base_addr(&self, _addr: usize) {
+        // No-op
     }
 }
 
@@ -2125,6 +2296,25 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
         ss_flags: 0,
         ss_size: alt_stack_size,
     };
+
+    // On ARM64, store the host's TPIDR_EL0 at a known location in the alt-stack.
+    // Signal handlers can read this to restore host TLS when signals occur
+    // during guest execution (when tpidr_el0 contains guest's TLS).
+    #[cfg(target_arch = "aarch64")]
+    {
+        let host_tls: usize;
+        unsafe {
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) host_tls, options(nostack, preserves_flags));
+        }
+        // Store at the very top of the alt-stack (offset -8 from top)
+        // Layout: [guard_page][alt_stack_data][host_tls_ptr]
+        let host_tls_location =
+            (stack_base as usize + guard_page_size + alt_stack_size - 8) as *mut usize;
+        unsafe {
+            host_tls_location.write_volatile(host_tls);
+        }
+    }
+
     let mut oss = libc::stack_t {
         ss_sp: std::ptr::null_mut(),
         ss_flags: 0,
@@ -2355,46 +2545,47 @@ fn signal_handler_exit_guest(
     set_interrupt: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     unsafe {
-        // Get TLS base
-        let tls_base: usize;
-        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
-
-        // Check in_guest flag and clear it
-        let in_guest_ptr = (tls_base as *mut u8).byte_add(core::mem::offset_of!(TlsVars, in_guest));
-        let is_in_guest = in_guest_ptr.read_volatile() != 0;
-        in_guest_ptr.write_volatile(0);
+        // Read and clear in_guest flag using linker-resolved TLS offsets
+        let in_guest: u8;
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el0",
+            "ldrb {out:w}, [{tmp}, #:tprel_lo12:in_guest]",
+            "strb wzr, [{tmp}, #:tprel_lo12:in_guest]",
+            tmp = out(reg) _,
+            out = out(reg) in_guest,
+            options(nostack)
+        );
 
         if set_interrupt {
-            let interrupt_ptr =
-                (tls_base as *mut u8).byte_add(core::mem::offset_of!(TlsVars, interrupt));
-            interrupt_ptr.write_volatile(1);
+            core::arch::asm!(
+                "mrs {tmp}, tpidr_el0",
+                "mov {one:w}, #1",
+                "strb {one:w}, [{tmp}, #:tprel_lo12:interrupt]",
+                tmp = out(reg) _,
+                one = out(reg) _,
+                options(nostack)
+            );
         }
 
-        if !is_in_guest {
+        if in_guest == 0 {
             return None;
         }
 
-        // Get guest context pointer from TLS
-        let guest_context_top_ptr =
-            (tls_base as *const usize).byte_add(core::mem::offset_of!(TlsVars, guest_context_top));
-        let guest_context_top =
-            guest_context_top_ptr.read_volatile() as *mut litebox_common_linux::PtRegs;
+        // Get guest context pointer using linker-resolved TLS offset
+        let guest_context_top: *mut litebox_common_linux::PtRegs;
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el0",
+            "ldr {out}, [{tmp}, #:tprel_lo12:guest_context_top]",
+            tmp = out(reg) _,
+            out = out(reg) guest_context_top,
+            options(nostack, preserves_flags, readonly)
+        );
         Some(guest_context_top.offset(-1))
     }
 }
 
-// Placeholder struct for TLS offset calculations (ARM64)
-#[cfg(target_arch = "aarch64")]
-#[repr(C)]
-struct TlsVars {
-    scratch: usize,
-    host_sp: usize,
-    host_fp: usize,
-    guest_context_top: usize,
-    guest_tpidr: usize,
-    in_guest: u8,
-    interrupt: u8,
-}
+// TlsVars struct is no longer needed for offset calculation since we use
+// linker-resolved :tprel_lo12: addressing in assembly
 
 /// Copies register state from a Linux signal context to a LiteBox PtRegs
 /// structure (ARM64 version).

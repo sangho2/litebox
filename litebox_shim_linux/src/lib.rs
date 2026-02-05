@@ -623,6 +623,10 @@ impl Task {
         {
             ctx.rax = return_value;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            ctx.regs[0] = return_value;
+        }
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {

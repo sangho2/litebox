@@ -993,6 +993,7 @@ dependencies = [
  "litebox_platform_linux_userland",
  "litebox_platform_multiplex",
  "litebox_shim_linux",
+ "litebox_syscall_rewriter_arm64",
  "memmap2",
  "sha2",
  "walkdir",

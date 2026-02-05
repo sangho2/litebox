@@ -45,6 +45,9 @@ pub struct MappingInfo {
     pub phdrs_addr: usize,
     /// The number of program headers.
     pub num_phdrs: usize,
+    /// The mapped address of the trampoline section, if present.
+    /// On ARM64, switch_to_guest writes host TLS to offset 16 of this address.
+    pub trampoline_addr: Option<usize>,
 }
 
 impl MappingInfo {
@@ -461,6 +464,7 @@ impl ElfParsedFile {
             entry_point: base_addr.wrapping_add(self.header.e_entry.truncate()),
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
+            trampoline_addr: None,
         };
 
         if self.trampoline.is_some() {
@@ -501,26 +505,47 @@ impl ElfParsedFile {
         }
 
         // Write the trampoline entry point.
+        debug_assert_ne!(
+            trampoline.syscall_entry_point, 0,
+            "syscall_entry_point must not be 0"
+        );
         mem.write(
             trampoline_start + 8,
             &trampoline.syscall_entry_point.to_ne_bytes(),
         )?;
 
-        // Now that the write is done, protect the trampoline code as
-        // read+execute only.
+        // Verify the write succeeded by reading back
+        #[cfg(debug_assertions)]
+        {
+            let mut verify = 0usize;
+            mem.read(trampoline_start + 8, verify.as_mut_bytes())?;
+            debug_assert_eq!(
+                verify, trampoline.syscall_entry_point,
+                "Write verification failed"
+            );
+        }
+
+        // Now that the write is done, protect the trampoline code.
+        // On ARM64, we need write access for switch_to_guest to store host TLS at offset 16.
+        // This is a limitation of the rewriter backend on ARM64 (single-threaded only).
+        #[cfg(target_arch = "aarch64")]
+        let prot = Protection {
+            read: true,
+            write: true,
+            execute: true,
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let prot = Protection {
+            read: true,
+            write: false,
+            execute: true,
+        };
         mapper
-            .protect(
-                trampoline_start,
-                trampoline_end - trampoline_start,
-                &Protection {
-                    read: true,
-                    write: false,
-                    execute: true,
-                },
-            )
+            .protect(trampoline_start, trampoline_end - trampoline_start, &prot)
             .map_err(ElfLoadError::Map)?;
 
         info.brk = info.brk.max(trampoline_end);
+        info.trampoline_addr = Some(trampoline_start);
         Ok(())
     }
 
@@ -546,6 +571,7 @@ impl ElfParsedFile {
             entry_point: 0,
             phdrs_addr: 0,
             num_phdrs: 0,
+            trampoline_addr: None,
         };
         self.load_trampoline(mapper, mem, &mut info)
     }

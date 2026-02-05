@@ -3,9 +3,8 @@
 
 //! Integration tests for the ARM64 Linux userland runner.
 //!
-//! These tests verify that the systrap-based syscall interception works correctly
-//! on ARM64 (aarch64) architecture. Unlike the x86 runner, the ARM64 runner only
-//! supports the seccomp/systrap backend (no binary rewriting).
+//! These tests verify that both systrap-based (seccomp) and rewriter-based syscall
+//! interception work correctly on ARM64 (aarch64) architecture.
 
 mod cache;
 mod common;
@@ -14,6 +13,13 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
+
+/// Backend to use for syscall interception
+#[derive(Clone, Copy, Debug)]
+enum Backend {
+    Seccomp,
+    Rewriter,
+}
 
 #[must_use]
 struct Runner {
@@ -24,6 +30,7 @@ struct Runner {
     cmd_path: PathBuf,
     cmd_args: Vec<OsString>,
     has_run: bool,
+    backend: Backend,
 }
 
 /// Get the output directory for test artifacts
@@ -45,6 +52,10 @@ fn get_out_dir() -> PathBuf {
 
 impl Runner {
     fn new(target: &Path, unique_name: &str) -> Self {
+        Self::with_backend(target, unique_name, Backend::Seccomp)
+    }
+
+    fn with_backend(target: &Path, unique_name: &str, backend: Backend) -> Self {
         let dir_path = get_out_dir();
 
         // For systrap backend, we use the target directly without rewriting
@@ -94,6 +105,16 @@ impl Runner {
             "HOME=/",
         ]);
 
+        // Add backend-specific args
+        match backend {
+            Backend::Seccomp => {
+                command.args(["--interception-backend", "seccomp"]);
+            }
+            Backend::Rewriter => {
+                command.args(["--interception-backend", "rewriter", "--rewrite-syscalls"]);
+            }
+        }
+
         Self {
             command,
             dir_path,
@@ -102,6 +123,7 @@ impl Runner {
             cmd_args: Vec::new(),
             has_run: false,
             unique_name: unique_name.to_owned(),
+            backend,
         }
     }
 
@@ -222,6 +244,25 @@ fn test_static_exec_with_systrap() {
         let unique_name = format!("{stem}_exec_systrap");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
         Runner::new(&target, &unique_name).run();
+    }
+}
+
+/// Test statically linked executables with rewriter backend
+///
+/// This test uses the syscall rewriter to hook all SVC instructions in the binary,
+/// avoiding the seccomp timing issues. The rewriter replaces SVC with jumps to
+/// trampoline code that calls into the litebox syscall handler.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_static_exec_with_rewriter() {
+    for path in find_c_test_files("./tests") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_exec_rewriter");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
+        Runner::with_backend(&target, &unique_name, Backend::Rewriter).run();
     }
 }
 

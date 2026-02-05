@@ -1466,6 +1466,28 @@ impl Task {
                         xss: 0x2b, // __USER_DS
                     };
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // Initialize all registers to zero
+                    ctx.regs = [0; 31];
+                    ctx.sp = load_info.user_stack_top;
+                    // On ARM64, switch_to_guest uses regs[30] (X30/LR) as the PC
+                    // It loads X30 from PtRegs[30] and does `ret` to jump there
+                    ctx.regs[30] = load_info.entry_point;
+                    ctx.pc = load_info.entry_point;
+                    ctx.pstate = 0;
+                    ctx.orig_x0 = 0;
+                    ctx.syscallno = 0;
+                    // For ARM64 rewriter backend, store trampoline address in the platform.
+                    // This is done through the global platform instance.
+                    #[cfg(all(target_arch = "aarch64", feature = "platform_linux_userland"))]
+                    if let Some(trampoline_addr) = load_info.trampoline_addr {
+                        // Use the platform's function through the multiplex layer
+                        use litebox::platform::RawConstPointer as _;
+                        litebox_platform_multiplex::platform()
+                            .set_trampoline_base_addr(trampoline_addr);
+                    }
+                }
             }
             ThreadInitState::NewThread {
                 tls,
@@ -1486,6 +1508,13 @@ impl Task {
                         ctx.esp = stack;
                     }
                     ctx.eax = 0;
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.sp = stack;
+                    }
+                    ctx.regs[0] = 0; // x0 = return value from clone
                 }
 
                 // Set the TLS for the new thread.
