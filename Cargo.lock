@@ -1139,6 +1139,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_syscall_rewriter_arm64"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "insta",
+ "memmap2",
+ "object",
+ "similar",
+ "tempfile",
+ "thiserror",
+ "yaxpeax-arch",
+ "yaxpeax-arm",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2240,6 +2256,25 @@ name = "xshell-macros"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32ac00cd3f8ec9c1d33fb3e7958a82df6989c42d747bd326c822b1d625283547"
+
+[[package]]
+name = "yaxpeax-arch"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36274fcc5403da2a7636ffda4d02eca12a1b2b8267b9d2e04447bd2ccfc72082"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "yaxpeax-arm"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1db82aac85bc577d19b6255bf54ad97241c436eeb997ba159f399adacc5fb69e"
+dependencies = [
+ "bitvec",
+ "yaxpeax-arch",
+]
 
 [[package]]
 name = "zerocopy"

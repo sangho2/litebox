@@ -1,0 +1,19 @@
+---
+source: litebox_syscall_rewriter_arm64/tests/snapshot_tests.rs
+assertion_line: 39
+expression: diff
+---
+--- original
++++ rewritten
+@@ -8,7 +8,7 @@
+   40007c:	100000e1 	adr	x1, 400098 <msg>
+   400080:	d28001a2 	mov	x2, #0xd                   	// #13
+   400084:	d2800808 	mov	x8, #0x40                  	// #64
+-  400088:	d4000001 	svc	#0x0
++  400088:	140003e2 	b	401010 <msg+0xf78>
+   40008c:	d2800000 	mov	x0, #0x0                   	// #0
+   400090:	d2800ba8 	mov	x8, #0x5d                  	// #93
+-  400094:	d4000001 	svc	#0x0
+\ No newline at end of file
++  400094:	140003e4 	b	401024 <msg+0xf8c>
+\ No newline at end of file
