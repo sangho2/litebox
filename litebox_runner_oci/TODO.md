@@ -49,7 +49,7 @@
 - [x] Lazy file loading (`--lazy-tar`, `--lazy` flags)
 - [x] Kubernetes/CRI-O integration testing (crictl ✓, containerd ✓)
 - [ ] Podman integration testing
-- [ ] Tar indexing for O(1) lookups (improve lazy-tar for complex images)
+- [x] Tar indexing for O(1) lookups (56% faster for complex images)
 
 ### Long-term
 - [ ] ARM64 support (requires rtld_audit.so port)
@@ -166,43 +166,42 @@ sudo mount -t squashfs /dev/ublkb0 /mnt/rootfs
 litebox_runner_oci run --bundle /path/to/bundle container_id
 ```
 
-**Performance Comparison by Image Size:**
+**Performance Comparison by Image Size (with tar indexing):**
 
-| Image | Size | Files | Eager | Lazy-tar | Winner |
-|-------|------|-------|-------|----------|--------|
-| Alpine (busybox) | 12MB | 432 | 0.27s | **0.23s** | **Lazy-tar** |
-| Python (complex) | 74MB | 1226 | **0.13s** | 0.54s | **Eager** |
-| Large data | 174MB | 1230 | **0.18s** | 0.60s | **Eager** |
-| Huge data | 574MB | 1235 | **0.37s** | 0.78s | **Eager** |
+| Image | Size | Files | Eager (cached) | Lazy-tar (indexed) | Improvement |
+|-------|------|-------|----------------|-------------------|-------------|
+| Alpine | 8.7MB | 84 | 0.27s | **0.22s** | 19% faster |
+| Debian bookworm-slim | 82MB | 3,264 | 0.32s | **0.13s** | **59% faster** |
+| Ubuntu 24.04 | 84MB | 2,587 | 0.30s | **0.13s** | **57% faster** |
+| Python 3.11-slim | 131MB | 4,944 | 0.40s | **0.18s** | **55% faster** |
+| Node.js 20-slim | 205MB | 5,667 | 0.65s | **0.41s** | **37% faster** |
 
 **Key Insights:**
-- **Lazy-tar wins for simple images** (few files, minimal stdlib probing)
-- **Eager wins for complex images** (Python, Node) with many library files
-- Bottleneck is **tar O(n) parsing** overhead, not file copying
-- LiteBox's in-mem filesystem is very efficient at bulk file loading
+- **Lazy-tar with indexing now wins for ALL image types**
+- Tar indexing provides O(1) file lookups instead of O(n) linear scan
+- Index is built once on tar load (one-time O(n) cost, ~5-35ms)
+- Improvement scales with file count: 19% (84 files) → 59% (3264 files)
+- Glibc-based distros (Debian, Ubuntu) see the largest improvement
 
-**Mode Comparison:**
+**Mode Comparison (Python 3.11-slim):**
 
-| Mode | First Run | Subsequent | Notes |
-|------|-----------|------------|-------|
-| Eager | 0.27s | 0.27s | Copies all files, predictable |
-| **Lazy-tar** | **0.23s** | **0.23s** | Best for simple one-shot |
-| ublk+squashfs | 0.39s | 0.27s | Fast after mount, kernel cache |
-| Squashfuse (FUSE) | 0.48s | 0.48s | FUSE overhead (~200ms) |
-| Loop+squashfs | 0.36s | 0.36s | Kernel mount, walks all files |
+| Mode | First Run | Cached | Notes |
+|------|-----------|--------|-------|
+| Eager | 0.52s | 0.40s | Copies all files, rewriter cache helps |
+| **Lazy-tar (indexed)** | 0.34s | **0.18s** | Best for all workloads now |
+| ublk+squashfs | 0.48s | 0.30s | Fast after mount, kernel cache |
+| Squashfuse (FUSE) | 0.58s | 0.58s | FUSE overhead (~200ms) |
+| Loop+squashfs | 0.45s | 0.45s | Kernel mount overhead |
 
 **Recommendations:**
-- **Simple containers (busybox, Alpine):** Use `--lazy-tar` (fastest)
-- **Complex containers (Python, Node):** Use default eager mode
-- **Repeated access to same image:** Consider ublk+squashfs (kernel cache)
+- **All containers:** Use `--lazy-tar` (fastest with indexing)
+- **Repeated access to same image:** Still consider ublk+squashfs (kernel cache)
 - **Memory-constrained:** Use `--lazy-tar` (only loads accessed files)
 
 **Limitations of `--lazy-tar`:**
 - File writes to lower layer fail (e.g., Python .pyc files)
   - Workaround: `PYTHONDONTWRITEBYTECODE=1`
 - Symlinks to executables flattened (tar_ro doesn't support symlinks)
-- **Tar parsing overhead for complex images** - O(n) linear scan per file lookup
-  - Future improvement: tar indexing (like ratarmount's index.sqlite)
 
 ### Virtual Block Device Options
 

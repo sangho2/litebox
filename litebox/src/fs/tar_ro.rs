@@ -25,9 +25,10 @@
 //! ```
 
 use alloc::borrow::ToOwned as _;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::{
     LiteBox,
@@ -57,6 +58,163 @@ const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
 // TODO(jayb): Determine appropriate block size
 const BLOCK_SIZE: usize = 0;
 
+/// Cached information about a tar entry for O(1) lookups.
+#[derive(Clone)]
+struct TarEntryInfo {
+    /// Index into tar entries iterator
+    idx: usize,
+    /// File size in bytes
+    size: usize,
+    /// File mode/permissions
+    mode: Mode,
+    /// Owner info
+    owner: UserInfo,
+}
+
+/// Index structure for fast path lookups.
+struct TarIndex {
+    /// Map from normalized path (without leading /) to entry info
+    files: HashMap<String, TarEntryInfo>,
+    /// Set of known directory paths (without leading /)
+    directories: HashSet<String>,
+}
+
+impl TarIndex {
+    /// Build an index from tar entries. This is O(n) but only done once.
+    fn build(tar_data: &TarData) -> Self {
+        let mut files = HashMap::new();
+        let mut directories = HashSet::new();
+
+        // Always include root directory
+        directories.insert(String::new());
+
+        for (idx, entry) in tar_data.entries().enumerate() {
+            let filename_result = entry.filename();
+            let Ok(filename) = filename_result.as_str() else {
+                continue;
+            };
+            let path = normalize_tar_filename(filename);
+
+            // Skip empty paths
+            if path.is_empty() {
+                continue;
+            }
+
+            // Add all parent directories
+            let mut current = String::new();
+            for component in path.split('/') {
+                if !current.is_empty() {
+                    current.push('/');
+                }
+                current.push_str(component);
+
+                // If this isn't the final component, it's a directory
+                if current.len() < path.len() {
+                    directories.insert(current.clone());
+                }
+            }
+
+            // Check if this entry itself is a directory (ends with / or is a dir type)
+            let is_dir = path.ends_with('/');
+            let normalized_path = path.trim_end_matches('/').to_owned();
+
+            if is_dir {
+                directories.insert(normalized_path);
+            } else {
+                // It's a file - store entry info
+                let mode = entry
+                    .posix_header()
+                    .mode
+                    .to_flags()
+                    .map(mode_of_modeflags)
+                    .unwrap_or(DEFAULT_DIR_MODE);
+                let owner = owner_from_posix_header(entry.posix_header());
+
+                files.insert(
+                    normalized_path,
+                    TarEntryInfo {
+                        idx,
+                        size: entry.size(),
+                        mode,
+                        owner,
+                    },
+                );
+            }
+        }
+
+        Self { files, directories }
+    }
+
+    /// Look up a file by path. Returns None if not found or if it's a directory.
+    fn get_file(&self, path: &str) -> Option<&TarEntryInfo> {
+        self.files.get(path)
+    }
+
+    /// Check if a path is a directory.
+    fn is_directory(&self, path: &str) -> bool {
+        self.directories.contains(path)
+    }
+
+    /// Check if a path exists (as file or directory).
+    fn exists(&self, path: &str) -> bool {
+        self.files.contains_key(path) || self.directories.contains(path)
+    }
+
+    /// Get all entries in a directory.
+    fn list_directory(&self, dir_path: &str) -> Vec<(String, FileType, usize)> {
+        let prefix = if dir_path.is_empty() {
+            String::new()
+        } else {
+            format!("{dir_path}/")
+        };
+
+        let mut entries: HashMap<String, (FileType, usize)> = HashMap::new();
+
+        // Find files in this directory
+        for (path, info) in &self.files {
+            if let Some(suffix) = path.strip_prefix(&prefix) {
+                // Check if it's a direct child (no more slashes)
+                if let Some((name, _)) = suffix.split_once('/') {
+                    // It's in a subdirectory
+                    entries
+                        .entry(name.to_owned())
+                        .or_insert((FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER));
+                } else if !suffix.is_empty() {
+                    // Direct child file
+                    entries.insert(suffix.to_owned(), (FileType::RegularFile, info.idx + 1));
+                }
+            } else if dir_path.is_empty() && !path.contains('/') {
+                // Root directory, direct child
+                entries.insert(path.clone(), (FileType::RegularFile, info.idx + 1));
+            }
+        }
+
+        // Find subdirectories
+        for dir in &self.directories {
+            if let Some(suffix) = dir.strip_prefix(&prefix) {
+                if let Some((name, _)) = suffix.split_once('/') {
+                    entries
+                        .entry(name.to_owned())
+                        .or_insert((FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER));
+                } else if !suffix.is_empty() {
+                    entries
+                        .entry(suffix.to_owned())
+                        .or_insert((FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER));
+                }
+            } else if dir_path.is_empty() && !dir.is_empty() && !dir.contains('/') {
+                entries
+                    .entry(dir.clone())
+                    .or_insert((FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER));
+            }
+        }
+
+        entries
+            .into_iter()
+            .map(|(name, (ft, ino))| (name, ft, ino))
+            .collect()
+    }
+}
+
 enum TarData {
     Owned(tar_no_std::TarArchive),
     Borrowed(tar_no_std::TarArchiveRef<'static>),
@@ -76,6 +234,8 @@ impl TarData {
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
     tar_data: TarData,
+    /// Index for O(1) path lookups (built once on construction)
+    index: TarIndex,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
 }
@@ -98,16 +258,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
+        let tar_data = match tar_data {
+            alloc::borrow::Cow::Borrowed(slice) => {
+                TarData::Borrowed(tar_no_std::TarArchiveRef::new(slice).expect("invalid tar data"))
+            }
+            alloc::borrow::Cow::Owned(vec) => TarData::Owned(
+                tar_no_std::TarArchive::new(vec.into_boxed_slice()).expect("invalid tar data"),
+            ),
+        };
+        // Build index for O(1) lookups (one-time O(n) cost)
+        let index = TarIndex::build(&tar_data);
         Self {
             litebox: litebox.clone(),
-            tar_data: match tar_data {
-                alloc::borrow::Cow::Borrowed(slice) => TarData::Borrowed(
-                    tar_no_std::TarArchiveRef::new(slice).expect("invalid tar data"),
-                ),
-                alloc::borrow::Cow::Owned(vec) => TarData::Owned(
-                    tar_no_std::TarArchive::new(vec.into_boxed_slice()).expect("invalid tar data"),
-                ),
-            },
+            tar_data,
+            index,
             current_working_dir: "/".into(),
         }
     }
@@ -136,14 +300,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileS
 /// This is helpful for tar files that have been created via `tar cvf foo.tar .`
 fn normalize_tar_filename(filename: &str) -> &str {
     filename.strip_prefix("./").unwrap_or(filename)
-}
-
-fn contains_dir(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    assert!(!needle.ends_with('/'));
-    haystack.starts_with(needle) && haystack.as_bytes().get(needle.len()) == Some(&b'/')
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
@@ -182,50 +338,46 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
         assert!(path.starts_with('/'));
         let path = &path[1..];
-        let Some((idx, entry)) =
-            // TODO: this might be slow for large tar files, due to a linear scan. If better perf is
-            // needed, we can add a hashmap layer after doing one scan (in `new()`) that allows a
-            // direct hashmap lookup of relevant information and data.
-            self.tar_data.entries().enumerate().find(|(_, entry)| {
-                match entry.filename().as_str() {
-                    Ok(p) => {
-                        let p = normalize_tar_filename(p);
-                        p == path || contains_dir(p, path)
-                    }
-                    Err(_) => false,
-                }
-            })
-        else {
-            return Err(PathError::NoSuchFileOrDirectory)?;
-        };
+
+        // Use index for O(1) lookup instead of linear scan
         if flags.contains(OFlags::RDWR) || flags.contains(OFlags::WRONLY) {
             return Err(OpenError::ReadOnlyFileSystem);
         }
         assert!(flags.contains(OFlags::RDONLY));
-        let fd = if normalize_tar_filename(entry.filename().as_str().unwrap()) == path {
-            // it is a file
+
+        // Check if it's a file
+        if let Some(entry_info) = self.index.get_file(path) {
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
             }
-            self.litebox
+            let fd = self
+                .litebox
                 .descriptor_table_mut()
-                .insert(Descriptor::File { idx, position: 0 })
-        } else {
-            // it is a dir
-            self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
-                path: path.to_owned(),
-            })
-        };
-        if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd, 0, true) {
-                Ok(()) => {}
-                Err(e) => {
-                    self.close(&fd).unwrap();
-                    return Err(e.into());
+                .insert(Descriptor::File {
+                    idx: entry_info.idx,
+                    position: 0,
+                });
+            if flags.contains(OFlags::TRUNC) {
+                match self.truncate(&fd, 0, true) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.close(&fd).unwrap();
+                        return Err(e.into());
+                    }
                 }
             }
+            return Ok(fd);
         }
-        Ok(fd)
+
+        // Check if it's a directory
+        if self.index.is_directory(path) {
+            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+                path: path.to_owned(),
+            }));
+        }
+
+        // Not found
+        Err(PathError::NoSuchFileOrDirectory)?
     }
 
     fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
@@ -327,19 +479,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn chmod(&self, path: impl crate::path::Arg, _mode: Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
-        assert!(path.starts_with('/'));
-        let path = &path[1..];
-        if self
-            .tar_data
-            .entries()
-            .any(|entry| match entry.filename().as_str() {
-                Ok(p) => {
-                    let p = normalize_tar_filename(p);
-                    p == path || contains_dir(p, path)
-                }
-                Err(_) => false,
-            })
-        {
+        let path = if path.is_empty() {
+            ""
+        } else {
+            assert!(path.starts_with('/'));
+            &path[1..]
+        };
+        // Use index for O(1) lookup
+        if self.index.exists(path) {
             Err(ChmodError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory)?
@@ -353,19 +500,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
-        assert!(path.starts_with('/'));
-        let path = &path[1..];
-        if self
-            .tar_data
-            .entries()
-            .any(|entry| match entry.filename().as_str() {
-                Ok(p) => {
-                    let p = normalize_tar_filename(p);
-                    p == path || contains_dir(p, path)
-                }
-                Err(_) => false,
-            })
-        {
+        let path = if path.is_empty() {
+            ""
+        } else {
+            assert!(path.starts_with('/'));
+            &path[1..]
+        };
+        // Use index for O(1) lookup
+        if self.index.exists(path) {
             Err(ChownError::ReadOnlyFileSystem)
         } else {
             Err(PathError::NoSuchFileOrDirectory)?
@@ -376,22 +518,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
-        let entry = self
-            .tar_data
-            .entries()
-            .find(|entry| match entry.filename().as_str() {
-                Ok(p) => {
-                    let p = normalize_tar_filename(p);
-                    p == path || contains_dir(p, path)
-                }
-                Err(_) => false,
-            });
-        match entry {
-            None => Err(PathError::NoSuchFileOrDirectory)?,
-            Some(p) if normalize_tar_filename(p.filename().as_str().unwrap()) != path => {
-                Err(UnlinkError::IsADirectory)
-            }
-            Some(_) => Err(UnlinkError::ReadOnlyFileSystem),
+        // Use index for O(1) lookup
+        if self.index.get_file(path).is_some() {
+            Err(UnlinkError::ReadOnlyFileSystem)
+        } else if self.index.is_directory(path) {
+            Err(UnlinkError::IsADirectory)
+        } else {
+            Err(PathError::NoSuchFileOrDirectory)?
         }
     }
 
@@ -416,35 +549,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         else {
             return Err(ReadDirError::NotADirectory);
         };
-        // Store into a hashmap to collapse together the entries we end up with for multiple files
-        // within a sub-dir.
-        let entries: HashMap<String, (FileType, usize)> = self
-            .tar_data
-            .entries()
-            .enumerate()
-            .map(|(idx, entry)| (idx, entry.filename()))
-            .filter_map(|(idx, p)| {
-                let p = p.as_str().ok()?;
-                let p = normalize_tar_filename(p);
-                contains_dir(p, path).then(|| {
-                    // Drop the directory path from `p`
-                    let suffix = p.trim_start_matches(path).trim_start_matches('/');
-                    // Then drop everything after the first `/`; if there is any then it was a dir,
-                    // otherwise it was a file.
-                    match suffix.split_once('/') {
-                        Some((dir, _)) => (
-                            String::from(dir),
-                            (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER),
-                        ),
-                        None => (String::from(suffix), (FileType::RegularFile, idx + 1)), // ino starts at 1 (zero represents deleted file)
-                    }
-                })
-            })
-            .collect();
+
+        // Use index for O(1) directory listing
+        let entries = self.index.list_directory(path);
 
         // Add "." and ".." entries first.
-        // In this read-only tar FS we don't maintain distinct inode numbers per-dir,
-        // so use the same directory inode constant for directories (including root).
         let mut out: Vec<DirEntry> = Vec::new();
 
         out.push(DirEntry {
@@ -467,19 +576,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }),
         });
 
-        out.extend(
-            entries
-                .into_iter()
-                .map(|(name, (file_type, ino))| DirEntry {
-                    name,
-                    file_type,
-                    ino_info: Some(NodeInfo {
-                        dev: DEVICE_ID,
-                        ino,
-                        rdev: None,
-                    }),
-                }),
-        );
+        out.extend(entries.into_iter().map(|(name, file_type, ino)| DirEntry {
+            name,
+            file_type,
+            ino_info: Some(NodeInfo {
+                dev: DEVICE_ID,
+                ino,
+                rdev: None,
+            }),
+        }));
         Ok(out)
     }
 
@@ -494,45 +599,40 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             assert!(path.starts_with('/'));
             &path[1..]
         };
-        let entry = self.tar_data.entries().enumerate().find(|(_, entry)| {
-            match entry.filename().as_str() {
-                Ok(p) => {
-                    let p = normalize_tar_filename(p);
-                    p == path || contains_dir(p, path)
-                }
-                Err(_) => false,
-            }
-        });
-        match entry {
-            None => Err(PathError::NoSuchFileOrDirectory)?,
-            Some((_, p)) if normalize_tar_filename(p.filename().as_str().unwrap()) != path => {
-                Ok(super::FileStatus {
-                    file_type: super::FileType::Directory,
-                    mode: DEFAULT_DIR_MODE,
-                    size: super::DEFAULT_DIRECTORY_SIZE,
-                    owner: owner_from_posix_header(p.posix_header()),
-                    node_info: NodeInfo {
-                        dev: DEVICE_ID,
-                        ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
-                        rdev: None,
-                    },
-                    blksize: BLOCK_SIZE,
-                })
-            }
-            Some((idx, p)) => Ok(super::FileStatus {
+
+        // Use index for O(1) lookup
+        if let Some(entry_info) = self.index.get_file(path) {
+            return Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
-                mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
-                size: p.size(),
-                owner: owner_from_posix_header(p.posix_header()),
+                mode: entry_info.mode,
+                size: entry_info.size,
+                owner: entry_info.owner,
                 node_info: NodeInfo {
                     dev: DEVICE_ID,
                     // ino starts at 1 (zero represents deleted file)
-                    ino: idx + 1,
+                    ino: entry_info.idx + 1,
                     rdev: None,
                 },
                 blksize: BLOCK_SIZE,
-            }),
+            });
         }
+
+        if self.index.is_directory(path) {
+            return Ok(super::FileStatus {
+                file_type: super::FileType::Directory,
+                mode: DEFAULT_DIR_MODE,
+                size: super::DEFAULT_DIRECTORY_SIZE,
+                owner: DEFAULT_DIRECTORY_OWNER,
+                node_info: NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                    rdev: None,
+                },
+                blksize: BLOCK_SIZE,
+            });
+        }
+
+        Err(PathError::NoSuchFileOrDirectory)?
     }
 
     fn fd_file_status(
