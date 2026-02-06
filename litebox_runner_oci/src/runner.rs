@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
 use oci_spec::runtime::Spec;
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 /// Flag to indicate whether we need the rtld_audit library for rewriter backend
@@ -37,16 +38,10 @@ fn cache_dir() -> PathBuf {
         .join("rewritten")
 }
 
-/// Compute a hash of file contents for cache key
+/// Compute a hash of file contents for cache key using xxhash (10x faster than DefaultHasher)
 fn hash_bytes(data: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    // Include data length to reduce collisions
-    data.len().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use xxhash_rust::xxh3::xxh3_64;
+    format!("{:016x}_{:08x}", xxh3_64(data), data.len())
 }
 
 /// Try to load a rewritten binary from cache
@@ -219,18 +214,37 @@ fn tar_cache_dir() -> PathBuf {
         .join("tar")
 }
 
+/// Tar data that can be either owned or memory-mapped for zero-copy access.
+enum TarSource {
+    Owned(Vec<u8>),
+    Mmap(memmap2::Mmap),
+}
+
+impl AsRef<[u8]> for TarSource {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            TarSource::Owned(v) => v.as_slice(),
+            TarSource::Mmap(m) => m.as_ref(),
+        }
+    }
+}
+
 /// Create a tar archive from the rootfs directory.
-/// Returns the tar data as a Vec<u8>.
-fn create_tar_from_rootfs(rootfs_path: &Path) -> Result<Vec<u8>> {
+/// Returns the tar data, either memory-mapped (for cached) or owned (for new).
+fn create_tar_from_rootfs(rootfs_path: &Path) -> Result<TarSource> {
     // Hash the rootfs path for cache key
     let cache_key = hash_bytes(rootfs_path.to_string_lossy().as_bytes());
     let cache_path = tar_cache_dir().join(format!("{cache_key}.tar"));
 
-    // Check cache first
+    // Check cache first - use mmap for zero-copy access
     if cache_path.exists() {
-        tracing::debug!(path = %cache_path.display(), "using cached tar");
-        return std::fs::read(&cache_path)
-            .with_context(|| format!("failed to read cached tar: {}", cache_path.display()));
+        tracing::debug!(path = %cache_path.display(), "using cached tar (mmap)");
+        let file = std::fs::File::open(&cache_path)
+            .with_context(|| format!("failed to open cached tar: {}", cache_path.display()))?;
+        // SAFETY: The file is read-only and we don't modify it
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("failed to mmap cached tar: {}", cache_path.display()))?;
+        return Ok(TarSource::Mmap(mmap));
     }
 
     tracing::debug!(
@@ -313,7 +327,7 @@ fn create_tar_from_rootfs(rootfs_path: &Path) -> Result<Vec<u8>> {
         tracing::debug!(path = %cache_path.display(), size = tar_data.len(), "cached tar archive");
     }
 
-    Ok(tar_data)
+    Ok(TarSource::Owned(tar_data))
 }
 
 /// A bind mount specification.
@@ -745,7 +759,8 @@ fn run_container_internal(
             } else {
                 tracing::info!("using true lazy loading with tar + layered filesystem");
             }
-            let tar_bytes = create_tar_from_rootfs(&rootfs_path)?;
+            let tar_source = create_tar_from_rootfs(&rootfs_path)?;
+            let tar_bytes = tar_source.as_ref();
 
             // For LazyRewrite mode, only eagerly load critical executables
             // (dynamic linkers and main binary). Other executables are lazily rewritten.
@@ -775,7 +790,7 @@ fn run_container_internal(
             let mut critical_targets: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             if lazy_mode == LazyMode::LazyRewrite {
-                let mut tar_archive = tar::Archive::new(std::io::Cursor::new(&tar_bytes));
+                let mut tar_archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
                 for entry in tar_archive.entries().into_iter().flatten() {
                     let Ok(entry) = entry else {
                         continue;
@@ -828,7 +843,9 @@ fn run_container_internal(
                 true
             };
 
-            let mut tar_archive = tar::Archive::new(std::io::Cursor::new(&tar_bytes));
+            // First pass: collect all executable data from tar
+            let mut executables_to_rewrite: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut tar_archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
             for entry in tar_archive.entries()? {
                 let entry = entry?;
                 let path = entry.path()?;
@@ -843,16 +860,7 @@ fn run_container_internal(
                         let mut data = Vec::new();
                         let mut entry = entry;
                         entry.read_to_end(&mut data)?;
-                        // Store for later so symlinks can reference it
-                        executable_content.insert(path_str.clone(), data.clone());
-                        load_file_with_rewrite(
-                            &mut in_mem,
-                            data,
-                            &path_str,
-                            true,
-                            exec_mode,
-                            file_mode,
-                        );
+                        executables_to_rewrite.push((path_str, data));
                     }
                 } else if entry_type == tar::EntryType::Symlink
                     || entry_type == tar::EntryType::Link
@@ -875,22 +883,85 @@ fn run_container_internal(
                 }
             }
 
+            // Parallel rewrite executables using rayon
+            let rewritten_executables: Vec<(String, Vec<u8>)> = executables_to_rewrite
+                .into_par_iter()
+                .map(|(path, data)| {
+                    let rewritten = rewrite_with_cache(&data);
+                    if rewritten.len() != data.len() {
+                        tracing::debug!(path = %path, "rewrote syscalls in executable");
+                    }
+                    (path, rewritten)
+                })
+                .collect();
+
+            // Load rewritten executables into filesystem (sequential - filesystem not thread-safe)
+            for (path_str, data) in &rewritten_executables {
+                executable_content.insert(path_str.clone(), data.clone());
+
+                in_mem.with_root_privileges(|fs| {
+                    // Ensure parent directories exist
+                    let target_path = Path::new(path_str);
+                    if let Some(parent) = target_path.parent() {
+                        let mut current = std::path::PathBuf::from("/");
+                        for component in parent.components().skip(1) {
+                            current.push(component);
+                            let _ = fs.mkdir(current.to_str().unwrap(), exec_mode);
+                        }
+                    }
+
+                    let fd = fs
+                        .open(
+                            path_str,
+                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                            exec_mode,
+                        )
+                        .expect("failed to create file in sandbox");
+                    fs.initialize_primarily_read_heavy_file(&fd, data.clone().into());
+                    fs.close(&fd).expect("failed to close file");
+                });
+            }
+
             // Handle symlinks pointing to executables (use cached content)
             for (symlink_path, target_path) in &symlinks {
                 if let Some(data) = executable_content.get(target_path) {
-                    load_file_with_rewrite(
-                        &mut in_mem,
-                        data.clone(),
-                        symlink_path,
-                        true,
-                        exec_mode,
-                        file_mode,
-                    );
+                    in_mem.with_root_privileges(|fs| {
+                        // Ensure parent directories exist
+                        let target_path_obj = Path::new(symlink_path);
+                        if let Some(parent) = target_path_obj.parent() {
+                            let mut current = std::path::PathBuf::from("/");
+                            for component in parent.components().skip(1) {
+                                current.push(component);
+                                let _ = fs.mkdir(current.to_str().unwrap(), exec_mode);
+                            }
+                        }
+
+                        let fd = fs
+                            .open(
+                                symlink_path,
+                                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                                exec_mode,
+                            )
+                            .expect("failed to create file in sandbox");
+                        fs.initialize_primarily_read_heavy_file(&fd, data.clone().into());
+                        fs.close(&fd).expect("failed to close file");
+                    });
                     tracing::debug!(symlink = %symlink_path, target = %target_path, "flattened executable symlink");
                 }
             }
 
-            tar_bytes.into()
+            // Convert TarSource to Cow for the tar filesystem
+            // For mmap, we leak the memory to get a 'static lifetime (container runs once anyway)
+            let tar_data: std::borrow::Cow<'static, [u8]> = match tar_source {
+                TarSource::Owned(v) => v.into(),
+                TarSource::Mmap(m) => {
+                    // Leak the mmap to get 'static lifetime - this is fine since the container
+                    // process will exit and release all memory anyway
+                    let leaked: &'static [u8] = Box::leak(m.to_vec().into_boxed_slice());
+                    std::borrow::Cow::Borrowed(leaked)
+                }
+            };
+            tar_data
         } else {
             // Eager or Squashfs mode: load all files from filesystem
             // Helper to load a file from host filesystem

@@ -521,3 +521,112 @@ fn test_tun_and_runner_with_iperf3() {
     has_started.store(true, std::sync::atomic::Ordering::Relaxed);
     runner.run();
 }
+
+/// Benchmark TCP throughput over TUN device.
+///
+/// Runs a bulk data transfer server inside LiteBox and a client on the host.
+/// Measures end-to-end TCP throughput through the smoltcp stack.
+///
+/// To run with release build and see output:
+/// ```
+/// cargo test --package litebox_runner_linux_userland --test run --release -- test_tun_tcp_throughput --exact --nocapture
+/// ```
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tun_tcp_throughput() {
+    let server_path = PathBuf::from("./tests/net/tcp_bench_server.c");
+    let client_path = PathBuf::from("./tests/net/tcp_bench_client.c");
+
+    let server_target = common::compile(
+        server_path.to_str().unwrap(),
+        "tcp_bench_server",
+        true,
+        false,
+    );
+    let client_target = common::compile(
+        client_path.to_str().unwrap(),
+        "tcp_bench_client",
+        false,
+        false,
+    );
+
+    // Transfer 4MB of data
+    let total_bytes = "4194304";
+
+    let client_target_clone = client_target.clone();
+    let child = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let output = std::process::Command::new(client_target_clone.to_str().unwrap())
+            .args(["10.0.0.2", "12346", total_bytes])
+            .output()
+            .expect("failed to execute client");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        std::println!("{stdout}");
+        if !stderr.is_empty() {
+            std::eprintln!("{stderr}");
+        }
+    });
+
+    Runner::new(Backend::Rewriter, &server_target, "tcp_bench_server")
+        .arg("10.0.0.2")
+        .arg("12346")
+        .arg(total_bytes)
+        .tun_device_name("tun99")
+        .run();
+    child.join().unwrap();
+}
+
+/// Benchmark TCP round-trip latency over TUN device.
+///
+/// Sends small ping messages and measures per-message RTT.
+///
+/// To run with release build and see output:
+/// ```
+/// cargo test --package litebox_runner_linux_userland --test run --release -- test_tun_tcp_latency --exact --nocapture
+/// ```
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tun_tcp_latency() {
+    let server_path = PathBuf::from("./tests/net/tcp_latency_server.c");
+    let client_path = PathBuf::from("./tests/net/tcp_latency_client.c");
+
+    let server_target = common::compile(
+        server_path.to_str().unwrap(),
+        "tcp_latency_server",
+        true,
+        false,
+    );
+    let client_target = common::compile(
+        client_path.to_str().unwrap(),
+        "tcp_latency_client",
+        false,
+        false,
+    );
+
+    let num_pings = "200";
+
+    let client_target_clone = client_target.clone();
+    let child = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let output = std::process::Command::new(client_target_clone.to_str().unwrap())
+            .args(["10.0.0.2", "12347", num_pings])
+            .output()
+            .expect("failed to execute latency client");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        std::println!("{stdout}");
+        if !stderr.is_empty() {
+            std::eprintln!("{stderr}");
+        }
+    });
+
+    Runner::new(Backend::Rewriter, &server_target, "tcp_latency_server")
+        .arg("10.0.0.2")
+        .arg("12347")
+        // Server expects num_pings + 5 warmup pings
+        .arg("205")
+        .tun_device_name("tun99")
+        .run();
+    child.join().unwrap();
+}

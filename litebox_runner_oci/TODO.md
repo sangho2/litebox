@@ -51,9 +51,10 @@
 - [ ] Podman integration testing
 - [x] Tar indexing for O(1) lookups (56% faster for complex images)
 - [x] Lazy executable rewriting (`--lazy-rewrite` flag)
-  - Cold cache: 22-73% faster than Eager
-  - Warm cache: 52-81% faster than Eager
-  - Best results: Debian 73%, Ubuntu 71%, Python 67%
+  - Cold cache: 31-72% faster than Eager
+  - Warm cache: 59-79% faster than Eager
+  - Best results: Debian 72%, Ubuntu 70%, Python 66%
+- [x] Performance optimizations (rayon parallel rewriting, xxhash, mmap tar cache)
 
 ### Long-term
 - [ ] ARM64 support (requires rtld_audit.so port)

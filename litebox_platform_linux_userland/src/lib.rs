@@ -34,6 +34,10 @@ extern crate alloc;
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
+    /// Futex-based wakeup for the TUN network worker thread.
+    /// Incremented by [`Self::wake_tun`] and waited on by [`Self::wait_on_tun`],
+    /// allowing the network worker to sleep without requiring the `poll` syscall.
+    tun_wakeup: AtomicU32,
     #[cfg(feature = "systrap_backend")]
     seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
@@ -159,6 +163,7 @@ impl LinuxUserland {
         let (reserved_pages, vdso_address) = Self::read_maps_and_vdso();
         let platform = Self {
             tun_socket_fd,
+            tun_wakeup: AtomicU32::new(0),
             #[cfg(feature = "systrap_backend")]
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
@@ -281,28 +286,67 @@ impl LinuxUserland {
         }
     }
 
-    /// Wait until there is data available on the TUN device.
+    /// Wait until there is data available on the TUN device, or until woken by [`Self::wake_tun`].
+    ///
+    /// Uses an adaptive spin + futex approach to avoid requiring the `poll` syscall in the seccomp
+    /// filter. First spins briefly with non-blocking reads to catch packets that arrive quickly,
+    /// then falls back to `futex_wait` with a timeout.
     ///
     /// # Panics
     ///
     /// Panics if the TUN device is not initialized.
     pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        const SPIN_ITERATIONS: u32 = 100;
+
+        // Adaptive spin phase: try non-blocking reads to catch packets with minimal latency.
         let tun_fd = self.tun_socket_fd.read().unwrap();
-        let mut pfd = libc::pollfd {
-            fd: tun_fd.as_ref().unwrap().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let _ = unsafe {
-            libc::poll(
-                &raw mut pfd,
-                1,
-                timeout.map_or(-1, |t| {
-                    let ms = t.as_millis();
-                    i32::try_from(ms).unwrap_or(i32::MAX)
-                }),
-            )
-        };
+        let raw_fd = tun_fd.as_ref().unwrap().as_raw_fd();
+        let mut scratch = [0u8; 1];
+        for _ in 0..SPIN_ITERATIONS {
+            match unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::read,
+                    usize::try_from(raw_fd).unwrap(),
+                    scratch.as_mut_ptr() as usize,
+                    0, // zero-length read: just checks if data is available
+                    syscall_intercept::SYSCALL_ARG_MAGIC,
+                )
+            } {
+                Ok(_) => return, // Data available or fd is readable
+                #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK on Linux")]
+                Err(syscalls::Errno::EAGAIN | syscalls::Errno::EWOULDBLOCK) => {
+                    core::hint::spin_loop();
+                }
+                Err(e) => panic!("unexpected TUN read error during spin: {e}"),
+            }
+        }
+        // Drop the RwLock guard before sleeping.
+        drop(tun_fd);
+
+        // Futex sleep phase: sleep until woken by wake_tun() or timeout expires.
+        let current = self.tun_wakeup.load(Ordering::SeqCst);
+        let _ = futex_timeout(
+            &self.tun_wakeup,
+            FutexOperation::Wait,
+            current,
+            timeout,
+            None,
+        );
+    }
+
+    /// Wake the TUN network worker thread from [`Self::wait_on_tun`].
+    ///
+    /// Call this when new outbound data is available (e.g., a container thread wrote to the TX ring
+    /// buffer) to avoid waiting for the futex timeout.
+    pub fn wake_tun(&self) {
+        self.tun_wakeup.fetch_add(1, Ordering::SeqCst);
+        let _ = futex_val2(
+            &self.tun_wakeup,
+            FutexOperation::Wake,
+            1, // wake one waiter
+            0,
+            None,
+        );
     }
 }
 

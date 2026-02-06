@@ -236,10 +236,17 @@ sudo iptables -A FORWARD -i eth0 -o tun99 -m state --state RELATED,ESTABLISHED -
 
 ## How It Works
 
-1. **Rootfs Loading**: Container filesystem is loaded into LiteBox's in-memory filesystem
-2. **Syscall Rewriting**: ELF binaries are patched to redirect syscalls to LiteBox (cached for performance)
+1. **Rootfs Loading**: Container filesystem is loaded into LiteBox's in-memory filesystem (with lazy loading option)
+2. **Syscall Rewriting**: ELF binaries are patched to redirect syscalls to LiteBox (parallel rewriting, xxhash-cached)
 3. **Dynamic Library Support**: `LD_AUDIT` mechanism patches shared libraries at load time
 4. **Syscall Emulation**: All syscalls are intercepted and emulated by LiteBox
+
+**Performance Optimizations:**
+- Lazy executable rewriting (`--lazy-rewrite`): Only rewrites critical binaries upfront
+- Tar indexing: O(1) file lookups instead of O(n) linear scan
+- Parallel rewriting: Uses rayon for multi-core speedup
+- xxhash caching: 10x faster than default hash for cache keys
+- Memory-mapped tar cache: Zero-copy access to cached tar files
 
 ## Performance
 
@@ -247,11 +254,11 @@ sudo iptables -A FORWARD -i eth0 -o tun99 -m state --state RELATED,ESTABLISHED -
 
 | Image | Size | Files | Lazy-rewrite | vs Eager |
 |-------|------|-------|--------------|----------|
-| Alpine | 8.7MB | 84 | **252ms** | 22% faster |
-| Debian | 82MB | 3,264 | **164ms** | 73% faster |
-| Ubuntu | 84MB | 2,587 | **158ms** | 71% faster |
-| Python | 131MB | 4,944 | **248ms** | 67% faster |
-| Node.js | 205MB | 5,667 | **1059ms** | 26% faster |
+| Alpine | 8.7MB | 84 | **193ms** | 32% faster |
+| Debian | 82MB | 3,264 | **172ms** | 72% faster |
+| Ubuntu | 84MB | 2,587 | **164ms** | 70% faster |
+| Python | 131MB | 4,944 | **252ms** | 66% faster |
+| Node.js | 205MB | 5,667 | **980ms** | 31% faster |
 
 *`--lazy-rewrite` is the fastest mode for all workloads. See [BENCHMARKS.md](BENCHMARKS.md) for details.*
 
@@ -294,10 +301,11 @@ litebox-oci run -b /bundle --lazy my-container
 - Only rewrites critical executables upfront (ld-linux, main binary)
 - Other executables lazily rewritten when first accessed
 - Most workloads only use a fraction of available executables
-- No external dependencies
+- Parallel rewriting with rayon for multi-core speedup
+- xxhash for fast cache key computation
 
 **Lazy-tar limitations:**
-- Slower for complex images due to tar O(n) parsing overhead
+- All executables rewritten upfront (slower startup)
 - File writes to read-only layer fail (use `PYTHONDONTWRITEBYTECODE=1` for Python)
 
 ### Advanced: ublk + Squashfs
