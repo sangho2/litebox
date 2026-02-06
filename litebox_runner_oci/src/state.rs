@@ -99,7 +99,7 @@ impl StateManager {
     pub fn sync_pipe(&self, id: &str) -> PathBuf {
         // Truncate ID to 16 chars to keep path short
         let short_id = if id.len() > 16 { &id[..16] } else { id };
-        PathBuf::from(format!("/tmp/litebox-{}.sock", short_id))
+        PathBuf::from(format!("/tmp/litebox-{short_id}.sock"))
     }
 
     /// Check if a container exists.

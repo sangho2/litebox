@@ -115,6 +115,20 @@ enum Command {
     /// List all containers
     List,
 
+    /// Display container events and statistics
+    Events {
+        /// Container ID
+        container_id: String,
+
+        /// Display stats once and exit
+        #[clap(long)]
+        stats: bool,
+
+        /// Stats collection interval (ignored, stats are emulated)
+        #[clap(long, default_value = "5s")]
+        interval: String,
+    },
+
     /// Create and immediately run a container (convenience command)
     Run {
         /// Path to the OCI bundle directory
@@ -404,6 +418,96 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            Ok(())
+        }
+
+        Command::Events {
+            container_id,
+            stats,
+            interval: _,
+        } => {
+            // Verify container exists
+            let state = lifecycle.state(&container_id)?;
+
+            // Try to get real stats from /proc if PID is available
+            #[allow(clippy::similar_names)]
+            let (memory_usage, cpu_user_ns, cpu_sys_ns) = if let Some(pid) = state.pid {
+                // Read memory from /proc/[pid]/statm (pages)
+                let mem = std::fs::read_to_string(format!("/proc/{pid}/statm"))
+                    .ok()
+                    .and_then(|s| {
+                        s.split_whitespace()
+                            .next()
+                            .and_then(|v| v.parse::<u64>().ok())
+                    })
+                    .map_or(0, |pages| pages * 4096); // Convert pages to bytes
+
+                // Read CPU time from /proc/[pid]/stat
+                let (utime, stime) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|s| {
+                        let parts: Vec<&str> = s.split_whitespace().collect();
+                        if parts.len() > 14 {
+                            let utime = parts[13].parse::<u64>().unwrap_or(0);
+                            let stime = parts[14].parse::<u64>().unwrap_or(0);
+                            // Convert jiffies to nanoseconds (assuming 100 Hz)
+                            Some((utime * 10_000_000, stime * 10_000_000))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or((0, 0));
+
+                (mem, utime, stime)
+            } else {
+                (0, 0, 0)
+            };
+
+            // Generate stats JSON matching runc format
+            let stats_json = serde_json::json!({
+                "type": "stats",
+                "id": container_id,
+                "data": {
+                    "cpu": {
+                        "usage": {
+                            "total": cpu_user_ns + cpu_sys_ns,
+                            "kernel": cpu_sys_ns,
+                            "user": cpu_user_ns
+                        },
+                        "throttling": {}
+                    },
+                    "memory": {
+                        "usage": {
+                            "limit": 0,
+                            "usage": memory_usage,
+                            "max": memory_usage,
+                            "failcnt": 0
+                        },
+                        "swap": {
+                            "limit": 0,
+                            "usage": 0,
+                            "failcnt": 0
+                        }
+                    },
+                    "pids": {
+                        "current": i32::from(state.pid.is_some()),
+                        "limit": 0
+                    },
+                    "blkio": {},
+                    "hugetlb": {},
+                    "intel_rdt": {}
+                }
+            });
+
+            println!("{stats_json}");
+
+            // If not --stats, we would loop. For now, just exit after one output.
+            // Real implementation would loop with interval.
+            if !stats {
+                // In streaming mode, runc loops forever. We just output once.
+                // Container orchestrators typically use --stats for one-shot.
+            }
+
             Ok(())
         }
 

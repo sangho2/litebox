@@ -32,6 +32,9 @@
 - [x] statx syscall implementation
 - [x] statfs/fstatfs syscall implementation
 - [x] Virtual /proc filesystem emulation (cpuinfo, meminfo, mounts, stat, status, etc.)
+- [x] `events --stats` command for container resource stats
+- [x] Unix socket path length fix for Kubernetes integration
+- [x] Directory symlink handling for glibc-based distros (Debian, Ubuntu, Fedora)
 
 ## TODO
 
@@ -41,7 +44,7 @@
 
 ### Medium-term
 - [ ] Implement console-socket for TTY support
-- [ ] Implement `events` command for container metrics
+- [x] Implement `events` command for container metrics (basic stats output)
 - [x] Optimize rootfs loading for large images (lazy loading implemented)
 - [x] Lazy file loading (`--lazy-tar`, `--lazy` flags)
 - [x] Kubernetes/CRI-O integration testing (crictl ✓, containerd ✓)

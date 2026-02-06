@@ -100,6 +100,7 @@ litebox-oci --root ~/.litebox-oci run --bundle /tmp/test-bundle my-container
 | `list` | List all containers |
 | `run -b <bundle> <id>` | Create and run (convenience) |
 | `exec <id> <command>...` | Run a command in container's rootfs |
+| `events --stats <id>` | Get container resource stats (CPU, memory) |
 
 ## Additional Options
 
@@ -153,6 +154,43 @@ litebox-oci exec my-container /bin/ls /
 # With environment and mounts
 litebox-oci exec -e DEBUG=1 -m src=/tools,dst=/tools my-container /tools/script.sh
 ```
+
+### Container Stats (Events)
+
+Query resource usage statistics for a running container:
+
+```bash
+# Get current resource stats
+litebox-oci events --stats my-container
+```
+
+Output format matches `runc events --stats`:
+
+```json
+{
+  "type": "stats",
+  "id": "my-container",
+  "data": {
+    "cpu": {
+      "usage": {
+        "total": 123456789,
+        "kernel": 45678901,
+        "user": 77777888
+      }
+    },
+    "memory": {
+      "usage": {
+        "usage": 12345678
+      }
+    },
+    "pids": {
+      "current": 1
+    }
+  }
+}
+```
+
+Stats are read from `/proc/<pid>/statm` (memory) and `/proc/<pid>/stat` (CPU time).
 
 ### Networking (TUN Device)
 
