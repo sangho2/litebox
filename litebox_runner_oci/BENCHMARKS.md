@@ -220,9 +220,39 @@ host and container over TUN device. Release build, 3 runs each.
 | **p99** | 10,562 μs | 66 μs | **160x faster** |
 | **max** | 10,923 μs | 79 μs | **138x faster** |
 
-**Why the improvement:** The old `poll()` approach blocked up to 5ms per direction,
-creating ~10ms minimum RTT. The adaptive spin catches packets within microseconds,
-and the futex fallback uses a 1ms timeout instead of 5ms.
+### How the Network Worker Waits
+
+The network worker thread is pinned to CPU 0 and runs a loop:
+
+1. **Drain phase**: Calls `perform_network_interaction()` in a tight loop while
+   `CallAgainImmediately` is returned (active sockets have data to process).
+   Both old and new approaches burn 100% CPU here — this is expected and identical.
+
+2. **Wait phase**: When no immediate work remains, the worker waits for new packets:
+
+| Aspect | Old (`poll`) | New (spin + `futex`) |
+|--------|-------------|----------------------|
+| **Mechanism** | `poll(tun_fd, POLLIN, 5ms)` | 100× `read(tun_fd, 0)` spin, then `futex_wait(1ms)` |
+| **Idle CPU** | ~0% (kernel sleep) | ~0% (brief spin, then kernel sleep) |
+| **Wakeup on RX** | Immediate (kernel POLLIN) | <1μs if during spin, else up to 1ms on futex timeout |
+| **Wakeup on TX** | Not possible (waits for timeout) | Immediate via `futex_wake` from container thread |
+| **Spin cost** | None | ~100 failed `read` syscalls per cycle (~few μs) |
+| **Syscall type** | Requires `poll` in seccomp filter | Uses only `read` + `futex` (already allowed) |
+
+**Why latency improved 237x:** The old `poll()` blocked up to 5ms per wait. A
+round-trip required two waits (TX direction + RX direction), creating ~10ms minimum
+RTT. The new approach catches packets during the spin window (sub-microsecond), and
+falls back to a 1ms futex timeout instead of 5ms.
+
+**Why throughput improved 73%:** The reduced timeout (5ms → 1ms) means the worker
+polls smoltcp more frequently during sustained transfers, reducing gaps between
+packet batches.
+
+**CPU trade-off:** The new approach adds ~100 `read` syscalls per wait cycle during
+the spin phase. These are zero-length non-blocking reads that return `EAGAIN`
+immediately, costing a few microseconds of CPU per cycle. This is negligible compared
+to the kernel `futex_wait` sleep that follows, and the benefit is catching
+packets that arrive within the spin window without waiting for the full timeout.
 
 ### Reproducing Network Benchmarks
 
