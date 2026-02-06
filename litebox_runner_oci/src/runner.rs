@@ -511,6 +511,38 @@ pub fn run_container_lazy_tar(
     )
 }
 
+/// Run an OCI container with lazy executable rewriting.
+///
+/// This mode combines the benefits of lazy loading with on-demand executable rewriting:
+/// - Only critical executables (dynamic linker, main binary) are rewritten upfront
+/// - Other executables are lazily rewritten when first accessed
+/// - Significantly faster startup for images with many executables
+///
+/// This is the fastest option for most workloads.
+pub fn run_container_lazy_rewrite(
+    bundle_path: &Path,
+    override_args: Option<&[String]>,
+    extra_env: &[String],
+    mounts: &[Mount],
+    stdio: &StdioRedirect,
+    network: &NetworkConfig,
+) -> Result<i32> {
+    if let Some(args) = override_args
+        && args.is_empty()
+    {
+        anyhow::bail!("exec command cannot be empty");
+    }
+    run_container_internal(
+        bundle_path,
+        override_args,
+        extra_env,
+        mounts,
+        stdio,
+        network,
+        LazyMode::LazyRewrite,
+    )
+}
+
 /// Lazy loading mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LazyMode {
@@ -520,6 +552,24 @@ enum LazyMode {
     Squashfs,
     /// True lazy loading with tar + layered filesystem
     TarLayered,
+    /// Lazy rewriting - only critical executables eagerly, rest lazily transformed
+    LazyRewrite,
+}
+
+/// Syscall rewriter implementing the ExecutableTransform trait for lazy rewriting.
+struct SyscallRewriter;
+
+impl litebox::fs::layered::ExecutableTransform for SyscallRewriter {
+    fn transform(&self, content: &[u8]) -> Option<Vec<u8>> {
+        // Use cached rewriting
+        let rewritten = rewrite_with_cache(content);
+        // Only return Some if the content was actually modified
+        if rewritten.len() != content.len() || rewritten != content {
+            Some(rewritten)
+        } else {
+            None
+        }
+    }
 }
 
 /// Internal implementation that handles both regular run and exec.
@@ -687,15 +737,96 @@ fn run_container_internal(
         };
 
         // For TarLayered mode, create tar and only load executables into upper layer
-        let tar_data: std::borrow::Cow<'static, [u8]> = if lazy_mode == LazyMode::TarLayered {
-            tracing::info!("using true lazy loading with tar + layered filesystem");
+        let tar_data: std::borrow::Cow<'static, [u8]> = if lazy_mode == LazyMode::TarLayered
+            || lazy_mode == LazyMode::LazyRewrite
+        {
+            if lazy_mode == LazyMode::LazyRewrite {
+                tracing::info!("using lazy rewriting with tar + layered filesystem");
+            } else {
+                tracing::info!("using true lazy loading with tar + layered filesystem");
+            }
             let tar_bytes = create_tar_from_rootfs(&rootfs_path)?;
+
+            // For LazyRewrite mode, only eagerly load critical executables
+            // (dynamic linkers and main binary). Other executables are lazily rewritten.
+            // Determine main binary path for LazyRewrite mode
+            let main_binary = &args[0];
+            let main_binary_paths: Vec<String> = if main_binary.starts_with('/') {
+                vec![main_binary.clone()]
+            } else {
+                // Search in common paths
+                vec![
+                    format!("/bin/{main_binary}"),
+                    format!("/usr/bin/{main_binary}"),
+                    format!("/sbin/{main_binary}"),
+                    format!("/usr/sbin/{main_binary}"),
+                    format!("/usr/local/bin/{main_binary}"),
+                ]
+            };
 
             // Single pass: collect executables and symlinks, load executable content
             // Symlinks pointing to executables need the rewritten content
             let mut symlinks: Vec<(String, String)> = Vec::new();
             let mut executable_content: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
+
+            // For LazyRewrite mode, do a first pass to collect symlinks
+            // so we can resolve the main binary's symlink target
+            let mut critical_targets: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            if lazy_mode == LazyMode::LazyRewrite {
+                let mut tar_archive = tar::Archive::new(std::io::Cursor::new(&tar_bytes));
+                for entry in tar_archive.entries().into_iter().flatten() {
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let Ok(path) = entry.path() else {
+                        continue;
+                    };
+                    let path_str = format!("/{}", path.to_string_lossy());
+                    let entry_type = entry.header().entry_type();
+
+                    if entry_type == tar::EntryType::Symlink || entry_type == tar::EntryType::Link {
+                        // Check if this symlink is one of the main binary paths
+                        if main_binary_paths.iter().any(|p| p == &path_str) {
+                            if let Ok(Some(link_path)) = entry.link_name() {
+                                let link_str = link_path.to_string_lossy().to_string();
+                                let link_abs = if link_str.starts_with('/') {
+                                    link_str
+                                } else {
+                                    let parent =
+                                        Path::new(&path_str).parent().unwrap_or(Path::new("/"));
+                                    parent.join(&link_str).to_string_lossy().to_string()
+                                };
+                                critical_targets.insert(link_abs);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let is_critical_executable = |path: &str| -> bool {
+                // Always load dynamic linkers - they must be rewritten before anything runs
+                if path.contains("ld-linux") || path.contains("ld-musl") {
+                    return true;
+                }
+                // In LazyRewrite mode, also load the main binary and its symlink targets
+                if lazy_mode == LazyMode::LazyRewrite {
+                    // Check if this is the main binary
+                    for main_path in &main_binary_paths {
+                        if path == main_path {
+                            return true;
+                        }
+                    }
+                    // Check if this is a symlink target of the main binary
+                    if critical_targets.contains(path) {
+                        return true;
+                    }
+                    return false;
+                }
+                // In TarLayered mode, load all executables
+                true
+            };
 
             let mut tar_archive = tar::Archive::new(std::io::Cursor::new(&tar_bytes));
             for entry in tar_archive.entries()? {
@@ -708,7 +839,7 @@ fn run_container_internal(
                     let mode = entry.header().mode().unwrap_or(0);
                     let is_executable = mode & 0o111 != 0;
 
-                    if is_executable {
+                    if is_executable && is_critical_executable(&path_str) {
                         let mut data = Vec::new();
                         let mut entry = entry;
                         entry.read_to_end(&mut data)?;
@@ -995,7 +1126,13 @@ fn run_container_internal(
 
         // Create read-only layer from tar data
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox_instance, tar_data);
-        shim_builder.default_fs(in_mem, tar_ro)
+
+        // For LazyRewrite mode, use executable transform to rewrite on first access
+        if lazy_mode == LazyMode::LazyRewrite {
+            shim_builder.default_fs_with_transform(in_mem, tar_ro, Box::new(SyscallRewriter))
+        } else {
+            shim_builder.default_fs(in_mem, tar_ro)
+        }
     };
 
     shim_builder.set_fs(initial_fs);

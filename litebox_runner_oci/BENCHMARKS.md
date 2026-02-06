@@ -4,58 +4,110 @@ Comprehensive performance benchmarks for litebox_runner_oci.
 
 **Test Environment:**
 - Ubuntu 24.04 LTS (Azure VM)
-- Kernel: 6.8.x with ublk support
+- Kernel: 6.8.x
 - CPU: Azure Standard tier
 - Storage: SSD-backed
-- LiteBox version: with tar indexing (O(1) file lookups)
+- LiteBox version: with lazy rewriting and tar indexing
 
-## Container Startup by Image Type
+## Executive Summary
 
-Benchmarks with tar indexing enabled (all times in seconds, averaged over 3 runs):
+**Lazy-rewrite (`--lazy-rewrite`) is now the fastest mode for all workloads.**
 
-| Image | Size | Files | Eager (cached) | Lazy-tar (indexed) | Improvement |
-|-------|------|-------|----------------|-------------------|-------------|
-| Alpine | 8.7MB | 84 | 0.27s | **0.22s** | 19% faster |
-| Debian bookworm-slim | 82MB | 3,264 | 0.32s | **0.13s** | **59% faster** |
-| Ubuntu 24.04 | 84MB | 2,587 | 0.30s | **0.13s** | **57% faster** |
-| Python 3.11-slim | 131MB | 4,944 | 0.40s | **0.18s** | **55% faster** |
-| Node.js 20-slim | 205MB | 5,667 | 0.65s | **0.41s** | **37% faster** |
+| Image | Size | Files | Lazy-rewrite | vs Eager | vs Lazy-tar |
+|-------|------|-------|--------------|----------|-------------|
+| Alpine | 8.7MB | 84 | **252ms** | 22% faster | 22% faster |
+| Debian | 82MB | 3,264 | **164ms** | 73% faster | 68% faster |
+| Ubuntu | 84MB | 2,587 | **158ms** | 71% faster | 67% faster |
+| Python | 131MB | 4,944 | **248ms** | 67% faster | 63% faster |
+| Node.js | 205MB | 5,667 | **1059ms** | 26% faster | 23% faster |
+
+## Cold Cache Performance (First Run)
+
+All caches cleared before each run. Average of 3 runs.
+
+| Image | Files | Eager | Lazy-tar | Lazy-rewrite |
+|-------|-------|-------|----------|--------------|
+| Alpine | 84 | 322ms | 323ms | **252ms** |
+| Debian | 3,264 | 593ms | 509ms | **164ms** |
+| Ubuntu | 2,587 | 540ms | 475ms | **158ms** |
+| Python | 4,944 | 734ms | 667ms | **248ms** |
+| Node.js | 5,667 | 1428ms | 1362ms | **1059ms** |
 
 **Key Insights:**
-- **Lazy-tar with indexing now wins for ALL image types**
-- Tar indexing provides O(1) file lookups instead of O(n) linear scan
-- Index is built once on tar load (one-time O(n) cost, ~50ms for 5000 files)
-- Improvement grows with file count: 19% for 84 files → 59% for 3264 files
-- Glibc-based distros (Debian, Ubuntu) see the largest improvement
+- **Lazy-rewrite is 22-73% faster than Eager mode**
+- Improvement is greatest for images with many executables (Debian, Ubuntu)
+- Node.js improvement is smaller due to many large JS files (non-executable)
 
-## First Run vs Cached Run
+## Warm Cache Performance (Subsequent Runs)
 
-First run includes tar creation and caching:
+One warmup run, then average of 3 runs with caches populated.
 
-| Image | First Run (tar creation) | Cached Run | Cache Hit Speedup |
-|-------|--------------------------|------------|-------------------|
-| Alpine | 0.24s | 0.22s | 8% |
-| Debian | 0.23s | 0.13s | 43% |
-| Python | 0.34s | 0.18s | 47% |
-| Node.js | 0.60s | 0.41s | 32% |
+| Image | Eager | Lazy-tar | Lazy-rewrite | vs Eager | vs Lazy-tar |
+|-------|-------|----------|--------------|----------|-------------|
+| Alpine | 278ms | 233ms | **218ms** | 22% faster | 7% faster |
+| Debian | 323ms | 141ms | **64ms** | 81% faster | 55% faster |
+| Ubuntu | 292ms | 129ms | **63ms** | 79% faster | 52% faster |
+| Python | 415ms | 182ms | **89ms** | 79% faster | 52% faster |
+| Node.js | 666ms | 392ms | **322ms** | 52% faster | 18% faster |
 
-Tar files are cached in `~/.cache/litebox-oci/tar/` using rootfs content hash.
+**Key Insights:**
+- Warm cache performance is even better (81% faster for Debian)
+- Cached binary rewrites + cached tar = minimal startup overhead
+- For repeated container runs, expect 52-81% improvement vs Eager
 
 ## Loading Mode Comparison
 
-Tested with Alpine 8.7MB image (84 files):
+### How Each Mode Works
 
-| Mode | Time | Setup Required | Notes |
-|------|------|----------------|-------|
-| **Lazy-tar (indexed)** | **0.22s** | None | Fastest for most cases |
-| Eager | 0.27s | None | Simple, predictable |
-| Loop+squashfs | 0.36s | mksquashfs | Kernel mount overhead |
-| ublk+squashfs | 0.39s | modprobe, rublk | Best for repeated access |
-| Squashfuse (FUSE) | 0.48s | squashfuse pkg | FUSE overhead (~200ms) |
+| Mode | Executables | Other Files | Rewriting |
+|------|-------------|-------------|-----------|
+| **Lazy-rewrite** | Critical only upfront | On-demand from tar | On-demand |
+| Lazy-tar | All upfront | On-demand from tar | All upfront |
+| Eager | All upfront | All upfront | All upfront |
+| Squashfs | All upfront | Via kernel mount | All upfront |
+
+### When to Use Each Mode
+
+| Mode | Best For | Trade-offs |
+|------|----------|------------|
+| `--lazy-rewrite` | **Most workloads** | Fastest startup, minimal memory |
+| `--lazy-tar` | Simple validation | All executables ready |
+| (default/Eager) | Debugging | Predictable, all files in memory |
+| `--lazy` (squashfs) | Kernel compatibility | Requires root/sudo |
+
+## Why Lazy-Rewrite is Fastest
+
+The new lazy-rewrite mode provides the best performance by:
+
+1. **Only loading critical executables upfront:**
+   - Dynamic linker (ld-linux or ld-musl)
+   - Main binary (resolved from command)
+   - Symlink targets of main binary
+
+2. **Lazy transformation on first access:**
+   - When an executable is opened, it's rewritten and cached
+   - Uses the `ExecutableTransform` trait in the layered filesystem
+   - Transformed files are promoted to upper layer for subsequent access
+
+3. **Most workloads only use a fraction of executables:**
+   - Python image has ~500 executables, but a simple script uses ~10
+   - Debian has ~300 executables, but `echo "Hello"` uses ~3
+
+### Startup Cost Breakdown
+
+For a Python container running a simple script:
+
+| Phase | Eager | Lazy-tar | Lazy-rewrite |
+|-------|-------|----------|--------------|
+| Tar loading | ~50ms | ~50ms | ~50ms |
+| Index build | - | ~30ms | ~30ms |
+| Executable rewriting | ~400ms (all) | ~400ms (all) | ~30ms (3 files) |
+| Other file loading | ~280ms | ~0ms | ~0ms |
+| **Total** | **~730ms** | **~480ms** | **~110ms** |
 
 ## Tar Indexing Performance
 
-The tar indexing implementation provides O(1) lookups:
+The tar filesystem uses O(1) hash-based lookups:
 
 | Operation | Before (O(n) scan) | After (indexed) | Speedup |
 |-----------|-------------------|-----------------|---------|
@@ -78,30 +130,21 @@ The tar indexing implementation provides O(1) lookups:
 |------|--------------|--------------|------------|
 | Eager | ~12MB | ~140MB | ~220MB |
 | Lazy-tar | ~3MB* | ~15MB* | ~25MB* |
-| ublk+squashfs | ~2MB | ~5MB | ~8MB |
+| Lazy-rewrite | ~2MB* | ~10MB* | ~20MB* |
 
-*Lazy-tar only loads accessed files. Memory grows as files are accessed.
+*Memory grows as files are accessed. Lazy-rewrite typically uses less memory because fewer executables are loaded upfront.
 
-## Binary Caching Impact
+## Binary Caching
 
 Rewritten executables are cached in `~/.cache/litebox-oci/rewritten/`:
 
-| Scenario | First Run | Cached Run | Speedup |
-|----------|-----------|------------|---------|
-| Alpine (echo) | 0.31s | 0.27s | 13% |
-| Python hello | 0.52s | 0.40s | 23% |
-| Node hello | 0.82s | 0.65s | 21% |
+| Scenario | Cold Run | Warm Run | Speedup |
+|----------|----------|----------|---------|
+| Alpine (lazy-rewrite) | 252ms | 218ms | 13% |
+| Python (lazy-rewrite) | 248ms | 89ms | 64% |
+| Debian (lazy-rewrite) | 164ms | 64ms | 61% |
 
-## Recommendations by Use Case
-
-| Use Case | Recommended Mode | Rationale |
-|----------|------------------|-----------|
-| **All workloads** | `--lazy-tar` | Now fastest with indexing |
-| Simple busybox/Alpine | `--lazy-tar` | Lowest memory, fast |
-| Python/Node/Go apps | `--lazy-tar` | Indexed lookups are fast |
-| Large data containers | `--lazy-tar` | Only loads needed files |
-| Repeated same image | ublk+squashfs | Kernel cache persists |
-| Memory-constrained | `--lazy-tar` | On-demand loading |
+Tar files are cached in `~/.cache/litebox-oci/tar/` using rootfs content hash.
 
 ## Reproducing Benchmarks
 
@@ -111,12 +154,12 @@ Rewritten executables are cached in `~/.cache/litebox-oci/rewritten/`:
 # Install tools
 sudo apt install skopeo umoci
 
-# Alpine bundle
+# Create bundles directory
 mkdir -p /tmp/oci-bundles /tmp/oci-images
+
+# Alpine bundle
 skopeo copy docker://alpine:latest oci:/tmp/oci-images/alpine:latest
 umoci unpack --rootless --image /tmp/oci-images/alpine:latest /tmp/oci-bundles/alpine
-
-# Create minimal config.json
 cat > /tmp/oci-bundles/alpine/config.json << 'EOF'
 {
   "ociVersion": "1.0.0",
@@ -129,30 +172,37 @@ cat > /tmp/oci-bundles/alpine/config.json << 'EOF'
   }
 }
 EOF
+
+# Repeat for other images (debian, ubuntu, python, node)
 ```
 
 ### Run Benchmarks
 
 ```bash
-# Clear caches
-rm -rf ~/.cache/litebox-oci/tar/
-rm -rf ~/.cache/litebox-oci/rewriter/
+# Build release binary
+cargo build --release -p litebox_runner_oci
 
-# Eager mode (default)
-time litebox_runner_oci run --bundle /tmp/oci-bundles/alpine test-eager
+# Clear caches for cold run
+rm -rf ~/.cache/litebox-oci/
 
-# Lazy-tar mode (with indexing)
-time litebox_runner_oci run --bundle /tmp/oci-bundles/alpine --lazy-tar test-lazy
+# Test each mode
+time target/release/litebox_runner_oci run -b /tmp/oci-bundles/alpine test-eager
+time target/release/litebox_runner_oci run -b /tmp/oci-bundles/alpine --lazy-tar test-tar
+time target/release/litebox_runner_oci run -b /tmp/oci-bundles/alpine --lazy-rewrite test-rewrite
 
 # Cleanup
-litebox_runner_oci delete test-eager test-lazy
+target/release/litebox_runner_oci delete test-eager test-tar test-rewrite
 ```
 
 ## Version History
 
+- **2026-02-06**: Added lazy executable rewriting (`--lazy-rewrite`)
+  - 22-73% faster than Eager mode (cold cache)
+  - 52-81% faster than Eager mode (warm cache)
+  - Only critical executables rewritten upfront
+
 - **2026-02-06**: Added tar indexing for O(1) file lookups
-  - Lazy-tar now fastest for all image types
-  - 37-59% improvement for glibc-based images
+  - Lazy-tar 37-59% faster for glibc-based images
   - Index build time: ~5-35ms depending on file count
 
 - **2026-02-05**: Initial benchmark collection on Ubuntu 24.04 Azure

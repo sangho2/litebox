@@ -3,6 +3,7 @@
 
 //! An layered file system, layering on [`FileSystem`](super::FileSystem) on top of another.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -40,6 +41,17 @@ pub enum LayeringSemantics {
     LowerLayerWritableFiles,
 }
 
+/// A trait for transforming executable file content.
+///
+/// This is used by the layered filesystem to apply transformations (e.g., syscall rewriting)
+/// to executable files when they are first accessed from the lower layer.
+pub trait ExecutableTransform: Send + Sync {
+    /// Transform the content of an executable file.
+    ///
+    /// Returns the transformed content, or None if no transformation is needed.
+    fn transform(&self, content: &[u8]) -> Option<Vec<u8>>;
+}
+
 /// A backing implementation of [`FileSystem`](super::FileSystem) that layers a file system on top
 /// of another.
 ///
@@ -68,6 +80,9 @@ pub struct FileSystem<
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
+    /// Optional transform for executable files from lower layer.
+    /// When set, executable files are transformed and copied to upper layer on first access.
+    executable_transform: Option<Box<dyn ExecutableTransform>>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
@@ -91,6 +106,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             current_working_dir: "/".into(),
             layering_semantics,
             node_info_lookup,
+            executable_transform: None,
+        }
+    }
+
+    /// Construct a new `FileSystem` instance with an executable transform.
+    ///
+    /// When set, executable files from the lower layer are transformed and promoted
+    /// to the upper layer on first access. This enables lazy rewriting of executables.
+    #[must_use]
+    pub fn with_executable_transform(
+        litebox: &LiteBox<Platform>,
+        upper: Upper,
+        lower: Lower,
+        layering_semantics: LayeringSemantics,
+        transform: Box<dyn ExecutableTransform>,
+    ) -> Self {
+        let root = sync::RwLock::new(RootDir::new());
+        let node_info_lookup = sync::RwLock::new(HashMap::new());
+        Self {
+            litebox: litebox.clone(),
+            upper,
+            lower,
+            root,
+            current_working_dir: "/".into(),
+            layering_semantics,
+            node_info_lookup,
+            executable_transform: Some(transform),
         }
     }
 
@@ -585,9 +627,82 @@ impl<
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
-        let entry = Arc::new(EntryX::Lower {
-            fd: self.lower.open(path.as_str(), flags, mode)?,
-        });
+        let lower_fd = self.lower.open(path.as_str(), flags, mode)?;
+
+        // Check if this is an executable that needs transformation
+        if let Some(ref transform) = self.executable_transform
+            && let Ok(status) = self.lower.fd_file_status(&lower_fd)
+        {
+            let is_executable = status
+                .mode
+                .intersects(super::Mode::XUSR | super::Mode::XGRP | super::Mode::XOTH);
+            if is_executable && status.file_type == FileType::RegularFile {
+                // Read entire file content from lower layer
+                let file_size = status.size;
+                let mut content = alloc::vec![0u8; file_size];
+                let mut offset = 0;
+                while offset < file_size {
+                    let bytes_read = self
+                        .lower
+                        .read(&lower_fd, &mut content[offset..], Some(offset))
+                        .unwrap_or(0);
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    offset += bytes_read;
+                }
+                self.lower.close(&lower_fd).ok();
+
+                // Apply transformation
+                if let Some(transformed) = transform.transform(&content) {
+                    // Create parent directories if needed (ignore errors, directory might exist)
+                    let _ = self.mkdir_migrating_ancestor_dirs(&path);
+
+                    // Create file in upper layer with transformed content
+                    let upper_flags = OFlags::CREAT | OFlags::RDWR | OFlags::TRUNC;
+                    if let Ok(upper_fd) = self.upper.open(path.as_str(), upper_flags, status.mode) {
+                        // Write transformed content
+                        let _ = self.upper.write(&upper_fd, &transformed, Some(0));
+
+                        // Return upper layer fd
+                        let entry = Arc::new(EntryX::Upper { fd: upper_fd });
+                        let old = self
+                            .root
+                            .write()
+                            .entries
+                            .insert(path.clone(), Arc::clone(&entry));
+                        // It's possible another thread already inserted, that's fine
+                        drop(old);
+                        return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                            path,
+                            flags: original_flags,
+                            entry,
+                            position: 0.into(),
+                        }));
+                    }
+                }
+
+                // If transformation failed or returned None, re-open lower layer
+                let lower_fd = self.lower.open(path.as_str(), flags, mode)?;
+                let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                let old = self
+                    .root
+                    .write()
+                    .entries
+                    .insert(path.clone(), Arc::clone(&entry));
+                assert!(old.is_none());
+                let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
+                    path,
+                    flags: original_flags,
+                    entry,
+                    position: 0.into(),
+                });
+                return Ok(fd);
+            }
+        }
+
+        // No transformation needed, proceed with lower layer fd
+        let entry = Arc::new(EntryX::Lower { fd: lower_fd });
         let old = self
             .root
             .write()

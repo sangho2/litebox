@@ -169,6 +169,19 @@ impl LinuxShimBuilder {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
 
+    /// Create a default layered file system with an executable transform for lazy rewriting.
+    ///
+    /// When set, executable files from the lower layer are transformed and promoted
+    /// to the upper layer on first access. This enables lazy rewriting of executables.
+    pub fn default_fs_with_transform(
+        &self,
+        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+        transform: alloc::boxed::Box<dyn litebox::fs::layered::ExecutableTransform>,
+    ) -> DefaultFS {
+        default_fs_with_transform(&self.litebox, in_mem_fs, tar_ro_fs, transform)
+    }
+
     /// Set the load filter, which can augment envp or auxv when starting a new program.
     pub fn set_load_filter(&mut self, callback: LoadFilter) {
         self.load_filter = Some(callback);
@@ -311,6 +324,30 @@ fn default_fs(
             dev_stdio,
             tar_ro_fs,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    )
+}
+
+/// Create a default layered file system with an executable transform for lazy rewriting.
+fn default_fs_with_transform(
+    litebox: &LiteBox<Platform>,
+    in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+    tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+    transform: alloc::boxed::Box<dyn litebox::fs::layered::ExecutableTransform>,
+) -> LinuxFS {
+    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
+    // Use with_executable_transform for the inner layer (dev_stdio + tar_ro)
+    // so that executables from tar_ro are transformed on first access
+    litebox::fs::layered::FileSystem::new(
+        litebox,
+        in_mem_fs,
+        litebox::fs::layered::FileSystem::with_executable_transform(
+            litebox,
+            dev_stdio,
+            tar_ro_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+            transform,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     )

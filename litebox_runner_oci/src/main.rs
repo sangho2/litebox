@@ -176,6 +176,12 @@ enum Command {
         /// are read on-demand from a tar archive. Much faster for large images.
         #[clap(long)]
         lazy_tar: bool,
+
+        /// Enable lazy rewriting with tar + layered filesystem.
+        /// Only critical executables (dynamic linker, main binary) are loaded upfront.
+        /// Other executables are lazily rewritten on first access. Fastest startup.
+        #[clap(long)]
+        lazy_rewrite: bool,
     },
 
     /// Execute a command in a container's rootfs (simplified exec)
@@ -522,6 +528,7 @@ fn main() -> Result<()> {
             tun_device,
             lazy,
             lazy_tar,
+            lazy_rewrite,
         } => {
             tracing::info!(
                 container_id = %container_id,
@@ -529,6 +536,7 @@ fn main() -> Result<()> {
                 tun_device = ?tun_device,
                 lazy = lazy,
                 lazy_tar = lazy_tar,
+                lazy_rewrite = lazy_rewrite,
                 "running container"
             );
 
@@ -550,7 +558,11 @@ fn main() -> Result<()> {
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
             let mounts = parse_mounts(&mount)?;
 
-            let exit_code = if lazy_tar {
+            let exit_code = if lazy_rewrite {
+                litebox_runner_oci::run_container_lazy_rewrite(
+                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                )?
+            } else if lazy_tar {
                 litebox_runner_oci::run_container_lazy_tar(
                     &bundle, None, &extra_env, &mounts, &stdio, &network,
                 )?

@@ -266,10 +266,16 @@ mod tests {
         let (_temp, manager) = create_temp_manager();
 
         assert!(manager.container_dir("foo").ends_with("containers/foo"));
+        // sync_pipe uses /tmp to avoid Unix socket path length limits
+        let sync_path = manager.sync_pipe("foo");
+        let sync_str = sync_path.to_string_lossy();
         assert!(
-            manager
-                .sync_pipe("foo")
-                .ends_with("containers/foo/sync.pipe")
+            sync_str.starts_with("/tmp/litebox-"),
+            "Expected sync_pipe to start with /tmp/litebox-, got: {sync_str}"
+        );
+        assert!(
+            sync_str.contains("foo"),
+            "Expected sync_pipe to contain 'foo', got: {sync_str}"
         );
     }
 

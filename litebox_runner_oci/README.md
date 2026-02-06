@@ -243,16 +243,17 @@ sudo iptables -A FORWARD -i eth0 -o tun99 -m state --state RELATED,ESTABLISHED -
 
 ## Performance
 
-### Quick Benchmarks
+### Quick Benchmarks (Cold Cache)
 
-| Image | Size | Startup Time | Notes |
-|-------|------|--------------|-------|
-| Alpine (echo) | 12MB | 0.23-0.27s | Lazy-tar fastest |
-| Python hello | 74MB | 0.13s | Eager fastest |
-| Python 3.11-slim | 130MB | 0.38s | Debian-based |
-| Large data | 574MB | 0.37s | Memory-efficient |
+| Image | Size | Files | Lazy-rewrite | vs Eager |
+|-------|------|-------|--------------|----------|
+| Alpine | 8.7MB | 84 | **252ms** | 22% faster |
+| Debian | 82MB | 3,264 | **164ms** | 73% faster |
+| Ubuntu | 84MB | 2,587 | **158ms** | 71% faster |
+| Python | 131MB | 4,944 | **248ms** | 67% faster |
+| Node.js | 205MB | 5,667 | **1059ms** | 26% faster |
 
-*Benchmarks on Ubuntu 24.04 Azure VM. See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results.*
+*`--lazy-rewrite` is the fastest mode for all workloads. See [BENCHMARKS.md](BENCHMARKS.md) for details.*
 
 ### Binary Caching
 
@@ -260,7 +261,7 @@ Rewritten executables are cached in `~/.cache/litebox-oci/rewritten/`. Subsequen
 
 ```bash
 # Clear cache if needed
-rm -rf ~/.cache/litebox-oci/rewritten/
+rm -rf ~/.cache/litebox-oci/
 ```
 
 ### Lazy Loading Modes
@@ -268,32 +269,31 @@ rm -rf ~/.cache/litebox-oci/rewritten/
 For large container images, lazy loading can significantly reduce startup time and memory usage:
 
 ```bash
-# Default: eager mode (loads all files upfront)
-litebox-oci run -b /bundle my-container
+# Lazy-rewrite mode: fastest - only critical executables rewritten upfront (RECOMMENDED)
+litebox-oci run -b /bundle --lazy-rewrite my-container
 
 # Lazy-tar mode: only loads executables, reads other files on-demand
 litebox-oci run -b /bundle --lazy-tar my-container
+
+# Default: eager mode (loads all files upfront)
+litebox-oci run -b /bundle my-container
 
 # Squashfs mode: uses loop-mounted squashfs (requires root)
 litebox-oci run -b /bundle --lazy my-container
 ```
 
-**Performance by image type:**
+**Mode Comparison:**
 
-| Image | Size | Eager | Lazy-tar | Best Mode |
-|-------|------|-------|----------|-----------|
-| Alpine (simple) | 12MB | 0.27s | **0.23s** | Lazy-tar |
-| Python (complex) | 74MB | **0.13s** | 0.54s | Eager |
-| Large data | 174MB | **0.18s** | 0.60s | Eager |
+| Mode | Cold Cache | Warm Cache | Best For |
+|------|------------|------------|----------|
+| `--lazy-rewrite` | **Fastest** | **Fastest** | All workloads (recommended) |
+| `--lazy-tar` | Fast | Fast | Memory-constrained |
+| Eager (default) | Slow | Moderate | Debugging, simple images |
 
-**When to use each mode:**
-- **`--lazy-tar`**: Simple containers (busybox, Alpine), memory-constrained environments
-- **Default (eager)**: Complex containers with many libraries (Python, Node, Go)
-- **ublk+squashfs**: Repeated access to same image, lowest overhead after setup
-
-**Lazy-tar benefits:**
-- Faster startup for simple images (fewer file lookups)
-- Lower memory usage (only accessed files loaded)
+**Why lazy-rewrite is fastest:**
+- Only rewrites critical executables upfront (ld-linux, main binary)
+- Other executables lazily rewritten when first accessed
+- Most workloads only use a fraction of available executables
 - No external dependencies
 
 **Lazy-tar limitations:**
