@@ -30,12 +30,15 @@ use core::sync::atomic::Ordering;
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
     umask: core::sync::atomic::AtomicU32,
+    /// Current working directory (absolute path).
+    cwd: litebox::sync::RwLock<Platform, String>,
 }
 
 impl Clone for FsState {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
+            cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
         }
     }
 }
@@ -44,11 +47,20 @@ impl FsState {
     pub fn new() -> Self {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+            cwd: litebox::sync::RwLock::new("/".into()),
         }
     }
 
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
+    }
+
+    fn cwd(&self) -> String {
+        self.cwd.read().clone()
+    }
+
+    pub(crate) fn set_cwd(&self, path: String) {
+        *self.cwd.write() = path;
     }
 }
 
@@ -118,6 +130,17 @@ impl<P: path::Arg> FsPath<P> {
 impl Task {
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
+    }
+
+    /// Resolve a relative path against the current working directory.
+    /// Returns an absolute path string suitable for filesystem operations.
+    fn resolve_cwd_path(&self, relative: &str) -> String {
+        let cwd = self.fs.borrow().cwd();
+        if cwd == "/" {
+            alloc::format!("/{relative}")
+        } else {
+            alloc::format!("{cwd}/{relative}")
+        }
     }
 
     /// Handle syscall `umask`
@@ -226,7 +249,7 @@ impl Task {
                 vec![comm.clone()]
             },
             environ: vec![], // We don't store environ, but could add placeholder
-            cwd: "/".into(), // We could get this from fs if stored
+            cwd: self.fs.borrow().cwd(),
             hostname: "litebox".into(),
         }
     }
@@ -241,10 +264,15 @@ impl Task {
     ) -> Result<u32, Errno> {
         let fs_path = FsPath::new(dirfd, pathname)?;
         match fs_path {
-            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
-                self.sys_open(path, flags, mode)
+            FsPath::Absolute { path } => self.sys_open(path, flags, mode),
+            FsPath::CwdRelative { path } => {
+                let resolved = self.resolve_cwd_path(path.as_rust_str()?);
+                self.sys_open(resolved.as_str(), flags, mode)
             }
-            FsPath::Cwd => self.sys_open("", flags, mode),
+            FsPath::Cwd => {
+                let cwd = self.fs.borrow().cwd();
+                self.sys_open(cwd.as_str(), flags, mode)
+            }
             FsPath::Fd(_fd) => {
                 log_unsupported!("openat with FsPath::Fd");
                 Err(Errno::EINVAL)
@@ -294,11 +322,22 @@ impl Task {
 
         let fs_path = FsPath::new(dirfd, pathname)?;
         match fs_path {
-            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+            FsPath::Absolute { path } => {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
                     self.global.fs.rmdir(path).map_err(Errno::from)
                 } else {
                     self.global.fs.unlink(path).map_err(Errno::from)
+                }
+            }
+            FsPath::CwdRelative { path } => {
+                let resolved = self.resolve_cwd_path(path.as_rust_str()?);
+                if flags.contains(AtFlags::AT_REMOVEDIR) {
+                    self.global.fs.rmdir(resolved.as_str()).map_err(Errno::from)
+                } else {
+                    self.global
+                        .fs
+                        .unlink(resolved.as_str())
+                        .map_err(Errno::from)
                 }
             }
             FsPath::Cwd => Err(Errno::EINVAL),
@@ -814,12 +853,13 @@ impl Task {
         let fspath = FsPath::new(dirfd, pathname)?;
         let path = match fspath {
             FsPath::Absolute { path } => self.do_readlink(path.normalized()?.as_str()),
-            // Note we don't support changing cwd yet; cwd is always `/`.
-            FsPath::Cwd => self.do_readlink("/"),
+            FsPath::Cwd => {
+                let cwd = self.fs.borrow().cwd();
+                self.do_readlink(&cwd)
+            }
             FsPath::CwdRelative { path } => {
-                let normalized_path = path.normalized()?;
-                let full_path = alloc::format!("/{}", normalized_path.as_str());
-                self.do_readlink(&full_path)
+                let resolved = self.resolve_cwd_path(path.normalized()?.as_str());
+                self.do_readlink(&resolved)
             }
             FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
         }?;
@@ -1109,10 +1149,20 @@ impl Task {
         let files = self.files.borrow();
         let fs_path = FsPath::new(dirfd, pathname)?;
         let fstat: FileStat = match fs_path {
-            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+            FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
             }
-            FsPath::Cwd => self.global.fs.file_status("")?.into(),
+            FsPath::CwdRelative { path } => {
+                let resolved = self.resolve_cwd_path(path.as_rust_str()?);
+                self.do_stat(
+                    resolved.as_str(),
+                    !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW),
+                )?
+            }
+            FsPath::Cwd => {
+                let cwd = self.fs.borrow().cwd();
+                self.global.fs.file_status(&cwd)?.into()
+            }
             FsPath::Fd(fd) => files
                 .file_descriptors
                 .read()
@@ -1146,14 +1196,21 @@ impl Task {
         let files = self.files.borrow();
         let fs_path = FsPath::new(dirfd, pathname)?;
         let status = match fs_path {
-            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+            FsPath::Absolute { path } => {
                 let follow_symlinks = !flags.contains(StatxFlags::AT_SYMLINK_NOFOLLOW);
                 // TODO: respect follow_symlinks when symlinks are supported
                 let _ = follow_symlinks;
                 let normalized = path.normalized()?;
                 self.global.fs.file_status(normalized)?
             }
-            FsPath::Cwd => self.global.fs.file_status("")?,
+            FsPath::CwdRelative { path } => {
+                let resolved = self.resolve_cwd_path(path.normalized()?.as_str());
+                self.global.fs.file_status(resolved.as_str())?
+            }
+            FsPath::Cwd => {
+                let cwd = self.fs.borrow().cwd();
+                self.global.fs.file_status(&cwd)?
+            }
             FsPath::Fd(fd) => {
                 if !flags.contains(StatxFlags::AT_EMPTY_PATH) {
                     return Err(Errno::ENOENT);
@@ -1546,19 +1603,37 @@ impl Task {
 
     /// Handle syscall `getcwd`
     pub fn sys_getcwd(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        // TODO: use a fixed path for now
-        let cwd = "/";
+        let cwd = self.fs.borrow().cwd();
         // need to account for the null terminator
         if cwd.len() >= buf.len() {
             return Err(Errno::ERANGE);
         }
 
-        let Ok(name) = CString::new(cwd) else {
+        let Ok(name) = CString::new(cwd.as_str()) else {
             return Err(Errno::EINVAL);
         };
         let bytes = name.as_bytes_with_nul();
         buf[..bytes.len()].copy_from_slice(bytes);
         Ok(bytes.len())
+    }
+
+    /// Handle syscall `chdir`
+    pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        let path_str = pathname.normalized()?;
+        let abs_path = if path_str.starts_with('/') {
+            path_str
+        } else {
+            self.resolve_cwd_path(&path_str)
+        };
+
+        // Verify the path exists and is a directory
+        let status = self.global.fs.file_status(&abs_path)?;
+        if status.file_type != litebox::fs::FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+
+        self.fs.borrow().set_cwd(abs_path);
+        Ok(())
     }
 }
 

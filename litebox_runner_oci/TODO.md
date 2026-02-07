@@ -35,6 +35,8 @@
 - [x] `events --stats` command for container resource stats
 - [x] Unix socket path length fix for Kubernetes integration
 - [x] Directory symlink handling for glibc-based distros (Debian, Ubuntu, Fedora)
+- [x] `chdir()` / `fchdir()` syscall support and `process.cwd` from OCI spec
+- [x] litebox-sh: fork-free minimal shell for container entrypoints
 
 ## TODO
 
@@ -74,7 +76,7 @@
 4. **Alpine cleanup segfault**: Sometimes segfaults during cleanup (doesn't affect execution)
 5. **Raw sockets not supported**: ping and other ICMP tools fail (SOCK_RAW not implemented in litebox)
 6. **Some TCP edge cases**: Certain socket state transitions cause panics in smoltcp stack
-7. **fork() not supported**: Shell scripts can't run external commands (use direct exec instead)
+7. **fork() not supported**: Standard shells can't run external commands. Use litebox-sh (see below) or direct exec instead
 
 ## Notes
 
@@ -112,19 +114,28 @@ LiteBox supports **pthreads** (multi-threading) and **execve**, but not **fork()
 |---------|--------|-------|
 | pthreads | ✅ Supported | `clone()` with `CLONE_VM\|CLONE_THREAD` |
 | execve | ✅ Supported | Replaces current process image |
+| chdir | ✅ Supported | Change working directory |
 | fork | ❌ Not supported | Returns ENOSYS |
 
 **Implications:**
 - Multi-threaded applications (Go, Rust, Java, Python threads) work
 - Direct command execution works (`/bin/ls`, `/usr/bin/python`)
-- Shell scripts calling external commands fail (sh needs fork)
+- Standard shells (bash, dash, ash) can't run external commands (they need fork)
 - Traditional fork-then-exec patterns don't work
 
-**Workaround:** Run commands directly instead of through shell:
+**Workaround:** Use **litebox-sh**, a fork-free minimal shell included in `litebox_runner_oci/tools/litebox-sh/`:
 ```json
-// Instead of: ["sh", "-c", "ls /"]
-// Use:        ["/bin/ls", "/"]
+// litebox-sh supports builtins + final exec:
+["litebox-sh", "-c", "export FOO=bar && echo $FOO && exec /app/server"]
 ```
+
+litebox-sh supports:
+- Builtins: `echo`, `cd`, `pwd`, `export`, `unset`, `exit`, `test`/`[`, `true`, `false`, `set`, `exec`, `source`/`.`, `read`, `:`
+- Operators: `&&`, `||`, `;`
+- Variable expansion: `$VAR`, `${VAR}`, `$?`, `$0`-`$9`
+- Quoting: single quotes, double quotes, backslash escaping
+- I/O redirection: `>`, `>>`, `<`, `2>`, `2>&1`
+- External commands via `execve` (replaces shell — no pipes or background jobs)
 
 **Future:** Implementing fork would require forking the LiteBox process itself while sharing the emulated address space across instances. This technique was used in kernel-mode LiteBox but hasn't been ported to userspace yet.
 

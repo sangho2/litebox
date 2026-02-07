@@ -293,6 +293,16 @@ pub struct LoadedProgram {
     pub process: LinuxShimProcess,
 }
 
+impl LoadedProgram {
+    /// Set the initial working directory for the loaded program.
+    ///
+    /// This should be called before running the program to set the cwd
+    /// from the OCI spec's `process.cwd` field.
+    pub fn set_cwd(&self, cwd: &str) {
+        self.entrypoints.task.fs.borrow().set_cwd(cwd.into());
+    }
+}
+
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
 /// This can be used to wait for the process to exit.
@@ -750,6 +760,9 @@ impl Task {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Chdir { pathname } => pathname
+                .to_cstring()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,

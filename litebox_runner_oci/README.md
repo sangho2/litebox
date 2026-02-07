@@ -343,6 +343,8 @@ See [TODO.md](TODO.md) for detailed performance analysis and virtual block devic
 - ✅ Lazy file loading (`--lazy-tar`, `--lazy`)
 - ✅ TUN-based networking (`--tun-device`)
 - ✅ Virtual /proc filesystem (cpuinfo, meminfo, mounts, etc.)
+- ✅ `chdir()` syscall and `process.cwd` from OCI spec
+- ✅ Fork-free shell (litebox-sh) for container entrypoint scripts
 
 ### Virtual /proc Filesystem
 
@@ -389,19 +391,31 @@ cat /proc/loadavg
 
 ## Process Model
 
-LiteBox supports **pthreads** and **execve**, but not **fork()**:
+LiteBox supports **pthreads**, **execve**, and **chdir**, but not **fork()**:
 
 - ✅ Multi-threaded programs work (Go, Rust, Java, Python with threads)
 - ✅ Direct command execution works (`/bin/ls`, `/usr/bin/python`)
-- ❌ Shell scripts calling external commands fail (`sh -c "ls"` needs fork)
-- ❌ Traditional fork-then-exec patterns don't work
+- ✅ Shell builtins work (`echo`, `cd`, `pwd`, `export`, `test`, etc.)
+- ✅ Shell `exec` works (`sh -c "export FOO=bar && exec /app/server"`)
+- ✅ `process.cwd` from OCI spec sets initial working directory
+- ❌ Shell scripts calling multiple external commands fail (needs fork for non-final commands)
+- ❌ Pipes (`|`), background jobs (`&`), subshells (`$(...)`) not supported
 
-**Workaround:** Run commands directly instead of through shell.
+**Shell support:** Alpine's `/bin/sh` (ash) works for builtin-only commands and
+single external commands (the last command is exec'd). For more complex scripts,
+use **litebox-sh**, a fork-free shell included in `litebox_runner_oci/tools/litebox-sh/`:
+
+```bash
+# Builtins + final exec (most common OCI entrypoint pattern)
+litebox-sh -c 'export PATH=/app/bin:$PATH && cd /app && exec ./server'
+```
+
+See [litebox-sh README](tools/litebox-sh/README.md) for full feature list.
 
 ## Limitations
 
 - ❌ x86_64 only (ARM64 not yet supported)
-- ❌ No fork() syscall (pthreads and execve work)
+- ❌ No fork() syscall (pthreads, execve, and chdir work; use litebox-sh for shell scripts)
 - ❌ No per-container network isolation (all containers share same TUN IP)
 - ❌ No cgroup resource limits
 - ❌ Symlinks flattened to regular files
@@ -415,6 +429,7 @@ LiteBox supports **pthreads** and **execve**, but not **fork()**:
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) - Development guide
 - [docs/OCI_FEATURES.md](docs/OCI_FEATURES.md) - OCI feature support matrix
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - Common issues and solutions
+- [tools/litebox-sh/README.md](tools/litebox-sh/README.md) - Fork-free shell for LiteBox
 
 ## License
 

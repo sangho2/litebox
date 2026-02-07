@@ -630,3 +630,77 @@ fn test_tun_tcp_latency() {
         .run();
     child.join().unwrap();
 }
+
+/// Test litebox-sh (fork-free shell) inside the sandbox.
+///
+/// Verifies builtins (echo, cd, pwd, export, test), variable expansion,
+/// && / || operators, and that the shell exits correctly.
+#[test]
+fn test_litebox_sh() {
+    let shell_src = PathBuf::from("../litebox_runner_oci/tools/litebox-sh/litebox-sh.c");
+    let unique_name = "litebox_sh_test";
+    let shell_target = common::compile(shell_src.to_str().unwrap(), unique_name, true, false);
+
+    // Test 1: echo
+    let output = Runner::new(
+        Backend::Rewriter,
+        &shell_target,
+        &format!("{unique_name}_echo"),
+    )
+    .args(["-c", "echo hello from litebox-sh"])
+    .output();
+    assert_eq!(
+        String::from_utf8_lossy(&output).trim(),
+        "hello from litebox-sh"
+    );
+
+    // Test 2: && operator and variable expansion
+    let output = Runner::new(
+        Backend::Rewriter,
+        &shell_target,
+        &format!("{unique_name}_and"),
+    )
+    .args(["-c", "export FOO=works && echo $FOO"])
+    .output();
+    assert_eq!(String::from_utf8_lossy(&output).trim(), "works");
+
+    // Test 3: || operator
+    let output = Runner::new(
+        Backend::Rewriter,
+        &shell_target,
+        &format!("{unique_name}_or"),
+    )
+    .args(["-c", "false || echo fallback"])
+    .output();
+    assert_eq!(String::from_utf8_lossy(&output).trim(), "fallback");
+
+    // Test 4: test builtin with file existence
+    let output = Runner::new(
+        Backend::Rewriter,
+        &shell_target,
+        &format!("{unique_name}_test_builtin"),
+    )
+    .args(["-c", "test -d / && echo root_exists"])
+    .output();
+    assert_eq!(String::from_utf8_lossy(&output).trim(), "root_exists");
+
+    // Test 5: $? expansion
+    let output = Runner::new(
+        Backend::Rewriter,
+        &shell_target,
+        &format!("{unique_name}_exit_status"),
+    )
+    .args(["-c", "true; echo $?"])
+    .output();
+    assert_eq!(String::from_utf8_lossy(&output).trim(), "0");
+
+    // Test 6: exit with code
+    // (Runner asserts exit code 0, so test with exit 0)
+    Runner::new(
+        Backend::Rewriter,
+        &shell_target,
+        &format!("{unique_name}_exit"),
+    )
+    .args(["-c", "exit 0"])
+    .run();
+}

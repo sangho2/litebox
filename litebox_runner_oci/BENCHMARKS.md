@@ -285,7 +285,54 @@ cargo test --package litebox_runner_linux_userland --test run --release \
     -- test_tun_tcp_latency --exact --nocapture
 ```
 
+## Container Compatibility (Alpine)
+
+Tested with Alpine 3.23 using the OCI runner. Results show which shell and
+command patterns work with LiteBox's fork-free process model.
+
+### Test Results
+
+| # | Pattern | Result | Notes |
+|---|---------|--------|-------|
+| 1 | `/bin/echo "Hello"` | ✅ PASS | Direct exec |
+| 2 | `/bin/ls /` | ✅ PASS | Directory listing |
+| 3 | `/bin/cat /etc/os-release` | ✅ PASS | File reading |
+| 4 | `/bin/uname -a` | ✅ PASS | System info |
+| 5 | `/usr/bin/seq 1 5` | ✅ PASS | Utility command |
+| 6 | `process.cwd=/etc` + `pwd` | ✅ PASS | **NEW: chdir support** |
+| 7 | `sh -c 'echo hello'` | ✅ PASS | Shell builtin |
+| 8 | `sh -c 'cd /tmp && pwd'` | ✅ PASS | **NEW: chdir syscall** |
+| 9 | `sh -c 'export FOO=bar && echo $FOO'` | ✅ PASS | Shell builtins chain |
+| 10 | `sh -c 'export MODE=prod && exec echo $MODE'` | ✅ PASS | OCI entrypoint pattern |
+| 11 | `sh -c 'echo hello > /tmp/f && exec cat /tmp/f'` | ✅ PASS | Redirect + exec |
+| 12 | `sh -c 'test -d /etc && echo exists'` | ✅ PASS | Test builtin |
+| 13 | `sh -c 'false \|\| echo fallback'` | ✅ PASS | `\|\|` operator |
+| 14 | `sh -c 'ls /'` | ✅ PASS | Last cmd → exec'd by ash |
+| 15 | `sh -c 'ls / && echo done'` | ❌ FAIL | Fork needed for non-final external |
+
+### What Works
+
+- **All builtins** in Alpine's ash: `echo`, `cd`, `pwd`, `export`, `test`, `true`, `false`, `exit`, `read`, `set`
+- **Operator chains** of builtins: `&&`, `||`, `;`
+- **Single external command** as last command (ash optimizes to exec)
+- **`export && exec app`** pattern (most common OCI entrypoint)
+- **File redirection**: `>`, `>>`, `<`
+- **`process.cwd`** from OCI config.json
+
+### What Doesn't Work
+
+- **Multiple external commands**: `ls / && cat /etc/hostname` (needs fork for first command)
+- **Pipes**: `echo hello | wc -w` (needs fork)
+- **Debian/Ubuntu images**: Symlink resolution (`/bin → usr/bin`) not fully supported
+- **whoami**: Needs `/etc/passwd` support
+
 ## Version History
+
+- **2026-02-07**: Shell and chdir support
+  - Added `chdir()` syscall to shim (enables `cd` in shells)
+  - Added `process.cwd` support from OCI spec (initial working directory)
+  - Created litebox-sh: fork-free minimal shell for container entrypoints
+  - Alpine container compatibility: 14/15 test patterns pass
 
 - **2026-02-06**: TUN networking optimization
   - Reduced poll timeout from 5ms to 1ms with timeout capping

@@ -1284,6 +1284,12 @@ fn run_container_internal(
             )
         })?;
 
+    // Set initial working directory from OCI spec
+    let cwd = process.cwd().as_path().to_str().unwrap_or("/");
+    if cwd != "/" {
+        program.set_cwd(cwd);
+    }
+
     // Run the sandboxed program
     let _ = unsafe {
         litebox_platform_linux_userland::run_thread(
