@@ -78,6 +78,20 @@ impl DecodedInsn {
         self.insn.opcode == Opcode::SVC
     }
 
+    /// Check if this instruction is `MSR TPIDR_EL0, Xn`
+    /// Encoding: 0xD51BD040 | Rt, so mask top 27 bits
+    fn is_msr_tpidr_el0(&self) -> bool {
+        let opcode = u32::from_le_bytes(self.bytes);
+        (opcode & 0xFFFF_FFE0) == 0xD51B_D040
+    }
+
+    /// Extract the source register Rt from `MSR TPIDR_EL0, Xt`
+    /// Only valid when `is_msr_tpidr_el0()` returns true.
+    fn msr_tpidr_el0_source_reg(&self) -> u8 {
+        let opcode = u32::from_le_bytes(self.bytes);
+        (opcode & 0x1F) as u8
+    }
+
     fn is_branch(&self) -> bool {
         matches!(
             self.insn.opcode,
@@ -379,6 +393,83 @@ mod encoder {
         let insn = 0x9100_0000 | ((imm12 as u32) << 10) | ((rn as u32) << 5) | (rd as u32);
         Some(insn.to_le_bytes())
     }
+
+    /// Encode MRS Xt, TPIDR_EL0
+    /// Reads the thread pointer register into Xt.
+    pub fn encode_mrs_tpidr_el0(rt: u8) -> [u8; 4] {
+        assert!(rt < 32);
+        // MRS Xt, TPIDR_EL0: 1101010100 11 1 1101 1110 0010 000 Rt
+        // System register TPIDR_EL0 = S3_3_C13_C0_2 = op0=3,op1=3,CRn=13,CRm=0,op2=2
+        // Encoding: 0xD53BD040 | Rt
+        let insn = 0xD53B_D040 | (rt as u32);
+        insn.to_le_bytes()
+    }
+
+    /// Encode MSR TPIDR_EL0, Xt
+    /// Writes Xt to the thread pointer register.
+    pub fn encode_msr_tpidr_el0(rt: u8) -> [u8; 4] {
+        assert!(rt < 32);
+        // MSR TPIDR_EL0, Xt: 1101010100 01 1 1101 1110 0010 000 Rt
+        // Encoding: 0xD51BD040 | Rt
+        let insn = 0xD51B_D040 | (rt as u32);
+        insn.to_le_bytes()
+    }
+
+    /// Encode CMP Xn, Xm (alias for SUBS XZR, Xn, Xm)
+    pub fn encode_cmp_reg(rn: u8, rm: u8) -> [u8; 4] {
+        assert!(rn < 32 && rm < 32);
+        // SUBS XZR, Xn, Xm: 1 1 1 01011 shift=00 0 Rm imm6=000000 Rn Rd=11111
+        // sf=1, op=1, S=1 => 0xEB00001F
+        let insn = 0xEB00_001F | ((rm as u32) << 16) | ((rn as u32) << 5);
+        insn.to_le_bytes()
+    }
+
+    /// Encode B.cond (conditional branch)
+    /// offset is in bytes, must be 4-byte aligned, range ±1MB
+    pub fn encode_b_cond(cond: u8, offset: i32) -> Option<[u8; 4]> {
+        assert!(cond < 16);
+        if offset & 3 != 0 {
+            return None;
+        }
+        let imm19 = offset >> 2;
+        if imm19 < -(1 << 18) || imm19 >= (1 << 18) {
+            return None;
+        }
+        // B.cond: 0101010 0 imm19 0 cond
+        let insn = 0x5400_0000 | (((imm19 as u32) & 0x7FFFF) << 5) | (cond as u32);
+        Some(insn.to_le_bytes())
+    }
+
+    /// Encode CMN (immediate) - Compare Negative: ADDS XZR, Xn, #imm12
+    /// Sets condition flags based on Xn + imm12.
+    /// CMN Xn, #1 sets ZF when Xn == 0xFFFFFFFFFFFFFFFF (-1).
+    pub fn encode_cmn_imm(rn: u8, imm12: u16) -> Option<[u8; 4]> {
+        assert!(rn < 32);
+        if imm12 > 4095 {
+            return None;
+        }
+        // ADDS (immediate): sf=1 op=0 S=1 100010 shift=0 imm12 Rn Rd=11111(XZR)
+        // 1 0 1 100010 0 imm12 Rn 11111 = 0xB100001F
+        let insn = 0xB100_001F | ((imm12 as u32) << 10) | ((rn as u32) << 5);
+        Some(insn.to_le_bytes())
+    }
+
+    /// ARM64 condition code for EQ (equal, Z=1)
+    pub const COND_EQ: u8 = 0;
+
+    /// Encode LDR Xt, [Xn, #simm9]! (pre-index, signed offset)
+    /// Used for post-increment pattern: LDR + ADD is more typical on ARM64.
+    /// Range: -256 to 255 bytes.
+    pub fn encode_ldr_pre(rt: u8, rn: u8, simm9: i16) -> Option<[u8; 4]> {
+        assert!(rt < 32 && rn < 32);
+        if simm9 < -256 || simm9 > 255 {
+            return None;
+        }
+        // LDR (pre-index): 11 111 00010 0 simm9 11 Rn Rt
+        let imm9 = (simm9 as u32) & 0x1FF;
+        let insn = 0xF840_0C00 | (imm9 << 12) | ((rn as u32) << 5) | (rt as u32);
+        Some(insn.to_le_bytes())
+    }
 }
 
 /// Decode all instructions in a section
@@ -477,12 +568,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Trampoline section layout:
     // Offset 0-7:   "LITEBOX0" magic/version
     // Offset 8-15:  Handler address (written by loader)
-    // Offset 16-23: Host TLS pointer (written by switch_to_guest)
+    // Offset 16-23: Pointer to per-thread host TLS lookup table (written at runtime)
     // Offset 24+:   Per-SVC trampoline entries
     //
-    // The trampoline code loads host TLS from offset 16 using PC-relative addressing.
-    // This slot is written by switch_to_guest before entering guest code.
-    // Note: This has a race condition for multi-threading, but is necessary.
+    // The trampoline code looks up host TLS by scanning the table for an entry
+    // matching the current thread's TPIDR_EL0 (guest TLS). Each table entry is
+    // 16 bytes: [guest_tpidr (8 bytes), host_tls (8 bytes)].
+    // This eliminates the race condition that existed when all threads shared
+    // a single host TLS slot.
 
     // The magic prefix for the trampoline section
     trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
@@ -491,8 +584,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     let trampoline = trampoline.unwrap_or(0);
     trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
 
-    // Placeholder for host TLS pointer (offset 16)
-    // Written by switch_to_guest, read by trampoline code via PC-relative LDR
+    // Placeholder for host TLS table pointer (offset 16)
+    // Written at runtime by the loader/runner; points to a per-thread lookup table.
+    // The trampoline scans this table to find the host TLS for the current thread.
     trampoline_data.extend_from_slice(&0u64.to_le_bytes());
 
     let mut syscall_insns_found = false;
@@ -635,7 +729,7 @@ fn get_control_transfer_targets(
     targets
 }
 
-/// Hook all syscalls in a section
+/// Hook all syscalls and MSR TPIDR_EL0 instructions in a section
 fn hook_syscalls_in_section(
     control_transfer_targets: &HashSet<u64>,
     section_base_addr: u64,
@@ -645,43 +739,24 @@ fn hook_syscalls_in_section(
 ) -> Result<()> {
     let instructions = decode_section(section_base_addr, section_data);
 
-    let mut found_syscall = false;
+    let mut found_hookable = false;
 
     for (i, insn) in instructions.iter().enumerate() {
-        // Look for SVC #0 (syscall)
-        if !insn.is_svc() {
-            continue;
-        }
-
-        // Check if this is SVC #0 specifically
-        // The immediate value should be 0 for syscalls
-        let is_svc_0 = {
+        // Check for SVC #0 (syscall)
+        let is_svc_0 = insn.is_svc() && {
             let opcode = u32::from_le_bytes(insn.bytes);
-            // SVC encoding: 11010100 000 imm16 00001
-            // imm16 is bits 5-20
             let imm16 = (opcode >> 5) & 0xFFFF;
             imm16 == 0
         };
 
-        if !is_svc_0 {
+        // Check for MSR TPIDR_EL0, Xn
+        let is_msr_tpidr = insn.is_msr_tpidr_el0();
+
+        if !is_svc_0 && !is_msr_tpidr {
             continue;
         }
 
-        found_syscall = true;
-
-        // For ARM64, we need to replace the SVC with a branch to the trampoline.
-        // ARM64 has fixed 4-byte instructions, and the SVC is only 4 bytes.
-        // We need at least 4 bytes for a B (branch) instruction.
-        //
-        // Strategy:
-        // 1. Replace SVC with B to trampoline
-        // 2. Trampoline: set up return address in X30 (LR), then jump to handler
-        // 3. Handler returns to the instruction after SVC
-
-        // Check if we have space before the SVC for the trampoline
-        // We need to find instructions before that are not control transfer targets
-        let mut replace_start = insn.addr;
-        let mut instructions_to_copy = Vec::new();
+        found_hookable = true;
 
         // ARM64 B instruction can only reach +/- 128MB
         // Check if trampoline is in range
@@ -690,7 +765,10 @@ fn hook_syscalls_in_section(
 
         if offset.abs() >= (1 << 27) {
             // Trampoline out of range - need indirect branch
-            // Look for space before SVC to insert longer sequence
+            // Look for space before the instruction to insert longer sequence
+            let mut replace_start = insn.addr;
+            let mut instructions_to_copy = Vec::new();
+
             for j in (0..i).rev() {
                 let prev = &instructions[j];
                 if prev.is_branch() {
@@ -702,13 +780,13 @@ fn hook_syscalls_in_section(
                 instructions_to_copy.insert(0, prev.clone());
                 replace_start = prev.addr;
 
-                // We need 16 bytes minimum for: LDR X16, [PC+8]; BR X16; .quad addr
-                if insn.next_ip() - replace_start >= 16 {
+                // We need 12 bytes minimum for: ADRP+ADD+BR
+                if insn.next_ip() - replace_start >= 12 {
                     break;
                 }
             }
 
-            if insn.next_ip() - replace_start < 16 {
+            if insn.next_ip() - replace_start < 12 {
                 // Try looking after
                 let mut replace_end = insn.next_ip();
                 let mut after_insns = Vec::new();
@@ -718,7 +796,7 @@ fn hook_syscalls_in_section(
                     }
                     after_insns.push(next.clone());
                     replace_end = next.next_ip();
-                    if replace_end - replace_start >= 16 {
+                    if replace_end - replace_start >= 12 {
                         break;
                     }
                     if next.is_branch() {
@@ -726,49 +804,89 @@ fn hook_syscalls_in_section(
                     }
                 }
 
-                if replace_end - replace_start < 16 {
+                if replace_end - replace_start < 12 {
                     return Err(Error::InsufficientBytesBeforeOrAfter(insn.addr));
                 }
 
-                // Generate trampoline with indirect branch
+                if is_svc_0 {
+                    generate_trampoline_indirect(
+                        section_base_addr,
+                        section_data,
+                        replace_start,
+                        replace_end,
+                        insn,
+                        &instructions_to_copy,
+                        &after_insns,
+                        trampoline_base_addr,
+                        trampoline_data,
+                    )?;
+                } else {
+                    generate_msr_trampoline_indirect(
+                        section_base_addr,
+                        section_data,
+                        replace_start,
+                        replace_end,
+                        insn,
+                        insn.msr_tpidr_el0_source_reg(),
+                        &instructions_to_copy,
+                        &after_insns,
+                        trampoline_base_addr,
+                        trampoline_data,
+                    )?;
+                }
+                continue;
+            }
+
+            if is_svc_0 {
                 generate_trampoline_indirect(
                     section_base_addr,
                     section_data,
                     replace_start,
-                    replace_end,
+                    insn.next_ip(),
                     insn,
                     &instructions_to_copy,
-                    &after_insns,
+                    &[],
                     trampoline_base_addr,
                     trampoline_data,
                 )?;
-                continue;
+            } else {
+                generate_msr_trampoline_indirect(
+                    section_base_addr,
+                    section_data,
+                    replace_start,
+                    insn.next_ip(),
+                    insn,
+                    insn.msr_tpidr_el0_source_reg(),
+                    &instructions_to_copy,
+                    &[],
+                    trampoline_base_addr,
+                    trampoline_data,
+                )?;
             }
-
-            generate_trampoline_indirect(
-                section_base_addr,
-                section_data,
-                replace_start,
-                insn.next_ip(),
-                insn,
-                &instructions_to_copy,
-                &[],
-                trampoline_base_addr,
-                trampoline_data,
-            )?;
         } else {
             // Trampoline in range - can use direct branch
-            generate_trampoline_direct(
-                section_base_addr,
-                section_data,
-                insn,
-                trampoline_base_addr,
-                trampoline_data,
-            )?;
+            if is_svc_0 {
+                generate_trampoline_direct(
+                    section_base_addr,
+                    section_data,
+                    insn,
+                    trampoline_base_addr,
+                    trampoline_data,
+                )?;
+            } else {
+                generate_msr_trampoline_direct(
+                    section_base_addr,
+                    section_data,
+                    insn,
+                    insn.msr_tpidr_el0_source_reg(),
+                    trampoline_base_addr,
+                    trampoline_data,
+                )?;
+            }
         }
     }
 
-    if !found_syscall {
+    if !found_hookable {
         return Err(Error::NoSyscallInstructionsFound);
     }
 
@@ -787,8 +905,8 @@ fn generate_trampoline_direct(
     let trampoline_entry = trampoline_base_addr + trampoline_data.len() as u64;
     let return_addr = svc_insn.next_ip();
 
-    // Trampoline sequence that reserves stack space itself.
-    // The trampoline loads host TLS from the trampoline header (offset 16).
+    // Trampoline sequence that reserves stack space and looks up host TLS
+    // from a per-thread table (avoiding the multi-thread race condition).
     //
     // Stack layout after SUB:
     //   [SP+0]:  saved x16
@@ -797,14 +915,21 @@ fn generate_trampoline_direct(
     //   [SP+24]: unused (alignment)
     //
     // Sequence:
-    // 1. SUB SP, SP, #32  - reserve 32 bytes on stack
-    // 2. STR X16, [SP, #0]  - save guest x16
-    // 3. STR X17, [SP, #8]  - save guest x17
-    // 4. STR X30, [SP, #16] - save guest x30
-    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
-    // 6. ADR X30, return_addr - set return address
-    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
-    // 8. BR X16             - jump to handler
+    //  1. SUB SP, SP, #32         - reserve 32 bytes on stack
+    //  2. STR X16, [SP, #0]       - save guest x16
+    //  3. STR X17, [SP, #8]       - save guest x17
+    //  4. STR X30, [SP, #16]      - save guest x30
+    //  5. LDR X16, [PC, #offset]  - load table pointer from trampoline header offset 16
+    //  6. MRS X17, TPIDR_EL0      - get guest_tpidr (unique per thread)
+    //  7. LDR X18, [X16, #0]      - load table[i].guest_tpidr
+    //  8. CMP X18, X17            - compare with our guest_tpidr
+    //  9. B.EQ +12                - match found → skip to step 12
+    // 10. ADD X16, X16, #16       - advance to next table entry
+    // 11. B -16                   - retry from step 7
+    // 12. LDR X18, [X16, #8]     - load host_tls from matched entry
+    // 13. ADR X30, return_addr    - set return address
+    // 14. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    // 15. BR X16                  - jump to handler
     //
     // syscall_callback knows: original guest SP = current SP + 32
 
@@ -836,17 +961,60 @@ fn generate_trampoline_direct(
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
-    let host_tls_location = trampoline_base_addr + 16;
+    // 5. LDR X16, [PC, #offset] - load table pointer from trampoline header offset 16
+    let table_ptr_location = trampoline_base_addr + 16;
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
-    let ldr_tls_offset = host_tls_location as i64 - current_pc as i64;
-    if let Some(ldr) = encoder::encode_ldr_literal(18, ldr_tls_offset as i32) {
+    let ldr_tls_offset = table_ptr_location as i64 - current_pc as i64;
+    if let Some(ldr) = encoder::encode_ldr_literal(16, ldr_tls_offset as i32) {
         trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 6. Set X30 to return_addr using PC-relative addressing.
+    // 6. MRS X17, TPIDR_EL0 - get guest_tpidr
+    trampoline_data.extend_from_slice(&encoder::encode_mrs_tpidr_el0(17));
+
+    // 7. LDR X18, [X16, #0] - load table[i].guest_tpidr (loop start)
+    if let Some(ldr) = encoder::encode_ldr_imm(18, 16, 0) {
+        trampoline_data.extend_from_slice(&ldr);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 8. CMP X18, X17 - compare with our guest_tpidr
+    trampoline_data.extend_from_slice(&encoder::encode_cmp_reg(18, 17));
+
+    // 9. B.EQ +12 - skip to step 12 (3 instructions forward: ADD, B, then LDR)
+    if let Some(beq) = encoder::encode_b_cond(0 /* EQ */, 12) {
+        trampoline_data.extend_from_slice(&beq);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 10. ADD X16, X16, #16 - advance to next table entry
+    if let Some(add) = encoder::encode_add_imm(16, 16, 16) {
+        trampoline_data.extend_from_slice(&add);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 11. B -16 - back to step 7 (4 instructions back)
+    let loop_start = trampoline_base_addr + trampoline_data.len() as u64;
+    let loop_target = loop_start - 16; // back 4 instructions
+    if let Some(b) = encoder::encode_b(loop_start, loop_target) {
+        trampoline_data.extend_from_slice(&b);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 12. LDR X18, [X16, #8] - load host_tls from matched entry
+    if let Some(ldr) = encoder::encode_ldr_imm(18, 16, 8) {
+        trampoline_data.extend_from_slice(&ldr);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 13. Set X30 to return_addr using PC-relative addressing.
     // Must use PC-relative (not absolute MOV) so it works with ET_DYN binaries
     // that are loaded at an arbitrary base address.
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
@@ -873,7 +1041,7 @@ fn generate_trampoline_direct(
         }
     }
 
-    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    // 14. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
     let handler_addr_location = trampoline_base_addr + 8;
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_offset = handler_addr_location as i64 - current_pc as i64;
@@ -883,13 +1051,229 @@ fn generate_trampoline_direct(
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 8. BR X16
+    // 15. BR X16
     trampoline_data.extend_from_slice(&encoder::encode_br(16));
 
     // Replace SVC with B to trampoline
     let b = encoder::encode_b(svc_insn.addr, trampoline_entry)
         .ok_or(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr))?;
     let offset = (svc_insn.addr - section_base_addr) as usize;
+    section_data[offset..offset + 4].copy_from_slice(&b);
+
+    Ok(())
+}
+
+/// Generate MSR TPIDR_EL0 trampoline using direct branch (B instruction)
+/// Used when trampoline is within +/- 128MB.
+///
+/// When the guest executes `MSR TPIDR_EL0, Xn`, we intercept it to:
+/// 1. Perform the actual MSR (changing the guest's TPIDR_EL0)
+/// 2. Update the host TLS lookup table so the old guest_tpidr entry now
+///    contains the new guest_tpidr value. This ensures that subsequent
+///    SVC trampolines can still find the host TLS for this thread.
+///
+/// If the old TPIDR_EL0 value is not found in the table (e.g., during
+/// early dynamic linker init before the platform has registered this thread),
+/// we skip the table update. The sentinel value 0xFFFFFFFFFFFFFFFF marks
+/// the end of valid table entries.
+///
+/// Stack layout after SUB:
+///   [SP+0]:  saved x16
+///   [SP+8]:  saved x17
+///   [SP+16]: saved x18
+///   [SP+24]: saved new_tpidr (temporary)
+fn generate_msr_trampoline_direct(
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    msr_insn: &DecodedInsn,
+    source_reg: u8,
+    trampoline_base_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<()> {
+    let trampoline_entry = trampoline_base_addr + trampoline_data.len() as u64;
+    let return_addr = msr_insn.next_ip();
+
+    // 1. SUB SP, SP, #32
+    trampoline_data.extend_from_slice(
+        &encoder::encode_sub_imm(31, 31, 32)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 2. STR X16, [SP, #0]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(16, 31, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 3. STR X17, [SP, #8]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(17, 31, 8)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 4. STR X18, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(18, 31, 16)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 5. MRS X16, TPIDR_EL0 - x16 = old_tpidr
+    trampoline_data.extend_from_slice(&encoder::encode_mrs_tpidr_el0(16));
+
+    // 6. Get new_tpidr into X17
+    // Special handling: if source_reg is one of x16/x17/x18, it was already
+    // saved to the stack, so we load from there instead.
+    match source_reg {
+        16 => {
+            trampoline_data.extend_from_slice(
+                &encoder::encode_ldr_imm(17, 31, 0)
+                    .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+            );
+        }
+        17 => {
+            trampoline_data.extend_from_slice(
+                &encoder::encode_ldr_imm(17, 31, 8)
+                    .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+            );
+        }
+        18 => {
+            trampoline_data.extend_from_slice(
+                &encoder::encode_ldr_imm(17, 31, 16)
+                    .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+            );
+        }
+        _ => {
+            trampoline_data.extend_from_slice(&encoder::encode_mov_reg(17, source_reg));
+        }
+    }
+
+    // 7. MSR TPIDR_EL0, X17 - perform the actual MSR
+    trampoline_data.extend_from_slice(&encoder::encode_msr_tpidr_el0(17));
+
+    // 8. STR X17, [SP, #24] - save new_tpidr
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(17, 31, 24)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 9. MOV X17, X16 - x17 = old_tpidr (for comparison key)
+    trampoline_data.extend_from_slice(&encoder::encode_mov_reg(17, 16));
+
+    // 10. LDR X16, [PC, #offset] - load table pointer from trampoline header offset 16
+    let table_ptr_location = trampoline_base_addr + 16;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let ldr_offset = table_ptr_location as i64 - current_pc as i64;
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_literal(16, ldr_offset as i32)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // --- Table scan loop with sentinel check ---
+    // 11. LDR X18, [X16, #0] - load table[i].guest_tpidr (loop start)
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(18, 16, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 12. CMN X18, #1 - check for sentinel (0xFFFFFFFFFFFFFFFF)
+    trampoline_data.extend_from_slice(
+        &encoder::encode_cmn_imm(18, 1)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 13. B.EQ skip_update (+28) - sentinel found, no entry for this thread
+    //     skip_update is 7 instructions ahead (CMP, B.EQ, ADD, B, LDR, STR, then skip_update LDR)
+    trampoline_data.extend_from_slice(
+        &encoder::encode_b_cond(encoder::COND_EQ, 28)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 14. CMP X18, X17 - compare with old_tpidr
+    trampoline_data.extend_from_slice(&encoder::encode_cmp_reg(18, 17));
+
+    // 15. B.EQ found (+12) - match found, skip to table update
+    //     found is 3 instructions ahead: ADD, B, then LDR (at found label)
+    trampoline_data.extend_from_slice(
+        &encoder::encode_b_cond(encoder::COND_EQ, 12)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 16. ADD X16, X16, #16 - next entry
+    trampoline_data.extend_from_slice(
+        &encoder::encode_add_imm(16, 16, 16)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 17. B loop (-24) - back to step 11 (6 instructions back)
+    let loop_start = trampoline_base_addr + trampoline_data.len() as u64;
+    let loop_target = loop_start - 24;
+    trampoline_data.extend_from_slice(
+        &encoder::encode_b(loop_start, loop_target)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // --- found: update table entry ---
+    // 18. LDR X18, [SP, #24] - x18 = new_tpidr
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(18, 31, 24)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 19. STR X18, [X16, #0] - update table[i].guest_tpidr = new_tpidr
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(18, 16, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // --- skip_update: restore and return ---
+    // 20. LDR X18, [SP, #16] - restore guest x18
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(18, 31, 16)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 21. LDR X16, [SP, #0] - restore guest x16
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(16, 31, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 22. LDR X17, [SP, #8] - restore guest x17
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(17, 31, 8)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 23. ADD SP, SP, #32 - restore stack
+    trampoline_data.extend_from_slice(
+        &encoder::encode_add_imm(31, 31, 32)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 24. B return_addr - branch back to instruction after original MSR
+    let current_addr = trampoline_base_addr + trampoline_data.len() as u64;
+    if let Some(b) = encoder::encode_b(current_addr, return_addr) {
+        trampoline_data.extend_from_slice(&b);
+    } else {
+        // Fallback: ADRP+ADD+BR for far targets
+        let target_page = return_addr & !0xFFF;
+        let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+        let pc_page = current_pc & !0xFFF;
+        let page_offset = target_page as i64 - pc_page as i64;
+        let adrp = encoder::encode_adrp(16, page_offset)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?;
+        trampoline_data.extend_from_slice(&adrp);
+        let within_page = (return_addr & 0xFFF) as u16;
+        let add = encoder::encode_add_imm(16, 16, within_page)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?;
+        trampoline_data.extend_from_slice(&add);
+        trampoline_data.extend_from_slice(&encoder::encode_br(16));
+    }
+
+    // Replace original MSR with B to trampoline
+    let b = encoder::encode_b(msr_insn.addr, trampoline_entry)
+        .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?;
+    let offset = (msr_insn.addr - section_base_addr) as usize;
     section_data[offset..offset + 4].copy_from_slice(&b);
 
     Ok(())
@@ -915,8 +1299,8 @@ fn generate_trampoline_indirect(
         trampoline_data.extend_from_slice(&insn.bytes);
     }
 
-    // Trampoline sequence that reserves stack space itself.
-    // The trampoline loads host TLS from the trampoline header (offset 16).
+    // Trampoline sequence that reserves stack space and looks up host TLS
+    // from a per-thread table (avoiding the multi-thread race condition).
     //
     // Stack layout after SUB:
     //   [SP+0]:  saved x16
@@ -925,14 +1309,21 @@ fn generate_trampoline_indirect(
     //   [SP+24]: unused (alignment)
     //
     // Sequence:
-    // 1. SUB SP, SP, #32  - reserve 32 bytes on stack
-    // 2. STR X16, [SP, #0]  - save guest x16
-    // 3. STR X17, [SP, #8]  - save guest x17
-    // 4. STR X30, [SP, #16] - save guest x30
-    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
-    // 6. ADR X30, return_addr - set return address
-    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
-    // 8. BR X16             - jump to handler
+    //  1. SUB SP, SP, #32         - reserve 32 bytes on stack
+    //  2. STR X16, [SP, #0]       - save guest x16
+    //  3. STR X17, [SP, #8]       - save guest x17
+    //  4. STR X30, [SP, #16]      - save guest x30
+    //  5. LDR X16, [PC, #offset]  - load table pointer from trampoline header offset 16
+    //  6. MRS X17, TPIDR_EL0      - get guest_tpidr (unique per thread)
+    //  7. LDR X18, [X16, #0]      - load table[i].guest_tpidr
+    //  8. CMP X18, X17            - compare with our guest_tpidr
+    //  9. B.EQ +12                - match found → skip to step 12
+    // 10. ADD X16, X16, #16       - advance to next table entry
+    // 11. B -16                   - retry from step 7
+    // 12. LDR X18, [X16, #8]     - load host_tls from matched entry
+    // 13. ADR X30, return_addr    - set return address
+    // 14. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    // 15. BR X16                  - jump to handler
     //
     // syscall_callback knows: original guest SP = current SP + 32
 
@@ -964,19 +1355,62 @@ fn generate_trampoline_indirect(
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
-    let host_tls_location = trampoline_base_addr + 16;
+    // 5. LDR X16, [PC, #offset] - load table pointer from trampoline header offset 16
+    let table_ptr_location = trampoline_base_addr + 16;
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
-    let ldr_tls_offset = host_tls_location as i64 - current_pc as i64;
-    if let Some(ldr) = encoder::encode_ldr_literal(18, ldr_tls_offset as i32) {
+    let ldr_tls_offset = table_ptr_location as i64 - current_pc as i64;
+    if let Some(ldr) = encoder::encode_ldr_literal(16, ldr_tls_offset as i32) {
+        trampoline_data.extend_from_slice(&ldr);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 6. MRS X17, TPIDR_EL0 - get guest_tpidr
+    trampoline_data.extend_from_slice(&encoder::encode_mrs_tpidr_el0(17));
+
+    // 7. LDR X18, [X16, #0] - load table[i].guest_tpidr (loop start)
+    if let Some(ldr) = encoder::encode_ldr_imm(18, 16, 0) {
+        trampoline_data.extend_from_slice(&ldr);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 8. CMP X18, X17 - compare with our guest_tpidr
+    trampoline_data.extend_from_slice(&encoder::encode_cmp_reg(18, 17));
+
+    // 9. B.EQ +12 - skip to step 12 (3 instructions forward: ADD, B, then LDR)
+    if let Some(beq) = encoder::encode_b_cond(0 /* EQ */, 12) {
+        trampoline_data.extend_from_slice(&beq);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 10. ADD X16, X16, #16 - advance to next table entry
+    if let Some(add) = encoder::encode_add_imm(16, 16, 16) {
+        trampoline_data.extend_from_slice(&add);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 11. B -16 - back to step 7 (4 instructions back)
+    let loop_start = trampoline_base_addr + trampoline_data.len() as u64;
+    let loop_target = loop_start - 16; // back 4 instructions
+    if let Some(b) = encoder::encode_b(loop_start, loop_target) {
+        trampoline_data.extend_from_slice(&b);
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    // 12. LDR X18, [X16, #8] - load host_tls from matched entry
+    if let Some(ldr) = encoder::encode_ldr_imm(18, 16, 8) {
         trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // Calculate where after_insns will be (after the syscall call sequence)
-    // Current position + ADR/MOV + LDR + BR = variable depending on ADR success
-    // We'll compute it more precisely after knowing return_addr encoding size
+    // Current position + ADR + LDR + BR = 12 bytes minimum
+    // (could be 16 if ADRP+ADD fallback is needed, but tentative assumes best case)
     let tentative_after_insns_start = trampoline_base_addr + trampoline_data.len() as u64 + 12;
 
     // Put return address in X30 (LR) - matching systrap handler convention
@@ -987,7 +1421,7 @@ fn generate_trampoline_indirect(
         tentative_after_insns_start
     };
 
-    // 6. Set X30 to return_addr using PC-relative addressing.
+    // 13. Set X30 to return_addr using PC-relative addressing.
     // Must use PC-relative (not absolute MOV) so it works with ET_DYN binaries
     // that are loaded at an arbitrary base address.
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
@@ -1014,7 +1448,7 @@ fn generate_trampoline_indirect(
         }
     }
 
-    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    // 14. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
     let handler_addr_location = trampoline_base_addr + 8;
     let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_offset = handler_addr_location as i64 - current_pc as i64;
@@ -1024,7 +1458,7 @@ fn generate_trampoline_indirect(
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 8. BR X16
+    // 15. BR X16
     trampoline_data.extend_from_slice(&encoder::encode_br(16));
 
     // Copy instructions after SVC (if any)
@@ -1089,6 +1523,248 @@ fn generate_trampoline_indirect(
         }
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+    }
+
+    Ok(())
+}
+
+/// Generate MSR TPIDR_EL0 trampoline using indirect branch (for far targets).
+/// Used when the MSR instruction is more than 128MB from the trampoline section.
+///
+/// Like the SVC indirect variant, this requires extra space around the MSR instruction
+/// for a longer jump sequence (ADRP+ADD+BR = 12 bytes). Instructions displaced from
+/// around the MSR are copied into the trampoline and executed there.
+#[allow(clippy::too_many_arguments)]
+fn generate_msr_trampoline_indirect(
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    replace_start: u64,
+    replace_end: u64,
+    msr_insn: &DecodedInsn,
+    source_reg: u8,
+    before_insns: &[DecodedInsn],
+    after_insns: &[DecodedInsn],
+    trampoline_base_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<()> {
+    let trampoline_entry = trampoline_base_addr + trampoline_data.len() as u64;
+
+    // Copy instructions before MSR to trampoline
+    for insn in before_insns {
+        trampoline_data.extend_from_slice(&insn.bytes);
+    }
+
+    // Generate the same MSR trampoline body as the direct variant
+    // 1. SUB SP, SP, #32
+    trampoline_data.extend_from_slice(
+        &encoder::encode_sub_imm(31, 31, 32)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 2. STR X16, [SP, #0]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(16, 31, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 3. STR X17, [SP, #8]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(17, 31, 8)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 4. STR X18, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(18, 31, 16)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 5. MRS X16, TPIDR_EL0 - x16 = old_tpidr
+    trampoline_data.extend_from_slice(&encoder::encode_mrs_tpidr_el0(16));
+
+    // 6. Get new_tpidr into X17
+    match source_reg {
+        16 => {
+            trampoline_data.extend_from_slice(
+                &encoder::encode_ldr_imm(17, 31, 0)
+                    .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+            );
+        }
+        17 => {
+            trampoline_data.extend_from_slice(
+                &encoder::encode_ldr_imm(17, 31, 8)
+                    .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+            );
+        }
+        18 => {
+            trampoline_data.extend_from_slice(
+                &encoder::encode_ldr_imm(17, 31, 16)
+                    .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+            );
+        }
+        _ => {
+            trampoline_data.extend_from_slice(&encoder::encode_mov_reg(17, source_reg));
+        }
+    }
+
+    // 7. MSR TPIDR_EL0, X17
+    trampoline_data.extend_from_slice(&encoder::encode_msr_tpidr_el0(17));
+
+    // 8. STR X17, [SP, #24]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(17, 31, 24)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 9. MOV X17, X16
+    trampoline_data.extend_from_slice(&encoder::encode_mov_reg(17, 16));
+
+    // 10. LDR X16, [PC, #offset] - load table pointer
+    let table_ptr_location = trampoline_base_addr + 16;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let ldr_offset = table_ptr_location as i64 - current_pc as i64;
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_literal(16, ldr_offset as i32)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // --- Table scan loop with sentinel check ---
+    // 11. LDR X18, [X16, #0] (loop start)
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(18, 16, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 12. CMN X18, #1 - check for sentinel (0xFFFFFFFFFFFFFFFF)
+    trampoline_data.extend_from_slice(
+        &encoder::encode_cmn_imm(18, 1)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 13. B.EQ skip_update (+28) - sentinel found, no entry for this thread
+    trampoline_data.extend_from_slice(
+        &encoder::encode_b_cond(encoder::COND_EQ, 28)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 14. CMP X18, X17
+    trampoline_data.extend_from_slice(&encoder::encode_cmp_reg(18, 17));
+
+    // 15. B.EQ found (+12)
+    trampoline_data.extend_from_slice(
+        &encoder::encode_b_cond(encoder::COND_EQ, 12)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 16. ADD X16, X16, #16
+    trampoline_data.extend_from_slice(
+        &encoder::encode_add_imm(16, 16, 16)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 17. B loop (-24) - back to step 11 (6 instructions back)
+    let loop_start = trampoline_base_addr + trampoline_data.len() as u64;
+    let loop_target = loop_start - 24;
+    trampoline_data.extend_from_slice(
+        &encoder::encode_b(loop_start, loop_target)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // --- found: update table entry ---
+    // 18. LDR X18, [SP, #24] - x18 = new_tpidr
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(18, 31, 24)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 19. STR X18, [X16, #0] - update table[i].guest_tpidr
+    trampoline_data.extend_from_slice(
+        &encoder::encode_str_imm(18, 16, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // --- skip_update: restore and return ---
+    // 20. LDR X18, [SP, #16]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(18, 31, 16)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 21. LDR X16, [SP, #0]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(16, 31, 0)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 22. LDR X17, [SP, #8]
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_imm(17, 31, 8)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // 23. ADD SP, SP, #32
+    trampoline_data.extend_from_slice(
+        &encoder::encode_add_imm(31, 31, 32)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?,
+    );
+
+    // Copy instructions after MSR (if any)
+    for insn in after_insns {
+        trampoline_data.extend_from_slice(&insn.bytes);
+    }
+
+    // Jump back to original code
+    let jump_back_target = if after_insns.is_empty() {
+        msr_insn.next_ip()
+    } else {
+        after_insns.last().unwrap().next_ip()
+    };
+
+    let current_addr = trampoline_base_addr + trampoline_data.len() as u64;
+    if let Some(b) = encoder::encode_b(current_addr, jump_back_target) {
+        trampoline_data.extend_from_slice(&b);
+    } else {
+        // Far jump: ADRP+ADD+BR
+        let target_page = jump_back_target & !0xFFF;
+        let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+        let pc_page = current_pc & !0xFFF;
+        let page_offset = target_page as i64 - pc_page as i64;
+        let adrp = encoder::encode_adrp(16, page_offset)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?;
+        trampoline_data.extend_from_slice(&adrp);
+        let within_page = (jump_back_target & 0xFFF) as u16;
+        let add = encoder::encode_add_imm(16, 16, within_page)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?;
+        trampoline_data.extend_from_slice(&add);
+        trampoline_data.extend_from_slice(&encoder::encode_br(16));
+    }
+
+    // Replace original code with jump to trampoline using PC-relative addressing
+    let replace_len = (replace_end - replace_start) as usize;
+    let replace_offset = (replace_start - section_base_addr) as usize;
+
+    if replace_len >= 12 {
+        // Use ADRP+ADD+BR (12 bytes, PC-relative)
+        let target_page = trampoline_entry & !0xFFF;
+        let pc_page = replace_start & !0xFFF;
+        let page_offset = target_page as i64 - pc_page as i64;
+        let adrp = encoder::encode_adrp(16, page_offset)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?;
+        let within_page = (trampoline_entry & 0xFFF) as u16;
+        let add = encoder::encode_add_imm(16, 16, within_page)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr))?;
+        section_data[replace_offset..replace_offset + 4].copy_from_slice(&adrp);
+        section_data[replace_offset + 4..replace_offset + 8].copy_from_slice(&add);
+        section_data[replace_offset + 8..replace_offset + 12]
+            .copy_from_slice(&encoder::encode_br(16));
+
+        // Fill remaining with NOPs
+        for i in (12..replace_len).step_by(4) {
+            section_data[replace_offset + i..replace_offset + i + 4]
+                .copy_from_slice(&encoder::encode_nop());
+        }
+    } else {
+        return Err(Error::InsufficientBytesBeforeOrAfter(msr_insn.addr));
     }
 
     Ok(())

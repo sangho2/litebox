@@ -8,10 +8,10 @@ This document captures the complete development history, findings, successes, fa
 2. [Implementation Timeline](#implementation-timeline)
 3. [Technical Architecture](#technical-architecture)
 4. [Bug Fixes and Discoveries](#bug-fixes-and-discoveries)
-5. [Current Blocker](#current-blocker)
-6. [Code Artifacts](#code-artifacts)
-7. [Lessons Learned](#lessons-learned)
-8. [Future Work](#future-work)
+5. [Code Artifacts](#code-artifacts)
+6. [Lessons Learned](#lessons-learned)
+7. [Future Work](#future-work)
+8. [Current Status](#current-status)
 
 ---
 
@@ -59,6 +59,21 @@ Add ARM64 (aarch64) support to LiteBox using a syscall rewriter backend that:
 - Fixed `O_DIRECT`/`O_NDELAY` support in filesystem backends
 - `ls` now works inside the sandbox (dynamically linked)
 
+### Phase 5: Multi-Threading and TLS Support (Completed)
+- Fixed missing SETTLS for ARM64 new threads (`clone` syscall)
+- Fixed broken `set_guest_tpidr`/`get_guest_tpidr` — replaced incorrect pointer arithmetic with inline assembly using `:tprel_lo12:`
+- Replaced racy single shared host TLS slot at `trampoline_base+16` with a per-thread host TLS table
+- Table stores `(guest_tpidr, host_tls)` entries, scanned by the trampoline to recover host TLS
+- Fixed signal handler host TLS recovery using power-of-2 aligned alt-stacks with host TLS stored at `aligned_base + ALT_STACK_ALLOC_SIZE - 8`
+- Fixed signal frame clobbering host TLS slot by reducing `ss_size` by 16 in `sigaltstack` configuration
+
+### Phase 6: MSR TPIDR_EL0 Interception (Completed)
+- Intercept `MSR TPIDR_EL0, Xn` instructions in the rewriter (unprivileged on ARM64, guest can freely change TPIDR_EL0)
+- Generated MSR trampolines that: save registers, perform the actual MSR, scan the host TLS table for the old entry, update the entry's `guest_tpidr` to the new value
+- Two trampoline variants: direct (within ±128MB) and indirect (far targets using ADRP+ADD+BR)
+- Fixed rtld_audit `do_syscall` to use the per-thread TLS table instead of the old single-slot layout
+- Node.js (with 12+ shared libraries) now runs successfully inside the sandbox
+
 ---
 
 ## Technical Architecture
@@ -71,11 +86,11 @@ Trampoline Section (mapped at high address, e.g., 0x8f7000):
 │ Header (24 bytes)                                           │
 │ ├── Offset 0-7:   "LITEBOX0" magic                         │
 │ ├── Offset 8-15:  Handler address (syscall_callback)       │
-│ └── Offset 16-23: Host TLS (written by switch_to_guest)    │
+│ └── Offset 16-23: Pointer to per-thread host TLS table     │
 ├─────────────────────────────────────────────────────────────┤
-│ Entry 0 (for first SVC, ~32 bytes)                         │
+│ Entry 0 (for first SVC/MSR, ~32-64 bytes)                  │
 ├─────────────────────────────────────────────────────────────┤
-│ Entry 1 (for second SVC, ~32 bytes)                        │
+│ Entry 1 (for second SVC/MSR, ~32-64 bytes)                 │
 ├─────────────────────────────────────────────────────────────┤
 │ ... more entries ...                                        │
 └─────────────────────────────────────────────────────────────┘
@@ -92,18 +107,64 @@ STR X16, [SP, #0]        ; Save guest x16
 STR X17, [SP, #8]        ; Save guest x17
 STR X30, [SP, #16]       ; Save guest x30
 
-; 3. Load host TLS from header (PC-relative)
-LDR X18, [PC, #offset]   ; X18 = host TPIDR_EL0 from header offset 16
+; 3. Recover host TLS via per-thread table lookup
+MRS X18, TPIDR_EL0       ; X18 = current guest TPIDR_EL0
+LDR X17, [PC, #offset]   ; X17 = table pointer from header offset 16
+; Loop: scan table for entry where table[i].guest_tpidr == X18
+;   X16 = table[i].guest_tpidr
+;   CMN X16, #1           ; Check for sentinel (0xFFFFFFFFFFFFFFFF)
+;   B.EQ done             ; End of table
+;   CMP X16, X18
+;   B.EQ found
+;   ADD X17, X17, #16     ; Next entry
+;   B loop
+; found:
+;   LDR X18, [X17, #8]    ; X18 = host_tls
 
 ; 4. Set return address (where to resume after syscall)
 ADR X30, return_addr     ; X30 = instruction after original SVC
-; (or MOVZ/MOVK sequence for far addresses)
+; (or ADRP+ADD for far addresses)
 
 ; 5. Load syscall handler address
 LDR X16, [PC, #offset]   ; X16 = syscall_callback from header offset 8
 
 ; 6. Jump to handler
 BR X16                   ; Begin syscall processing
+```
+
+### Per-MSR TPIDR_EL0 Trampoline Entry Sequence
+
+```asm
+; 1. Reserve stack space
+SUB SP, SP, #32
+
+; 2. Save registers
+STR X16, [SP, #0]        ; Save x16
+STR X17, [SP, #8]        ; Save x17
+STR X18, [SP, #16]       ; Save x18 (will hold new tpidr)
+
+; 3. Read old TPIDR_EL0 and get new value
+MRS X16, TPIDR_EL0       ; X16 = old TPIDR_EL0
+MOV X18, Xn              ; X18 = new TPIDR value from source register
+;   (special handling if Xn is x16/x17/x18 — read from stack)
+
+; 4. Perform the actual MSR
+MSR TPIDR_EL0, X18       ; Set new TPIDR_EL0
+
+; 5. Scan host TLS table for old entry and update guest_tpidr
+LDR X17, [PC, #offset]   ; X17 = table pointer from header offset 16
+; Loop: find entry where table[i].guest_tpidr == X16 (old value)
+;   CMN tmp, #1           ; Sentinel check
+;   B.EQ skip_update      ; Not found (pre-registration MSR)
+;   STR X18, [X17, #0]    ; Update entry's guest_tpidr to new value
+; skip_update:
+
+; 6. Restore registers and return
+LDR X18, [SP, #16]
+LDR X17, [SP, #8]
+LDR X16, [SP, #0]
+ADD SP, SP, #32
+B return_addr             ; Branch back to instruction after original MSR
 ```
 
 ### Stack Layout During Syscall
@@ -132,10 +193,50 @@ When `syscall_callback` is entered, the guest stack has:
 | x9-x15   | Guest values         | x9, x10 used as scratch |
 | x16      | Scratch, then handler addr | Loaded from stack [SP+0] |
 | x17      | Scratch              | Loaded from stack [SP+8] |
-| x18      | Host TLS (from header) | Host TLS for all operations |
+| x18      | Host TLS (from table) | Host TLS for all operations |
 | x19-x29  | Guest callee-saved   | Preserved |
 | x30      | Scratch (return addr)| Loaded from stack [SP+16] |
 | SP       | Decremented by 32    | Original SP = current SP + 32 |
+
+### Per-Thread Host TLS Table
+
+The host TLS table replaces the original racy single-slot design at `trampoline_base+16`. A pointer to the table is stored at `trampoline_base+16` and the table itself is allocated via mmap (4096 bytes).
+
+**Entry format:**
+
+| Offset | Size | Content |
+|--------|------|---------|
+| 0 | 8B | `guest_tpidr` — current TPIDR_EL0 value for this thread |
+| 8 | 8B | `host_tls` — host's TPIDR_EL0 value |
+
+- 256 entries max (256 * 16 = 4096 bytes)
+- Empty/free slots: `guest_tpidr = 0xFFFFFFFFFFFFFFFF` (sentinel `HOST_TLS_TABLE_EMPTY`)
+- On thread creation, `update_host_tls_table()` claims a free slot or updates existing
+- The SVC trampoline scans the table at every syscall to recover host TLS
+- The MSR trampoline scans the table to update `guest_tpidr` when the guest changes TPIDR_EL0
+
+### Alt-Stack Layout (Per Thread)
+
+Signal handlers need host TLS recovery without access to the trampoline header (since the guest may have changed TPIDR_EL0). Each thread gets a power-of-2 aligned alt-stack:
+
+```
+[guard (0x1000)] [usable signal stack (ss_size = SIZE-16)] [host_tls (8B)] [pad (8B)]
+^                                                          ^               ^
+base                                                       base+SIZE-8     base+SIZE
+```
+
+- `ALT_STACK_ALLOC_SIZE = 0x10000` (64KB), power-of-2 aligned
+- Host TLS stored at `aligned_base + ALT_STACK_ALLOC_SIZE - 8`
+- Signal handler recovers host TLS by masking SP: `SP & ~(ALT_STACK_ALLOC_SIZE - 1) + ALT_STACK_ALLOC_SIZE - 8`
+- `ss_size` is reduced by 16 to prevent signal frame from clobbering the host TLS slot
+
+### MSR TPIDR_EL0 Instruction Encoding
+
+ARM64 allows unprivileged access to TPIDR_EL0, meaning the guest C runtime can freely change it (e.g., during TLS setup). The rewriter intercepts these instructions.
+
+- `MSR TPIDR_EL0, Xt`: `0xD51BD040 | Rt` (mask `0xFFFFFFE0`)
+- `MRS Xt, TPIDR_EL0`: `0xD53BD040 | Rt`
+- Source register: `opcode & 0x1F`
 
 ---
 
@@ -485,6 +586,98 @@ Changed the design so the **trampoline** reserves stack space, not `switch_to_gu
 
 ---
 
+### Bug 18: Missing SETTLS for ARM64 New Threads (FIXED)
+
+**Symptoms**: Threads created via `clone` with `CLONE_SETTLS` flag crashed immediately because their TPIDR_EL0 was not initialized.
+
+**Root Cause**: The `clone` syscall handler set TPIDR_EL0 for x86/x86_64 but was missing the ARM64 case. On ARM64, TPIDR_EL0 must be set from the `newtls` argument passed to clone.
+
+**Solution**: Added ARM64 SETTLS handling in the clone syscall path using inline assembly `MSR TPIDR_EL0, <newtls>`.
+
+**File**: `litebox_shim_linux/src/syscalls/process.rs`
+
+---
+
+### Bug 19: Broken `set_guest_tpidr`/`get_guest_tpidr` (FIXED)
+
+**Symptoms**: TLS accessors returned garbage values.
+
+**Root Cause**: The functions used incorrect pointer arithmetic to access a thread-local variable. The compiler-generated code for accessing `#[thread_local]` statics on ARM64 requires specific addressing modes.
+
+**Solution**: Replaced pointer arithmetic with inline assembly using `:tprel_lo12:` relocations to correctly access the thread-local storage slot.
+
+**File**: `litebox_platform_linux_userland/src/lib.rs`
+
+---
+
+### Bug 20: Racy Single-Slot Host TLS at `trampoline_base+16` (FIXED)
+
+**Symptoms**: Multi-threaded programs (like Node.js) crashed because multiple threads overwrote each other's host TLS value at the single shared slot.
+
+**Root Cause**: `switch_to_guest` wrote the host TLS to `trampoline_base+16` before entering guest code. With multiple threads, each thread's write clobbered the previous thread's value.
+
+**Solution**: Replaced the single slot with a per-thread host TLS table:
+1. Allocated a 4KB mmap'd table (256 entries × 16 bytes)
+2. Store a pointer to the table at `trampoline_base+16` instead of host TLS directly
+3. Each thread registers its `(guest_tpidr, host_tls)` pair in the table
+4. SVC trampoline scans the table using current TPIDR_EL0 to find matching host TLS
+5. Sentinel value `0xFFFFFFFFFFFFFFFF` marks empty slots
+
+**Files**:
+- `litebox_platform_linux_userland/src/lib.rs` — table allocation, `update_host_tls_table()`, `switch_to_guest` modifications
+- `litebox_syscall_rewriter_arm64/src/lib.rs` — SVC trampoline rewritten with table lookup loop
+
+---
+
+### Bug 21: Signal Handler Cannot Recover Host TLS (FIXED)
+
+**Symptoms**: Signal handlers (e.g., SIGSEGV for guard page handling) crashed because they couldn't find the host TLS value — TPIDR_EL0 contained the guest's value.
+
+**Root Cause**: Signal handlers run on a separate alt-stack and need host TLS to call into the shim. With the per-thread table, they'd need to scan it, but the table pointer itself requires host TLS to locate.
+
+**Solution**: Power-of-2 aligned alt-stacks with host TLS embedded at a known offset:
+1. Allocate alt-stacks at `ALT_STACK_ALLOC_SIZE` (64KB) alignment
+2. Store host TLS at `aligned_base + ALT_STACK_ALLOC_SIZE - 8`
+3. Signal handler recovers host TLS by masking SP to find the alt-stack base
+4. Reduced `ss_size` by 16 bytes to prevent signal frame growth from overwriting the host TLS slot
+
+**File**: `litebox_platform_linux_userland/src/lib.rs`
+
+---
+
+### Bug 22: MSR TPIDR_EL0 Desynchronizes Host TLS Table (FIXED)
+
+**Symptoms**: After the guest C runtime sets up TLS (via `MSR TPIDR_EL0`), subsequent SVC trampolines read the new TPIDR_EL0, can't find it in the host TLS table (which has the old value), and fail to recover host TLS.
+
+**Root Cause**: `MSR TPIDR_EL0, Xn` is unprivileged on ARM64. The guest freely changes TPIDR_EL0 during C runtime initialization, but the host TLS table entry still has the old `guest_tpidr` value.
+
+**Solution**: Intercept `MSR TPIDR_EL0, Xn` instructions in the rewriter, similar to how `SVC #0` is intercepted:
+1. `is_msr_tpidr_el0()` detection: checks `(u32 & 0xFFFFFFE0) == 0xD51BD040`
+2. `generate_msr_trampoline_direct()`: for near targets (within ±128MB)
+3. `generate_msr_trampoline_indirect()`: for far targets (uses ADRP+ADD+BR)
+4. The trampoline performs the MSR, then scans the host TLS table for the old entry and updates `guest_tpidr` to the new value
+5. Sentinel check (`CMN X18, #1`) handles the case where MSR executes before the platform registers the thread (graceful skip)
+
+**File**: `litebox_syscall_rewriter_arm64/src/lib.rs`
+
+---
+
+### Bug 23: rtld_audit `do_syscall` Using Old Single-Slot Layout (FIXED)
+
+**Symptoms**: Shared library syscalls crashed after the per-thread table refactor.
+
+**Root Cause**: The `do_syscall()` function in `rtld_audit_arm64.c` was reading `trampoline_data+16` as host TLS directly. After the refactor, offset 16 contains a table pointer, not host TLS.
+
+**Solution**: Updated `do_syscall` to:
+1. Read the table pointer from `trampoline_data+16`
+2. Read current `tpidr_el0` (guest_tpidr) via MRS
+3. Scan the table for matching entry (up to 256 entries, sentinel = `0xFFFFFFFFFFFFFFFF`)
+4. Load `host_tls` from the matched entry
+
+**File**: `litebox_rtld_audit_arm64/rtld_audit_arm64.c`
+
+---
+
 ## Code Artifacts
 
 ### New Crates Created
@@ -493,7 +686,7 @@ Changed the design so the **trampoline** reserves stack space, not `switch_to_gu
 litebox_syscall_rewriter_arm64/
 ├── Cargo.toml           # Dependencies: yaxpeax-arm, object, thiserror
 ├── src/
-│   └── lib.rs           # ~900 lines: decoder, encoder, trampoline generator
+│   └── lib.rs           # ~1830 lines: decoder, encoder, SVC/MSR trampoline generator
 └── tests/
     ├── hello-arm64      # Test binary
     ├── snapshots/       # Insta snapshots
@@ -501,9 +694,8 @@ litebox_syscall_rewriter_arm64/
 
 litebox_rtld_audit_arm64/
 ├── Cargo.toml
-└── src/
-    └── lib.rs           # LD_AUDIT shared library for runtime trampoline loading
-                         # la_objopen() finds .trampolineLB0 section in shared libs
+├── rtld_audit_arm64.c   # ~540 lines: LD_AUDIT shared library with per-thread TLS table lookup
+└── litebox_rtld_audit_arm64.so  # Pre-compiled shared library
 ```
 
 ### Key Functions in litebox_syscall_rewriter_arm64
@@ -511,26 +703,52 @@ litebox_rtld_audit_arm64/
 | Function | Purpose |
 |----------|---------|
 | `rewrite_syscalls()` | Main entry point, processes ELF |
-| `decode_section()` | Finds all SVC instructions |
-| `generate_trampoline_direct()` | Creates trampoline for near branches |
-| `generate_trampoline_indirect()` | Creates trampoline for far branches |
-| `encoder::encode_adr()` | Encodes ADR instruction (±1MB) |
-| `encoder::encode_adrp()` | Encodes ADRP instruction (±4GB, page-aligned) |
-| `encoder::encode_b()` | Encodes B (branch) instruction |
-| `encoder::encode_ldr_imm()` | Encodes LDR with immediate offset |
-| `encoder::encode_ldr_literal()` | Encodes LDR with PC-relative offset |
-| `encoder::encode_str_imm()` | Encodes STR with immediate offset |
-| `encoder::encode_sub_imm()` | Encodes SUB with immediate |
-| `encoder::encode_add_imm()` | Encodes ADD with immediate |
-| `encoder::encode_mov_imm64()` | Encodes 64-bit immediate load (MOVZ+MOVK) |
+| `decode_section()` | Finds all SVC and MSR TPIDR_EL0 instructions |
+| `generate_trampoline_direct()` | Creates SVC trampoline for near branches (±128MB) |
+| `generate_trampoline_indirect()` | Creates SVC trampoline for far branches |
+| `generate_msr_trampoline_direct()` | Creates MSR TPIDR_EL0 trampoline for near branches |
+| `generate_msr_trampoline_indirect()` | Creates MSR TPIDR_EL0 trampoline for far branches |
+| `is_msr_tpidr_el0()` | Detects MSR TPIDR_EL0 instructions |
+| `msr_tpidr_el0_source_reg()` | Extracts source register from MSR encoding |
+
+### Encoder Functions (`mod encoder`)
+
+| Function | Purpose |
+|----------|---------|
+| `encode_b()` | B (branch) instruction |
+| `encode_bl()` | BL (branch with link) instruction |
+| `encode_br()` | BR (branch register) instruction |
+| `encode_ret()` | RET instruction |
+| `encode_ldr_literal()` | LDR with PC-relative offset |
+| `encode_ldr_imm()` | LDR with immediate offset |
+| `encode_ldr_pre()` | LDR with pre-index (e.g., `LDR Xt, [SP], #imm`) |
+| `encode_str_imm()` | STR with immediate offset |
+| `encode_adr()` | ADR instruction (±1MB) |
+| `encode_adrp()` | ADRP instruction (±4GB, page-aligned) |
+| `encode_nop()` | NOP instruction |
+| `encode_movz()` | MOVZ (move wide with zero) |
+| `encode_movk()` | MOVK (move wide with keep) |
+| `encode_mov_imm64()` | 64-bit immediate load (MOVZ+MOVK×3) |
+| `encode_stp_pre()` | STP with pre-index |
+| `encode_ldp_post()` | LDP with post-index |
+| `encode_mov_reg()` | MOV (register to register) |
+| `encode_sub_imm()` | SUB with immediate |
+| `encode_add_imm()` | ADD with immediate |
+| `encode_mrs_tpidr_el0()` | MRS Xt, TPIDR_EL0 |
+| `encode_msr_tpidr_el0()` | MSR TPIDR_EL0, Xt |
+| `encode_cmp_reg()` | CMP (register compare) |
+| `encode_cmn_imm()` | CMN Xn, #imm (compare negative) |
+| `encode_b_cond()` | B.cond (conditional branch) |
 
 ### Modified Platform Files
 
 | File | Changes |
 |------|---------|
-| `litebox_platform_linux_userland/src/lib.rs` | switch_to_guest jumps to ctx.pc via x18; syscall_callback loads saved regs from header for rewriter mode |
+| `litebox_platform_linux_userland/src/lib.rs` | `switch_to_guest` with per-thread TLS table update; `syscall_callback` loads saved regs from stack; signal handler with alt-stack TLS recovery; `update_host_tls_table()` for thread registration |
 | `litebox_shim_linux/src/lib.rs` | ARM64 syscall return value (ctx.regs[0]) |
+| `litebox_shim_linux/src/syscalls/process.rs` | ARM64 SETTLS for clone/new threads |
 | `litebox_common_linux/src/loader.rs` | Trampoline section loading and mapping |
+| `litebox_rtld_audit_arm64/rtld_audit_arm64.c` | `do_syscall` with per-thread TLS table lookup; shared library trampoline patching with table pointer propagation |
 
 ---
 
@@ -564,19 +782,34 @@ litebox_rtld_audit_arm64/
 - Adding verification assertions caught issues early
 - **Hardcoded instruction encodings should always be verified with an assembler**
 
+### 7. Multi-Threading Requires Careful TLS Management
+- A single shared TLS slot is racy with multiple threads
+- Per-thread tables with sentinel-terminated scanning is robust
+- Signal handlers need an independent path to recover host TLS (alt-stack embedding)
+
+### 8. Guest Can Change TPIDR_EL0 Freely
+- `MSR TPIDR_EL0, Xn` is unprivileged on ARM64, unlike x86's `WRGSBASE`
+- Must intercept these instructions to keep the host TLS table synchronized
+- The MSR may execute before the platform registers the thread — sentinel checks prevent infinite loops
+
 ---
 
 ## Future Work
 
-### Short-term
-1. Fix threading/signal issues in rewriter mode (trampoline stores host TLS at fixed offset `trampoline_base+16` — race condition for multi-threaded programs)
-2. Implement `faccessat2` (syscall 439) — only `faccessat` (syscall 48) is currently supported
-3. Respect `statx` flags parameter (currently `_flags` is ignored — could honor `AT_SYMLINK_NOFOLLOW`)
+### Short-term (Cleanup)
+1. Remove temporary debug `eprintln!` logging from `litebox_platform_linux_userland/src/lib.rs` (7 statements with `[DEBUG]` prefix)
+2. Fix `dead_code` warning on `backend` field in `litebox_runner_linux_arm64_userland/tests/run.rs`
+3. Run systrap tests for regression (`test_static_exec_with_systrap`, `test_dynamic_lib_with_systrap`)
+
+### Short-term (Features)
+1. Implement `faccessat2` (syscall 439) — only `faccessat` (syscall 48) is currently supported
+2. Respect `statx` flags parameter (currently `_flags` is ignored — could honor `AT_SYMLINK_NOFOLLOW`)
 
 ### Medium-term
 1. Fix seccomp backend timing issues
 2. Handle SVE/NEON context in signals
 3. Implement remaining silenced syscalls as needed
+4. Optimize host TLS table lookup (consider hash-based or direct-indexed approach for many threads)
 
 ### Long-term
 1. Performance optimization
@@ -590,7 +823,27 @@ litebox_rtld_audit_arm64/
 # Build
 cargo build -p litebox_runner_linux_arm64_userland
 
-# Run with rewriter backend
+# Run rewriter tests
+cargo test -p litebox_runner_linux_arm64_userland test_static_exec_with_rewriter -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland test_dynamic_lib_with_rewriter -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland test_node_with_rewriter -- --nocapture
+
+# Run systrap tests
+cargo test -p litebox_runner_linux_arm64_userland test_static_exec_with_systrap -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland test_dynamic_lib_with_systrap -- --nocapture
+
+# Run clippy (zero warnings required, no #[allow(...)] attributes)
+cargo clippy -p litebox -p litebox_common_linux -p litebox_shim_linux \
+  -p litebox_syscall_rewriter_arm64 -p litebox_runner_linux_arm64_userland \
+  -p litebox_platform_linux_userland
+
+# Clean rewriter caches (MUST do after any rewriter or rtld_audit changes)
+rm -f target/debug/build/litebox_runner_linux_arm64_userland-*/out/*.hooked
+rm -f target/debug/build/litebox_runner_linux_arm64_userland-*/out/*.tar
+rm -f target/debug/build/litebox_runner_linux_arm64_userland-*/out/*.cache-checksum
+rm -rf target/debug/build/litebox_runner_linux_arm64_userland-*/out/tar_files_*
+
+# Run with rewriter backend (manual)
 ./target/debug/litebox_runner_linux_arm64_userland \
     --unstable \
     --interception-backend rewriter \
@@ -600,10 +853,32 @@ cargo build -p litebox_runner_linux_arm64_userland
 
 # Analyze coredump
 coredumpctl debug -1 -A "-batch -ex 'bt' -ex 'info registers'"
-
-# Check trampoline encoding
-dd if=/tmp/rewritten_binary bs=1 skip=$((0x911000)) count=64 | od -A x -t x4
 ```
+
+---
+
+## Current Status
+
+### All Rewriter Tests Passing
+- `test_static_exec_with_rewriter` — static binary (hello world)
+- `test_dynamic_lib_with_rewriter` — dynamically linked binary
+- `test_node_with_rewriter` — Node.js with 12+ shared libraries
+
+### Clippy Clean
+Zero warnings across all packages.
+
+### Uncommitted Changes
+5 files modified (+1,179 / -196 lines), all unstaged:
+- `litebox_platform_linux_userland/src/lib.rs` — per-thread TLS table, signal handling, debug logging
+- `litebox_rtld_audit_arm64/litebox_rtld_audit_arm64.so` — recompiled shared library
+- `litebox_rtld_audit_arm64/rtld_audit_arm64.c` — table lookup in `do_syscall`
+- `litebox_shim_linux/src/syscalls/process.rs` — ARM64 SETTLS
+- `litebox_syscall_rewriter_arm64/src/lib.rs` — MSR interception, TLS table lookup in trampolines
+
+### Remaining Cleanup
+1. Remove 7 debug `eprintln!` statements (search `[DEBUG]` in `litebox_platform_linux_userland/src/lib.rs`)
+2. Fix `dead_code` warning on `backend` field in test runner
+3. Verify systrap tests still pass
 
 ---
 

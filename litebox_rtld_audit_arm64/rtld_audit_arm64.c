@@ -41,7 +41,7 @@
 
 typedef long (*syscall_stub_t)(void);
 static syscall_stub_t syscall_entry = 0;
-// Address of the trampoline data section where host TLS is stored at offset 16
+// Address of the trampoline data section where the host TLS table pointer is stored at offset 16
 static void *trampoline_data = 0;
 static char interp[256] = {0}; // Buffer for interpreter path
 
@@ -97,7 +97,7 @@ static void early_print_hex(uint64_t data) {
 
 // ARM64 syscall: arguments in x0-x5, syscall number in x8, return in x0
 // The syscall_callback expects:
-// - x18 = host TLS (loaded from trampoline_data+16)
+// - x18 = host TLS (looked up from the per-thread host TLS table)
 // - Stack frame set up like the trampoline does:
 //   [SP+0]: saved x16, [SP+8]: saved x17, [SP+16]: saved x30
 // - x30 (LR) = return address after syscall
@@ -106,9 +106,29 @@ static long do_syscall(long num, long a0, long a1, long a2, long a3, long a4,
   if (!syscall_entry || !trampoline_data)
     return -1;
 
-  // Load host TLS from trampoline_data+16
-  uint64_t host_tls;
-  __builtin_memcpy(&host_tls, (char *)trampoline_data + 16, sizeof(host_tls));
+  // trampoline_data+16 now contains a pointer to the per-thread host TLS table.
+  // Each table entry is 16 bytes: [guest_tpidr (8 bytes), host_tls (8 bytes)].
+  // Scan the table for an entry matching our current TPIDR_EL0 to find host_tls.
+  uint64_t table_ptr;
+  __builtin_memcpy(&table_ptr, (char *)trampoline_data + 16, sizeof(table_ptr));
+
+  uint64_t guest_tpidr;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(guest_tpidr));
+
+  uint64_t host_tls = 0;
+  uint64_t *table = (uint64_t *)table_ptr;
+  // Table has up to 256 entries, sentinel 0xFFFFFFFFFFFFFFFF marks empty slots
+  for (int i = 0; i < 256; i++) {
+    uint64_t entry_tpidr = table[i * 2];
+    if (entry_tpidr == 0xFFFFFFFFFFFFFFFFULL) {
+      // Hit sentinel - entry not found, use 0 (will likely crash but shouldn't happen)
+      break;
+    }
+    if (entry_tpidr == guest_tpidr) {
+      host_tls = table[i * 2 + 1];
+      break;
+    }
+  }
 
   register long x8 __asm__("x8") = num;
   register long x0 __asm__("x0") = a0;
@@ -453,25 +473,25 @@ unsigned int la_objopen(struct link_map *map,
     syscall_print("[audit-arm64] libc tramp size=", 30);
     print_hex(total_size);
     
-    // Data section is 0x1000 bytes (one page)
-    uint64_t data_size = 0x1000;
-    // Code section follows data section
-    uint64_t code_vaddr = data_section_vaddr + data_size;
-    uint64_t code_size = total_size - data_size;
-    uint64_t code_size_aligned = align_up(code_size, 0x1000);
+    // Map the trampoline section as RW first (for writing header data),
+    // then mprotect to RWX. We use a two-step approach because the sandbox's
+    // mmap handler doesn't support RWX directly, but mprotect does.
+    // The header (first 24 bytes) needs to stay writable for the host TLS pointer
+    // at offset 16 (written at runtime by switch_to_guest), and code entries
+    // start at offset 0x18 within the same page.
+    uint64_t total_size_aligned = align_up(total_size, 0x1000);
 
-    // Map data section as RW
     void *data_mapped =
-        (void *)do_syscall(SYS_mmap, data_section_vaddr, data_size,
+        (void *)do_syscall(SYS_mmap, data_section_vaddr, total_size_aligned,
                            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, tramp_file_offset);
     if ((uintptr_t)data_mapped >= (uintptr_t)-4096) {
-      syscall_print("[audit-arm64] mmap failed for data section\n", 43);
+      syscall_print("[audit-arm64] mmap failed for trampoline\n", 41);
       break;
     }
     if ((uint64_t)data_mapped != data_section_vaddr) {
-      syscall_print("[audit-arm64] data mmap returned unexpected address\n", 51);
+      syscall_print("[audit-arm64] trampoline mmap returned unexpected address\n", 57);
       print_hex((uint64_t)data_mapped);
-      do_syscall(SYS_munmap, (long)data_mapped, data_size, 0, 0, 0, 0);
+      do_syscall(SYS_munmap, (long)data_mapped, total_size_aligned, 0, 0, 0, 0);
       break;
     }
 
@@ -485,33 +505,26 @@ unsigned int la_objopen(struct link_map *map,
     __builtin_memcpy((char *)data_mapped + 8, (const void *)&syscall_entry, 8);
     syscall_print("[audit-arm64] patched handler address\n", 38);
 
-    // Copy host TLS from ld-linux's trampoline to this library's trampoline
-    // Host TLS is stored at offset 16 in the trampoline data section
+    // Copy the host TLS table pointer from ld-linux's trampoline to this library's trampoline.
+    // The table pointer is stored at offset 16 in the trampoline data section.
+    // All shared libraries' trampolines need the same table pointer so their
+    // trampoline code can look up the host TLS for the current thread.
     if (trampoline_data != 0) {
-      uint64_t host_tls;
-      __builtin_memcpy(&host_tls, (char *)trampoline_data + 16, sizeof(host_tls));
-      syscall_print("[audit-arm64] host_tls value=", 29);
-      print_hex(host_tls);
-      __builtin_memcpy((char *)data_mapped + 16, (const void *)&host_tls, 8);
-      syscall_print("[audit-arm64] copied host TLS\n", 30);
+      uint64_t table_ptr;
+      __builtin_memcpy(&table_ptr, (char *)trampoline_data + 16, sizeof(table_ptr));
+      syscall_print("[audit-arm64] table_ptr value=", 30);
+      print_hex(table_ptr);
+      __builtin_memcpy((char *)data_mapped + 16, (const void *)&table_ptr, 8);
+      syscall_print("[audit-arm64] copied table pointer\n", 35);
     }
 
-    // Map code section as R-X if there is any
-    if (code_size > 0) {
-      void *code_mapped =
-          (void *)do_syscall(SYS_mmap, code_vaddr, code_size_aligned,
-                             PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, fd, 
-                             tramp_file_offset + data_size);
-      if ((uintptr_t)code_mapped >= (uintptr_t)-4096) {
-        syscall_print("[audit-arm64] mmap failed for code section\n", 43);
-        break;
-      }
-      if ((uint64_t)code_mapped != code_vaddr) {
-        syscall_print("[audit-arm64] code mmap returned unexpected address\n", 51);
-        print_hex((uint64_t)code_mapped);
-        do_syscall(SYS_munmap, (long)code_mapped, code_size_aligned, 0, 0, 0, 0);
-        break;
-      }
+    // Now mprotect the entire trampoline to RWX so code is executable
+    // and the table pointer at offset 16 remains writable at runtime.
+    long mprotect_ret = do_syscall(SYS_mprotect, data_section_vaddr, total_size_aligned,
+                                   PROT_READ | PROT_WRITE | PROT_EXEC, 0, 0, 0);
+    if (mprotect_ret != 0) {
+      syscall_print("[audit-arm64] mprotect to RWX failed\n", 37);
+      break;
     }
 
     syscall_print("[audit-arm64] trampoline loaded successfully\n", 45);

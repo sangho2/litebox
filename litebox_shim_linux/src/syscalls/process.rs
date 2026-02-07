@@ -1552,18 +1552,25 @@ impl Task {
                 }
 
                 // Set the TLS for the new thread.
-                if let Some(_tls) = tls {
+                if let Some(tls) = tls {
                     #[cfg(target_arch = "x86")]
                     {
-                        let mut _tls = _tls;
-                        self.set_thread_area(&mut _tls).unwrap();
+                        let mut tls = tls;
+                        self.set_thread_area(&mut tls).unwrap();
                     }
 
                     #[cfg(target_arch = "x86_64")]
                     {
                         use litebox::platform::RawConstPointer as _;
-                        self.sys_arch_prctl(ArchPrctlArg::SetFs(_tls.as_usize()))
+                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
                             .unwrap();
+                    }
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        use litebox::platform::RawConstPointer as _;
+                        litebox_platform_multiplex::platform()
+                            .set_guest_tls(tls.as_usize());
                     }
                 }
 

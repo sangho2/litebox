@@ -801,11 +801,15 @@ interrupt:
 #[allow(dead_code)]
 fn set_guest_tpidr(value: usize) {
     unsafe {
-        // Store guest TPIDR_EL0 in TLS
-        let tls_base: usize;
-        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
-        let ptr = (tls_base as *mut usize).byte_offset(guest_tpidr_offset());
-        ptr.write_volatile(value);
+        // Store guest TPIDR_EL0 in TLS using the same :tprel_lo12: addressing
+        // that the assembly code uses for consistency.
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el0",
+            "str {val}, [{tmp}, #:tprel_lo12:guest_tpidr]",
+            tmp = out(reg) _,
+            val = in(reg) value,
+            options(nostack)
+        );
     }
 }
 
@@ -813,22 +817,16 @@ fn set_guest_tpidr(value: usize) {
 #[allow(dead_code)]
 fn get_guest_tpidr() -> usize {
     unsafe {
-        let tls_base: usize;
-        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls_base, options(nostack, preserves_flags));
-        let ptr = (tls_base as *const usize).byte_offset(guest_tpidr_offset());
-        ptr.read_volatile()
+        let value: usize;
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el0",
+            "ldr {out}, [{tmp}, #:tprel_lo12:guest_tpidr]",
+            tmp = out(reg) _,
+            out = out(reg) value,
+            options(nostack, preserves_flags, readonly)
+        );
+        value
     }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-fn guest_tpidr_offset() -> isize {
-    // SAFETY: accessing a symbol defined in TLS
-    unsafe extern "C" {
-        static guest_tpidr: u8;
-    }
-    // Calculate TLS offset - this is a simplification
-    (&raw const guest_tpidr as isize).wrapping_sub(0)
 }
 
 /// Global storage for trampoline base address (ARM64 only).
@@ -838,12 +836,90 @@ fn guest_tpidr_offset() -> isize {
 static GLOBAL_TRAMPOLINE_BASE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Global storage for the per-thread host TLS lookup table (ARM64 only).
+/// The table is allocated once and shared by all threads. Each entry is 16 bytes:
+///   [guest_tpidr: u64, host_tls: u64]
+/// The trampoline code scans this table (keyed by TPIDR_EL0) to find the host TLS
+/// for the current thread, avoiding the race condition of a single shared slot.
+#[cfg(target_arch = "aarch64")]
+static GLOBAL_HOST_TLS_TABLE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Maximum number of threads supported by the host TLS table.
+#[cfg(target_arch = "aarch64")]
+const HOST_TLS_TABLE_MAX_ENTRIES: usize = 256;
+
+/// Size of each entry in the host TLS table (guest_tpidr + host_tls = 16 bytes).
+#[cfg(target_arch = "aarch64")]
+const HOST_TLS_TABLE_ENTRY_SIZE: usize = 16;
+
+/// Sentinel value for empty slots in the host TLS table.
+/// Must be a value that no real guest_tpidr would have, since guest_tpidr can be 0
+/// for the initial thread before the guest C runtime sets up TLS.
+#[cfg(target_arch = "aarch64")]
+const HOST_TLS_TABLE_EMPTY: u64 = u64::MAX;
+
 /// Set the trampoline base address for syscall rewriting (ARM64 only).
 /// This must be called before entering guest code when using the rewriter backend.
 #[cfg(target_arch = "aarch64")]
 pub fn set_trampoline_base(addr: usize) {
     // Store in global for signal handler access
     GLOBAL_TRAMPOLINE_BASE.store(addr, core::sync::atomic::Ordering::Release);
+
+    // Allocate the host TLS table if not already allocated.
+    // Use compare_exchange to ensure only one thread allocates it.
+    if GLOBAL_HOST_TLS_TABLE.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        let table_size = HOST_TLS_TABLE_MAX_ENTRIES * HOST_TLS_TABLE_ENTRY_SIZE;
+        let table_ptr = unsafe {
+            let flags = libc::MAP_PRIVATE
+                | libc::MAP_ANONYMOUS
+                | syscall_intercept::MMAP_FLAG_MAGIC.cast_signed();
+            syscalls::raw::syscall6(
+                syscalls::Sysno::mmap,
+                0,
+                table_size,
+                (libc::PROT_READ | libc::PROT_WRITE) as usize,
+                flags.cast_unsigned() as usize,
+                usize::MAX,
+                0,
+            )
+        };
+        if table_ptr.cast_signed() >= 0 {
+            // Initialize all slots with the sentinel value (mmap returns zeroed pages,
+            // but we need the sentinel to distinguish empty from guest_tpidr==0).
+            let table = table_ptr as *mut u64;
+            for i in 0..HOST_TLS_TABLE_MAX_ENTRIES {
+                unsafe {
+                    core::ptr::write_volatile(table.add(i * 2), HOST_TLS_TABLE_EMPTY);
+                }
+            }
+            // Try to set the global. If another thread beat us, unmap our allocation.
+            if GLOBAL_HOST_TLS_TABLE
+                .compare_exchange(
+                    0,
+                    table_ptr,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                // Another thread allocated the table first, free ours
+                unsafe {
+                    let _ =
+                        syscalls::raw::syscall2(syscalls::Sysno::munmap, table_ptr, table_size);
+                }
+            }
+        }
+    }
+
+    // Store the table pointer at trampoline_base+16 for the trampoline code to read.
+    let table_ptr = GLOBAL_HOST_TLS_TABLE.load(core::sync::atomic::Ordering::Acquire);
+    if table_ptr != 0 && addr != 0 {
+        unsafe {
+            core::ptr::write_volatile((addr + 16) as *mut u64, table_ptr as u64);
+        }
+    } else {
+    }
 
     // Also store in TLS for fast access in switch_to_guest
     unsafe {
@@ -872,6 +948,98 @@ fn get_trampoline_base() -> usize {
         );
     }
     result
+}
+
+/// Updates the host TLS table entry for the current thread (ARM64 only).
+///
+/// This writes `(guest_tpidr, host_tls)` to the table so the trampoline code
+/// can look up the host TLS pointer by scanning for the matching `guest_tpidr`.
+/// Must be called before `switch_to_guest` on every guest entry.
+#[cfg(target_arch = "aarch64")]
+fn update_host_tls_table() {
+    let table_ptr = GLOBAL_HOST_TLS_TABLE.load(core::sync::atomic::Ordering::Acquire);
+    if table_ptr == 0 {
+        return; // Not in rewriter mode
+    }
+
+    // Read guest_tpidr and host_tls from TLS variables.
+    // guest_tpidr may be 0 for the initial thread before guest CRT sets up TLS.
+    let guest_tpidr: u64;
+    let host_tls: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {host_tls}, tpidr_el0",
+            "ldr {guest_tpidr}, [{host_tls}, #:tprel_lo12:guest_tpidr]",
+            host_tls = out(reg) host_tls,
+            guest_tpidr = out(reg) guest_tpidr,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    // Scan the table for an existing entry with this guest_tpidr,
+    // or find the first empty (sentinel) slot.
+    // Empty slots are marked with the sentinel value HOST_TLS_TABLE_EMPTY.
+    let table = table_ptr as *mut u64;
+    for i in 0..HOST_TLS_TABLE_MAX_ENTRIES {
+        let entry_ptr = unsafe { table.add(i * 2) };
+        let existing_tpidr = unsafe { core::ptr::read_volatile(entry_ptr) };
+        if existing_tpidr == guest_tpidr {
+            // Found existing entry for this thread, update host_tls
+            unsafe {
+                core::ptr::write_volatile(entry_ptr.add(1), host_tls);
+            }
+            return;
+        }
+        if existing_tpidr == HOST_TLS_TABLE_EMPTY {
+            // Empty slot, claim it
+            unsafe {
+                core::ptr::write_volatile(entry_ptr, guest_tpidr);
+                core::ptr::write_volatile(entry_ptr.add(1), host_tls);
+            }
+            return;
+        }
+    }
+    // Table is full — this is a fatal error, shouldn't happen with 256 entries
+    panic!("Host TLS table is full ({HOST_TLS_TABLE_MAX_ENTRIES} entries)");
+}
+
+/// Clears the host TLS table entry for the current thread (ARM64 only).
+///
+/// Must be called when a thread exits to free its table slot.
+#[cfg(target_arch = "aarch64")]
+fn clear_host_tls_table_entry() {
+    let table_ptr = GLOBAL_HOST_TLS_TABLE.load(core::sync::atomic::Ordering::Acquire);
+    if table_ptr == 0 {
+        return;
+    }
+
+    let guest_tpidr: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el0",
+            "ldr {guest_tpidr}, [{tmp}, #:tprel_lo12:guest_tpidr]",
+            tmp = out(reg) _,
+            guest_tpidr = out(reg) guest_tpidr,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    let table = table_ptr as *mut u64;
+    for i in 0..HOST_TLS_TABLE_MAX_ENTRIES {
+        let entry_ptr = unsafe { table.add(i * 2) };
+        let existing_tpidr = unsafe { core::ptr::read_volatile(entry_ptr) };
+        if existing_tpidr == guest_tpidr {
+            // Clear the entry by writing the sentinel value
+            unsafe {
+                core::ptr::write_volatile(entry_ptr, HOST_TLS_TABLE_EMPTY);
+                core::ptr::write_volatile(entry_ptr.add(1), 0u64);
+            }
+            return;
+        }
+        if existing_tpidr == HOST_TLS_TABLE_EMPTY {
+            return; // No more entries to check
+        }
+    }
 }
 
 /// Runs the guest thread until it terminates (ARM64 version).
@@ -1086,20 +1254,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // Check for pending interrupt
         "ldrb w10, [x18, #:tprel_lo12:interrupt]",
         "cbnz w10, interrupt_callback",
-        // Check if we're using rewriter mode (trampoline_base != 0)
-        "ldr x11, [x18, #:tprel_lo12:trampoline_base]",
         // Restore guest context from ctx (x0 points to PtRegs)
         // Load guest SP (offset 248)
         "ldr x1, [x0, #248]",
-        // If rewriter mode, store host TLS at trampoline_base+16 for signal handler access.
-        // The trampoline will load host TLS from there (not from stack).
-        // Note: This has a race condition for multi-threading, but is needed for
-        // signal handlers which can't safely access the guest stack.
-        // We do NOT modify guest SP here - the trampoline will subtract 32 before saving.
-        "cbz x11, 1f",         // Skip if no trampoline (systrap mode)
-        "str x18, [x11, #16]", // Store host TLS at trampoline_base+16
-        "1:",
-        // Set SP to guest SP (unmodified)
+        // Host TLS table entry is updated by update_host_tls_table() before
+        // switch_to_guest is called. No need to write trampoline_base+16 here.
+        // Set SP to guest SP
         "mov sp, x1",
         // Load guest PC into x1 temporarily (will use x18 after we're done with it for TLS)
         // pc is at offset 256
@@ -2073,9 +2233,17 @@ impl ThreadContext<'_> {
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::ResumeGuest => {
+                // Update the host TLS table entry before entering guest code.
+                // The trampoline will scan this table to find our host TLS.
+                #[cfg(target_arch = "aarch64")]
+                update_host_tls_table();
                 unsafe { switch_to_guest(self.ctx) }
             }
-            ContinueOperation::ExitThread => {}
+            ContinueOperation::ExitThread => {
+                // Clean up the host TLS table entry when the thread exits.
+                #[cfg(target_arch = "aarch64")]
+                clear_host_tls_table_entry();
+            }
         }
     }
 }
@@ -2110,6 +2278,19 @@ impl LinuxUserland {
     /// No-op on non-ARM64 platforms.
     #[cfg(not(target_arch = "aarch64"))]
     pub fn set_trampoline_base_addr(&self, _addr: usize) {
+        // No-op
+    }
+
+    /// Set the guest TLS (TPIDR_EL0) for the current thread on ARM64.
+    /// This must be called when a new thread is created with CLONE_SETTLS.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_guest_tls(&self, tls: usize) {
+        set_guest_tpidr(tls);
+    }
+
+    /// No-op on non-ARM64 platforms.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn set_guest_tls(&self, _tls: usize) {
         // No-op
     }
 }
@@ -2216,37 +2397,92 @@ fn register_exception_handlers() {
     });
 }
 
+/// Total size of each thread's alt-stack allocation, including guard page.
+/// Must be a power of 2 so that signal handlers can recover the allocation base
+/// from their current SP using a simple bitmask: `base = sp & !(ALT_STACK_ALLOC_SIZE - 1)`.
+///
+/// Layout within each aligned allocation:
+/// ```text
+/// [guard_page (0x1000)] [usable signal stack (ss_size)] [host_tls (8 bytes)] [pad (8 bytes)]
+///  ^                     ^                                ^                   ^
+///  base                  base + 0x1000                    base + SIZE - 8     base + SIZE
+/// ```
+///
+/// The kernel is told `ss_size = ALT_STACK_ALLOC_SIZE - 16` so the signal frame
+/// (placed at `ss_sp + ss_size` growing downward) doesn't clobber the host TLS slot.
+/// The host TLS pointer is stored at `base + ALT_STACK_ALLOC_SIZE - 8` so that
+/// signal handlers running on the alt-stack can find it in O(1) without any
+/// shared mutable state (avoiding the multi-thread race on `trampoline_base+16`).
+const ALT_STACK_ALLOC_SIZE: usize = 0x10000; // 64 KB, power of 2
+
 /// Runs `f` with an alternate signal stack set up.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    let alt_stack_size = libc::SIGSTKSZ * 2;
-    let guard_page_size = 0x1000;
+    let guard_page_size: usize = 0x1000;
+    // The usable stack size is the total allocation minus the guard page.
+    // We tell sigaltstack about the full allocation (ss_sp = aligned_base,
+    // ss_size = ALT_STACK_ALLOC_SIZE) so the kernel knows the full range.
+    // The guard page at the bottom catches stack overflows.
+    let alt_stack_size = ALT_STACK_ALLOC_SIZE;
 
-    // Use raw syscalls with magic flags to bypass seccomp filter
-    let stack_base = unsafe {
+    // Over-allocate by 2x so we can find a properly aligned region within it.
+    // This ensures `aligned_base` is aligned to ALT_STACK_ALLOC_SIZE.
+    let mmap_size = ALT_STACK_ALLOC_SIZE * 2;
+    let mmap_base = unsafe {
         let flags =
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | syscall_intercept::MMAP_FLAG_MAGIC.cast_signed();
         let r = syscalls::raw::syscall6(
             syscalls::Sysno::mmap,
             0, // addr
-            guard_page_size + alt_stack_size,
+            mmap_size,
             (libc::PROT_READ | libc::PROT_WRITE) as usize,
             flags.cast_unsigned() as usize,
             usize::MAX, // fd = -1
             0,          // offset
         );
-        assert!(r.cast_signed() >= 0, 
+        assert!(r.cast_signed() >= 0,
             "failed to allocate memory for alternate signal stack: {}",
             syscalls::Errno::from_ret(r).unwrap_err()
         );
-        r as *mut libc::c_void
+        r
     };
+
+    // Find the aligned base within the over-allocated region.
+    let aligned_base = (mmap_base + ALT_STACK_ALLOC_SIZE - 1) & !(ALT_STACK_ALLOC_SIZE - 1);
+
+    // Unmap the unused portions before and after the aligned region.
+    let prefix_len = aligned_base - mmap_base;
+    let suffix_len = mmap_size - prefix_len - ALT_STACK_ALLOC_SIZE;
+    if prefix_len > 0 {
+        unsafe {
+            let r = syscalls::raw::syscall3(
+                syscalls::Sysno::munmap,
+                mmap_base,
+                prefix_len,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            );
+            assert!(r.cast_signed() >= 0, "failed to unmap alt-stack prefix");
+        }
+    }
+    if suffix_len > 0 {
+        unsafe {
+            let r = syscalls::raw::syscall3(
+                syscalls::Sysno::munmap,
+                aligned_base + ALT_STACK_ALLOC_SIZE,
+                suffix_len,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            );
+            assert!(r.cast_signed() >= 0, "failed to unmap alt-stack suffix");
+        }
+    }
+
+    let stack_base = aligned_base as *mut libc::c_void;
     let _unmap_guard = litebox::utils::defer(|| {
         // Use raw munmap with backdoor
         let r = unsafe {
             syscalls::raw::syscall3(
                 syscalls::Sysno::munmap,
                 stack_base as usize,
-                guard_page_size + alt_stack_size,
+                ALT_STACK_ALLOC_SIZE,
                 syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         };
@@ -2271,25 +2507,34 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
         "failed to set guard page for alternate signal stack"
     );
 
+    // On ARM64 in rewriter mode, we reserve 16 bytes at the very top of the
+    // allocation for the host TLS pointer. We tell the kernel ss_size is 16
+    // bytes less so its signal frame (placed at ss_sp + ss_size, growing down)
+    // won't clobber our host TLS slot at aligned_base + ALT_STACK_ALLOC_SIZE - 8.
+    #[cfg(target_arch = "aarch64")]
+    let reported_stack_size = alt_stack_size - 16;
+    #[cfg(not(target_arch = "aarch64"))]
+    let reported_stack_size = alt_stack_size;
+
     let alt_stack = libc::stack_t {
         ss_sp: stack_base.cast(),
         ss_flags: 0,
-        ss_size: alt_stack_size,
+        ss_size: reported_stack_size,
     };
 
     // On ARM64, store the host's TPIDR_EL0 at a known location in the alt-stack.
     // Signal handlers can read this to restore host TLS when signals occur
     // during guest execution (when tpidr_el0 contains guest's TLS).
+    // The location is at `aligned_base + ALT_STACK_ALLOC_SIZE - 8`, which is
+    // above the declared ss_size so the kernel's signal frame won't clobber it.
     #[cfg(target_arch = "aarch64")]
     {
         let host_tls: usize;
         unsafe {
             core::arch::asm!("mrs {}, tpidr_el0", out(reg) host_tls, options(nostack, preserves_flags));
         }
-        // Store at the very top of the alt-stack (offset -8 from top)
-        // Layout: [guard_page][alt_stack_data][host_tls_ptr]
         let host_tls_location =
-            (stack_base as usize + guard_page_size + alt_stack_size - 8) as *mut usize;
+            (aligned_base + ALT_STACK_ALLOC_SIZE - 8) as *mut usize;
         unsafe {
             host_tls_location.write_volatile(host_tls);
         }
@@ -2570,12 +2815,27 @@ fn signal_handler_exit_guest(
             return Some(guest_context_top.offset(-1));
         }
 
-        // Rewriter mode: Read host TLS from trampoline header (offset 16).
-        // The host TLS is stored there by switch_to_guest before entering guest mode.
-        // Note: This has a race condition for multi-threading (another thread could
-        // overwrite this value), but we need this for signal handlers which can't
-        // safely access the guest stack.
-        let host_tls = core::ptr::read_volatile((trampoline_base + 16) as *const usize);
+        // Rewriter mode: Read host TLS from the per-thread alt-stack.
+        //
+        // Each thread's alt-stack is allocated as a power-of-2-aligned region
+        // (ALT_STACK_ALLOC_SIZE). The host TLS pointer is stored at
+        // `aligned_base + ALT_STACK_ALLOC_SIZE - 8`. Since this signal handler
+        // runs on the alt-stack (SA_ONSTACK), we can recover the aligned base
+        // from the current SP using a bitmask.
+        //
+        // This avoids the race condition of the old approach (reading from
+        // trampoline_base+16) where multiple threads would overwrite each
+        // other's host TLS values.
+        let current_sp: usize;
+        core::arch::asm!(
+            "mov {}, sp",
+            out(reg) current_sp,
+            options(nostack, nomem, preserves_flags)
+        );
+        let alt_stack_base = current_sp & !(ALT_STACK_ALLOC_SIZE - 1);
+        let host_tls = core::ptr::read_volatile(
+            (alt_stack_base + ALT_STACK_ALLOC_SIZE - 8) as *const usize,
+        );
 
         if host_tls == 0 {
             // Host TLS not yet saved (we're not in guest mode yet)
