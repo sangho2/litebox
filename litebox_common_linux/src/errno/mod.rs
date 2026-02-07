@@ -350,6 +350,7 @@ impl From<litebox::net::errors::AcceptError> for Errno {
             litebox::net::errors::AcceptError::InvalidFd => Errno::EBADF,
             litebox::net::errors::AcceptError::NotListening => Errno::ENOTCONN,
             litebox::net::errors::AcceptError::NoConnectionsReady => Errno::EAGAIN,
+            litebox::net::errors::AcceptError::InvalidProtocol => Errno::EOPNOTSUPP,
             _ => unimplemented!(),
         }
     }
@@ -362,6 +363,7 @@ impl From<litebox::net::errors::BindError> for Errno {
             litebox::net::errors::BindError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
             litebox::net::errors::BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
             litebox::net::errors::BindError::AlreadyBound => Errno::EINVAL,
+            litebox::net::errors::BindError::OperationNotSupported => Errno::EOPNOTSUPP,
             _ => unimplemented!(),
         }
     }
@@ -376,6 +378,7 @@ impl From<litebox::net::errors::ConnectError> for Errno {
             litebox::net::errors::ConnectError::Unaddressable => Errno::EADDRNOTAVAIL,
             litebox::net::errors::ConnectError::InProgress => Errno::EINPROGRESS,
             litebox::net::errors::ConnectError::InvalidState => Errno::ECONNREFUSED,
+            litebox::net::errors::ConnectError::UnsupportedProtocol => Errno::EPROTONOSUPPORT,
             _ => unimplemented!(),
         }
     }
@@ -407,6 +410,7 @@ impl From<litebox::net::errors::ListenError> for Errno {
             litebox::net::errors::ListenError::InvalidAddress => Errno::EINVAL,
             litebox::net::errors::ListenError::InvalidState => Errno::EINVAL,
             litebox::net::errors::ListenError::NoAvailableFreeEphemeralPorts => Errno::ENOSPC,
+            litebox::net::errors::ListenError::InvalidProtocol => Errno::EOPNOTSUPP,
 
             _ => unimplemented!(),
         }
@@ -436,6 +440,8 @@ impl From<litebox::net::errors::SendError> for Errno {
             litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
             litebox::net::errors::SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
             litebox::net::errors::SendError::DestinationAddressRequired => Errno::EDESTADDRREQ,
+            litebox::net::errors::SendError::UnsupportedAddress => Errno::EAFNOSUPPORT,
+            litebox::net::errors::SendError::UnsupportedProtocol => Errno::EPROTONOSUPPORT,
             _ => unimplemented!(),
         }
     }
@@ -447,6 +453,7 @@ impl From<litebox::net::errors::ReceiveError> for Errno {
             litebox::net::errors::ReceiveError::InvalidFd => Errno::EBADF,
             litebox::net::errors::ReceiveError::SocketInInvalidState => Errno::EAGAIN,
             litebox::net::errors::ReceiveError::OperationFinished => Errno::ESHUTDOWN,
+            litebox::net::errors::ReceiveError::NotConnected => Errno::ENOTCONN,
             _ => unimplemented!(),
         }
     }

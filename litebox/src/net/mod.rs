@@ -150,6 +150,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
     where
         TCP: FnOnce(&tcp::Socket) -> R,
         UDP: FnOnce(&udp::Socket) -> R,
+        R: Default,
     {
         match self.protocol() {
             crate::net::Protocol::Tcp => {
@@ -160,9 +161,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
                 let udp_socket = socket_set.get::<udp::Socket>(self.handle);
                 udp(udp_socket)
             }
-            crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
-                unimplemented!()
-            }
+            crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => R::default(),
         }
     }
 
@@ -176,6 +175,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
     where
         TCP: FnOnce(&mut tcp::Socket) -> R,
         UDP: FnOnce(&mut udp::Socket) -> R,
+        R: Default,
     {
         match self.protocol() {
             crate::net::Protocol::Tcp => {
@@ -186,9 +186,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
                 let udp_socket = socket_set.get_mut::<udp::Socket>(self.handle);
                 udp(udp_socket)
             }
-            crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
-                unimplemented!()
-            }
+            crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => R::default(),
         }
     }
 }
@@ -210,10 +208,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::DerefMut
 }
 
 /// The [`ProtocolSpecific`] stores socket-type-specific data
-#[expect(
-    dead_code,
-    reason = "these might eventually get used, they exist for completeness sake"
-)]
 pub(crate) enum ProtocolSpecific {
     Tcp(TcpSpecific),
     Udp(UdpSpecific),
@@ -276,7 +270,12 @@ pub(crate) struct UdpSpecific {
 }
 
 /// Socket-specific data for ICMP sockets
-pub(crate) struct IcmpSpecific {}
+pub(crate) struct IcmpSpecific {
+    /// Remote address for connected ICMP sockets (for ping)
+    remote_addr: Option<smoltcp::wire::IpAddress>,
+    /// ICMP identifier (used to filter responses)
+    ident: u16,
+}
 
 /// Socket-specific data for RAW sockets
 pub(crate) struct RawSpecific {
@@ -665,7 +664,8 @@ where
                 }
             }
             (Protocol::Icmp | Protocol::Raw { .. }, _) => {
-                unimplemented!()
+                // ICMP/Raw sockets don't use the proxy channel for data transfer;
+                // send/receive goes directly through smoltcp socket API.
             }
             _ => panic!("Mismatched protocol and proxy type"),
         }
@@ -760,8 +760,11 @@ where
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
                     remote_endpoint: None,
                 }),
-                Protocol::Icmp => unimplemented!(),
-                Protocol::Raw { protocol: _ } => unimplemented!(),
+                Protocol::Icmp => ProtocolSpecific::Icmp(IcmpSpecific {
+                    remote_addr: None,
+                    ident: 0,
+                }),
+                Protocol::Raw { protocol } => ProtocolSpecific::Raw(RawSpecific { protocol }),
             },
             proxy: None,
         }))
@@ -1000,8 +1003,12 @@ where
                 socket_handle.udp_mut().remote_endpoint = Some(addr);
                 Ok(())
             }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
+            Protocol::Icmp => {
+                socket_handle.icmp_mut().remote_addr =
+                    Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip()));
+                Ok(())
+            }
+            Protocol::Raw { protocol: _ } => Err(ConnectError::UnsupportedProtocol),
         };
 
         if let Some(proxy) = &socket_handle.proxy {
@@ -1047,8 +1054,17 @@ where
                     ))),
                 }
             }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
+            Protocol::Icmp => {
+                // Return the interface address with the ident in the port field
+                let ident = socket_handle.icmp().ident;
+                Ok(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::UNSPECIFIED,
+                    ident,
+                )))
+            }
+            Protocol::Raw { protocol: _ } => {
+                Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+            }
         }
     }
 
@@ -1077,8 +1093,18 @@ where
                 .udp()
                 .remote_endpoint
                 .ok_or(RemoteAddrError::NotConnected)?,
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
+            Protocol::Icmp => {
+                let addr = socket_handle
+                    .icmp()
+                    .remote_addr
+                    .ok_or(RemoteAddrError::NotConnected)?;
+                match addr {
+                    smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                        return Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, 0)));
+                    }
+                }
+            }
+            Protocol::Raw { protocol: _ } => return Err(RemoteAddrError::NotConnected),
         };
         match endpoint.addr {
             smoltcp::wire::IpAddress::Ipv4(ipv4) => {
@@ -1148,8 +1174,18 @@ where
                     }
                 });
             }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
+            Protocol::Icmp => {
+                // ICMP bind: set the identifier from the port field
+                let icmp_socket: &mut icmp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                socket_handle.icmp_mut().ident = addr.port();
+                icmp_socket
+                    .bind(icmp::Endpoint::Ident(addr.port()))
+                    .map_err(|_| BindError::AlreadyBound)?;
+            }
+            Protocol::Raw { protocol: _ } => {
+                // Raw sockets don't support bind
+                return Err(BindError::OperationNotSupported);
+            }
         }
 
         drop(table_entry);
@@ -1232,9 +1268,9 @@ where
                 }
                 server_socket.refill_to_backlog(&mut self.socket_set);
             }
-            ProtocolSpecific::Udp(_) => unimplemented!(),
-            ProtocolSpecific::Icmp(_) => unimplemented!(),
-            ProtocolSpecific::Raw(_) => unimplemented!(),
+            ProtocolSpecific::Udp(_) => return Err(ListenError::InvalidProtocol),
+            ProtocolSpecific::Icmp(_) => return Err(ListenError::InvalidProtocol),
+            ProtocolSpecific::Raw(_) => return Err(ListenError::InvalidProtocol),
         }
 
         if let Some(proxy) = &socket_handle.proxy {
@@ -1326,9 +1362,9 @@ where
                 }
                 Ok(self.new_socket_fd_for(handle))
             }
-            ProtocolSpecific::Udp(_) => unimplemented!(),
-            ProtocolSpecific::Icmp(_) => unimplemented!(),
-            ProtocolSpecific::Raw(_) => unimplemented!(),
+            ProtocolSpecific::Udp(_) => Err(AcceptError::InvalidProtocol),
+            ProtocolSpecific::Icmp(_) => Err(AcceptError::InvalidProtocol),
+            ProtocolSpecific::Raw(_) => Err(AcceptError::InvalidProtocol),
         }
     }
 
@@ -1394,14 +1430,64 @@ where
                         udp::SendError::Unaddressable => SendError::Unaddressable,
                     })
             }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
+            Protocol::Icmp => {
+                // Extract ident from ICMP echo request (bytes 4-5) to rebind if needed.
+                // Linux SOCK_DGRAM ICMP auto-assigns ident on bind; we match by
+                // rebinding to the actual ident used in outgoing packets.
+                if buf.len() >= 6 && buf[0] == 8 {
+                    // Type 8 = Echo Request
+                    let pkt_ident = u16::from_be_bytes([buf[4], buf[5]]);
+                    if pkt_ident != socket_handle.icmp().ident {
+                        socket_handle.icmp_mut().ident = pkt_ident;
+                        // Replace the socket with a new one bound to the correct ident
+                        let old_handle = socket_handle.handle;
+                        let new_socket = icmp::Socket::new(
+                            smoltcp::storage::PacketBuffer::new(
+                                vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
+                                vec![0; SOCKET_BUFFER_SIZE],
+                            ),
+                            smoltcp::storage::PacketBuffer::new(
+                                vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
+                                vec![0; SOCKET_BUFFER_SIZE],
+                            ),
+                        );
+                        *self.socket_set.get_mut::<icmp::Socket>(old_handle) = new_socket;
+                        let icmp_socket: &mut icmp::Socket = self.socket_set.get_mut(old_handle);
+                        let _ = icmp_socket.bind(icmp::Endpoint::Ident(pkt_ident));
+                    }
+                }
+
+                let icmp_socket: &mut icmp::Socket = self.socket_set.get_mut(socket_handle.handle);
+
+                // Bind if not already bound
+                if !icmp_socket.is_open() {
+                    let ident = socket_handle.icmp().ident;
+                    let _ = icmp_socket.bind(icmp::Endpoint::Ident(ident));
+                }
+                let remote_addr = destination
+                    .map(|d| {
+                        let SocketAddr::V4(v4) = d else {
+                            return Err(SendError::UnsupportedAddress);
+                        };
+                        Ok(smoltcp::wire::IpAddress::Ipv4(*v4.ip()))
+                    })
+                    .or_else(|| socket_handle.icmp().remote_addr.map(Ok))
+                    .ok_or(SendError::Unaddressable)??;
+                let send_result = icmp_socket.send_slice(buf, remote_addr);
+                send_result.map(|()| buf.len()).map_err(|e| match e {
+                    icmp::SendError::BufferFull => SendError::BufferFull,
+                    icmp::SendError::Unaddressable => SendError::Unaddressable,
+                })
+            }
+            Protocol::Raw { protocol: _ } => Err(SendError::UnsupportedProtocol),
         };
 
         drop(table_entry);
         drop(descriptor_table);
 
-        self.automated_platform_interaction(PollDirection::Egress);
+        // Force platform interaction for ICMP/Raw since they bypass the proxy channel
+        // and need immediate flushing to the TUN device.
+        self.internal_perform_platform_interaction();
         ret
     }
 
@@ -1419,10 +1505,9 @@ where
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, ReceiveError> {
-        // Note that we do an earlier-than-usual automated interaction to ingress packets since it
-        // doesn't hurt to do this too often (other than wasting energy), and this allows us to
-        // possibly get packets where we might otherwise return with size 0 on the `receive`.
-        self.automated_platform_interaction(PollDirection::Ingress);
+        // Force platform interaction to process incoming TUN packets.
+        // This is always done (even in Manual mode) to ensure ICMP replies are processed.
+        self.internal_perform_platform_interaction();
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
@@ -1494,14 +1579,38 @@ where
                     Err(udp::RecvError::Truncated) => unreachable!(),
                 }
             }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
+            Protocol::Icmp => {
+                let icmp_socket = self
+                    .socket_set
+                    .get_mut::<icmp::Socket>(socket_handle.handle);
+                match icmp_socket.recv() {
+                    Ok((data, remote_addr)) => {
+                        if let Some(source_addr) = source_addr {
+                            match remote_addr {
+                                smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                                    *source_addr = Some(SocketAddr::V4(SocketAddrV4::new(ipv4, 0)));
+                                }
+                            }
+                        }
+                        let length = data.len().min(buf.len());
+                        buf[..length].copy_from_slice(&data[..length]);
+                        if flags.contains(ReceiveFlags::TRUNC) {
+                            Ok(data.len())
+                        } else {
+                            Ok(length)
+                        }
+                    }
+                    Err(icmp::RecvError::Exhausted) => Ok(0),
+                    Err(icmp::RecvError::Truncated) => unreachable!(),
+                }
+            }
+            Protocol::Raw { protocol: _ } => Err(ReceiveError::NotConnected),
         };
 
         drop(table_entry);
         drop(descriptor_table);
 
-        self.automated_platform_interaction(PollDirection::Ingress);
+        self.internal_perform_platform_interaction();
         ret
     }
 

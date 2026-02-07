@@ -134,6 +134,7 @@ impl Lifecycle {
         id: &str,
         bundle: &Path,
         console_socket: Option<&Path>,
+        extra_run_args: &[String],
     ) -> Result<ContainerState> {
         // Validate bundle
         let bundle = bundle
@@ -245,12 +246,13 @@ impl Lifecycle {
                     let _ = fs::remove_file(&sync_path);
 
                     // Execute the container
-                    let err = exec::Command::new(&exe)
-                        .arg("run")
-                        .arg("--bundle")
-                        .arg(&bundle)
-                        .arg(id)
-                        .exec();
+                    let mut cmd = exec::Command::new(&exe);
+                    cmd.arg("run").arg("--bundle").arg(&bundle);
+                    for arg in extra_run_args {
+                        cmd.arg(arg);
+                    }
+                    cmd.arg(id);
+                    let err = cmd.exec();
 
                     eprintln!("child: exec failed: {err}");
                     std::process::exit(1);
@@ -442,7 +444,7 @@ mod tests {
     fn test_create_bundle_not_found() {
         let (_temp, lifecycle) = create_temp_lifecycle();
 
-        let result = lifecycle.create("test-id", Path::new("/nonexistent/bundle"), None);
+        let result = lifecycle.create("test-id", Path::new("/nonexistent/bundle"), None, &[]);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("bundle not found"));
@@ -456,7 +458,7 @@ mod tests {
         let bundle_dir = temp.path().join("bundle");
         fs::create_dir_all(&bundle_dir).unwrap();
 
-        let result = lifecycle.create("test-id", &bundle_dir, None);
+        let result = lifecycle.create("test-id", &bundle_dir, None, &[]);
 
         assert!(result.is_err());
         assert!(
@@ -476,7 +478,7 @@ mod tests {
         let state = ContainerState::new("test-id".to_string(), bundle.clone());
         lifecycle.state_manager.save(&state).unwrap();
 
-        let result = lifecycle.create("test-id", &bundle, None);
+        let result = lifecycle.create("test-id", &bundle, None, &[]);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));

@@ -37,6 +37,7 @@ impl Task {
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
+            self.check_itimer_real();
             self.process_signals(ctx);
             !self.is_exiting()
         })

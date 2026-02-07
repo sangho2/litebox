@@ -28,7 +28,7 @@
 - [x] `--mount` for additional bind mounts
 - [x] `--stdout` and `--stderr` for stdio redirection
 - [x] Cache rewritten binaries for faster subsequent runs
-- [x] TUN-based networking via `--tun-device` flag (TCP/UDP supported, raw sockets not yet)
+- [x] TUN-based networking via `--tun-device` flag (TCP/UDP/ICMP supported)
 - [x] statx syscall implementation
 - [x] statfs/fstatfs syscall implementation
 - [x] Virtual /proc filesystem emulation (cpuinfo, meminfo, mounts, stat, status, etc.)
@@ -70,7 +70,7 @@
 ### Long-term
 - [ ] ARM64 support (requires rtld_audit.so port)
 - [ ] Per-container network isolation (multiple TUN devices or veth pairs)
-- [ ] Raw socket support (SOCK_RAW for ping/ICMP)
+- [x] ICMP raw socket support (SOCK_RAW + IPPROTO_ICMP for ping)
 - [ ] fork() support (see notes below)
 - [ ] seccomp backend improvements
 - [ ] Audit syscall emulation for security gaps
@@ -83,7 +83,7 @@
 2. **Some syscalls unsupported**: lgetxattr, listxattr show warnings but don't break execution
 3. **whoami fails**: Needs proper /etc/passwd and utmp support
 4. **Alpine cleanup segfault**: Sometimes segfaults during cleanup (doesn't affect execution)
-5. **Raw sockets not supported**: ping and other ICMP tools fail (SOCK_RAW not implemented in litebox)
+5. **Generic raw sockets not supported**: Only ICMP raw sockets are implemented; other raw socket protocols return EPROTONOSUPPORT
 6. **Some TCP edge cases**: Certain socket state transitions cause panics in smoltcp stack
 7. **fork() not supported**: Standard shells can't run external commands. Use litebox-sh (see below) or direct exec instead. **Automatic shell rewriting** mitigates this for most container entrypoints. **Pipeline orchestration** handles pipes.
 8. **Background jobs / subshells**: `&` and `$(...)` are not supported (require fork)
@@ -114,7 +114,7 @@ TUN-based networking uses LiteBox's smoltcp TCP/IP stack:
 - Container IP: `10.0.0.2/24` (hardcoded)
 - Gateway: `10.0.0.1` (host TUN interface)
 - Supports: TCP, UDP sockets
-- Not supported: Raw sockets (ICMP/ping)
+- Not supported: Generic raw sockets (non-ICMP)
 
 ### Multi-threading and Process Model
 

@@ -1351,6 +1351,7 @@ impl UnixSocket {
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => Err(Errno::EOPNOTSUPP),
+                IpOption::TTL | IpOption::RECVTTL | IpOption::RETOPTS => Ok(()),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -1399,6 +1400,8 @@ impl UnixSocket {
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                IpOption::TTL => 64,
+                IpOption::RECVTTL | IpOption::RETOPTS => 0,
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`

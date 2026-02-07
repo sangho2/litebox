@@ -382,6 +382,10 @@ impl GlobalState {
         match optname {
             SocketOptionName::IP(ip) => match ip {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                // Accept but ignore - we don't have TTL/option control in smoltcp
+                litebox_common_linux::IpOption::TTL
+                | litebox_common_linux::IpOption::RECVTTL
+                | litebox_common_linux::IpOption::RETOPTS => {}
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -533,6 +537,9 @@ impl GlobalState {
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                litebox_common_linux::IpOption::TTL => 64, // default TTL
+                litebox_common_linux::IpOption::RECVTTL => 0, // not enabled
+                litebox_common_linux::IpOption::RETOPTS => 0, // not enabled
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -692,6 +699,25 @@ impl GlobalState {
     ) -> Result<usize, Errno> {
         let proxy = self.get_proxy(fd)?;
 
+        // ICMP/Raw sockets bypass the proxy channel and go directly through Network::send()
+        if let NetworkProxy::Raw = proxy.as_ref() {
+            let new_flags = convert_flags!(
+                flags,
+                SendFlags,
+                litebox::net::SendFlags,
+                CONFIRM,
+                DONTROUTE,
+                EOR,
+                MORE,
+                OOB,
+            );
+            return self
+                .net
+                .lock()
+                .send(fd, buf, new_flags, sockaddr)
+                .map_err(Errno::from);
+        }
+
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
         // UDP socket implicitly binds it to an ephemeral port before sending).
         // This is mostly lock-free: we only take the network lock if we need to allocate a port.
@@ -805,6 +831,38 @@ impl GlobalState {
         }
 
         let proxy = self.get_proxy(fd)?;
+
+        // ICMP/Raw sockets bypass the proxy channel and go directly through Network::receive().
+        // We retry with polling since the ICMP reply may not have arrived yet.
+        if let NetworkProxy::Raw = proxy.as_ref() {
+            let max_attempts = match timeout {
+                Some(t) => (t.as_millis() / 10).max(1) as u32,
+                None => 1000, // ~10 seconds default
+            };
+            for _ in 0..max_attempts {
+                let result =
+                    self.net
+                        .lock()
+                        .receive(fd, buf, new_flags, source_addr.as_deref_mut());
+                match &result {
+                    Ok(0) => {
+                        // No data yet - spin briefly and retry
+                        for _ in 0..10000 {
+                            core::hint::spin_loop();
+                        }
+                        continue;
+                    }
+                    _ => return result.map_err(Errno::from),
+                }
+            }
+            // Timed out
+            return if is_nonblock {
+                Err(Errno::EAGAIN)
+            } else {
+                Ok(0)
+            };
+        }
+
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
@@ -937,16 +995,27 @@ impl Task {
                         litebox::net::Protocol::Tcp
                     }
                     SockType::Datagram => {
-                        if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
+                        if matches!(protocol, IPProtocol::ICMP) {
+                            litebox::net::Protocol::Icmp
+                        } else if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
                             return Err(Errno::EINVAL);
+                        } else {
+                            litebox::net::Protocol::Udp
                         }
-                        litebox::net::Protocol::Udp
                     }
-                    SockType::Raw => todo!(),
+                    SockType::Raw => match protocol {
+                        IPProtocol::ICMP => litebox::net::Protocol::Icmp,
+                        _ => {
+                            return Err(Errno::EPROTONOSUPPORT);
+                        }
+                    },
                     _ => unimplemented!(),
                 };
+                let is_icmp = matches!(protocol, litebox::net::Protocol::Icmp);
                 let socket = self.global.net.lock().socket(protocol)?;
-                let _ = self.global.initialize_socket(&socket, ty, flags);
+                // For ICMP-over-datagram, use Raw proxy (ICMP bypasses the channel)
+                let effective_ty = if is_icmp { SockType::Raw } else { ty };
+                let _ = self.global.initialize_socket(&socket, effective_ty, flags);
                 Descriptor::LiteBoxRawFd(
                     files
                         .raw_descriptor_store

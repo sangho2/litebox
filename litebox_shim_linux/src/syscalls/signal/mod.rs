@@ -30,8 +30,17 @@ use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
-use litebox_common_linux::{PtRegs, errno::Errno};
+use litebox_common_linux::{ItimerVal, PtRegs, errno::Errno};
 use litebox_platform_multiplex::Platform;
+
+/// State for ITIMER_REAL interval timer.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ITimerRealState {
+    /// Timer interval (for repeating). Zero means one-shot.
+    pub interval: core::time::Duration,
+    /// Next expiration as monotonic duration since boot. None means disarmed.
+    pub next_expiry: Option<core::time::Duration>,
+}
 
 pub(crate) struct SignalState {
     /// Pending thread signals.
@@ -44,6 +53,8 @@ pub(crate) struct SignalState {
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
+    /// ITIMER_REAL state (delivers SIGALRM on expiry).
+    pub(crate) itimer_real: Cell<ITimerRealState>,
 }
 
 impl SignalState {
@@ -64,6 +75,7 @@ impl SignalState {
                 error_code: 0,
                 cr2: 0,
             }),
+            itimer_real: Cell::new(ITimerRealState::default()),
         }
     }
 
@@ -86,6 +98,8 @@ impl SignalState {
             .into(),
             // Preserve last exception
             last_exception: self.last_exception.clone(),
+            // Inherit timer state
+            itimer_real: self.itimer_real.clone(),
         }
     }
 
@@ -521,6 +535,104 @@ impl Task {
         } else {
             log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
             Err(Errno::ESRCH)
+        }
+    }
+
+    /// Handle syscall `setitimer`. Only ITIMER_REAL is supported.
+    pub(crate) fn sys_setitimer(
+        &self,
+        which: litebox_common_linux::IntervalTimer,
+        new_value: ConstPtr<ItimerVal>,
+        old_value: Option<MutPtr<ItimerVal>>,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::{Instant as _, TimeProvider};
+
+        if !matches!(which, litebox_common_linux::IntervalTimer::Real) {
+            return Err(Errno::EINVAL);
+        }
+
+        let old_state = self.signals.itimer_real.get();
+
+        // Write old value if requested
+        if let Some(old_ptr) = old_value {
+            let remaining = match old_state.next_expiry {
+                Some(expiry) => {
+                    let now = self
+                        .global
+                        .platform
+                        .now()
+                        .duration_since(&self.global.boot_time);
+                    expiry.saturating_sub(now)
+                }
+                None => core::time::Duration::ZERO,
+            };
+            let old_itimer = ItimerVal::new(old_state.interval, remaining);
+            old_ptr
+                .write_at_offset(0, old_itimer)
+                .ok_or(Errno::EFAULT)?;
+        }
+
+        // Read new value
+        let new_itimer = new_value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let interval: core::time::Duration = new_itimer.interval().try_into()?;
+        let value: core::time::Duration = new_itimer.value().try_into()?;
+
+        let now = self
+            .global
+            .platform
+            .now()
+            .duration_since(&self.global.boot_time);
+
+        let new_state = if value.is_zero() {
+            // Disarm the timer
+            ITimerRealState {
+                interval: core::time::Duration::ZERO,
+                next_expiry: None,
+            }
+        } else {
+            ITimerRealState {
+                interval,
+                next_expiry: Some(now + value),
+            }
+        };
+
+        self.signals.itimer_real.set(new_state);
+        Ok(0)
+    }
+
+    /// Check ITIMER_REAL and queue SIGALRM if expired.
+    /// Called from `prepare_to_run_guest` before returning to guest code.
+    pub(crate) fn check_itimer_real(&self) {
+        use litebox::platform::{Instant as _, TimeProvider};
+
+        let state = self.signals.itimer_real.get();
+        let Some(expiry) = state.next_expiry else {
+            return;
+        };
+
+        let now = self
+            .global
+            .platform
+            .now()
+            .duration_since(&self.global.boot_time);
+
+        if now >= expiry {
+            // Timer expired — queue SIGALRM
+            self.send_signal(Signal::SIGALRM, siginfo_kill(Signal::SIGALRM));
+
+            // Rearm or disarm
+            let new_state = if state.interval.is_zero() {
+                ITimerRealState {
+                    interval: core::time::Duration::ZERO,
+                    next_expiry: None,
+                }
+            } else {
+                ITimerRealState {
+                    interval: state.interval,
+                    next_expiry: Some(now + state.interval),
+                }
+            };
+            self.signals.itimer_real.set(new_state);
         }
     }
 

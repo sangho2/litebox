@@ -889,6 +889,9 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    TTL = 2,
+    RETOPTS = 7,
+    RECVTTL = 12,
 }
 
 #[repr(u32)]
@@ -1062,6 +1065,26 @@ pub struct ItimerVal {
     interval: TimeVal,
     /// Current value
     value: TimeVal,
+}
+
+impl ItimerVal {
+    /// Create a new `ItimerVal` from interval and value durations.
+    pub fn new(interval: Duration, value: Duration) -> Self {
+        Self {
+            interval: interval.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Returns the timer interval.
+    pub fn interval(&self) -> TimeVal {
+        self.interval
+    }
+
+    /// Returns the current timer value (time until next expiry).
+    pub fn value(&self) -> TimeVal {
+        self.value
+    }
 }
 
 impl TryFrom<TimeVal> for Duration {

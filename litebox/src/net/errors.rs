@@ -49,9 +49,9 @@ pub enum ConnectError {
     InProgress,
     #[error("Socket is in an invalid state")]
     InvalidState,
+    #[error("Unsupported protocol")]
+    UnsupportedProtocol,
 }
-
-/// Possible errors from [`Network::get_local_addr`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum LocalAddrError {
@@ -81,9 +81,9 @@ pub enum BindError {
     PortAlreadyInUse(u16),
     #[error("Already bound to an address")]
     AlreadyBound,
+    #[error("Operation not supported for this socket type")]
+    OperationNotSupported,
 }
-
-/// Possible errors from [`Network::listen`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ListenError {
@@ -95,9 +95,9 @@ pub enum ListenError {
     InvalidState,
     #[error("No available free ephemeral ports")]
     NoAvailableFreeEphemeralPorts,
+    #[error("Protocol does not support listening")]
+    InvalidProtocol,
 }
-
-/// Possible errors from [`Network::accept`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum AcceptError {
@@ -107,9 +107,9 @@ pub enum AcceptError {
     NotListening,
     #[error("No connections ready to be accepted")]
     NoConnectionsReady,
+    #[error("Protocol does not support accept")]
+    InvalidProtocol,
 }
-
-/// Possible errors from [`Network::send`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SendError {
@@ -127,9 +127,11 @@ pub enum SendError {
     UnnecessaryDestinationAddress,
     #[error("destination address required but not provided")]
     DestinationAddressRequired,
+    #[error("unsupported address family")]
+    UnsupportedAddress,
+    #[error("unsupported protocol")]
+    UnsupportedProtocol,
 }
-
-/// Possible errors from [`Network::receive`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReceiveError {
@@ -139,6 +141,8 @@ pub enum ReceiveError {
     SocketInInvalidState,
     #[error("Operation finished")]
     OperationFinished,
+    #[error("Socket is not connected")]
+    NotConnected,
 }
 
 /// Possible errors from [`Network::set_tcp_option`]

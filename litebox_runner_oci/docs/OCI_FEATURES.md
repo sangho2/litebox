@@ -202,9 +202,10 @@ litebox-oci run -b /bundle --tun-device tun99 my-container
 **Supported socket operations:**
 - TCP: `socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`, `close`
 - UDP: `socket`, `bind`, `sendto`/`recvfrom`, `close`
+- ICMP: `socket(SOCK_RAW, IPPROTO_ICMP)`, `connect`, `bind`, `sendto`/`recvfrom`
 
 **Not yet supported:**
-- Raw sockets (SOCK_RAW) - ping won't work
+- Generic raw sockets (`SOCK_RAW` with non-ICMP protocols)
 - Some socket state edge cases
 - `/proc/net/*` files
 

@@ -48,6 +48,15 @@ struct Cli {
     #[clap(long)]
     systemd_cgroup: bool,
 
+    /// TUN device name for container networking (e.g., "tun99").
+    /// Requires a pre-configured TUN device on the host.
+    #[clap(long, value_name = "DEVICE")]
+    tun_device: Option<String>,
+
+    /// Enable lazy rewriting with tar + layered filesystem.
+    #[clap(long)]
+    lazy_rewrite: bool,
+
     #[clap(subcommand)]
     command: Command,
 }
@@ -79,6 +88,15 @@ enum Command {
         /// Don't create new namespaces (accepted, we don't use namespaces)
         #[clap(long)]
         no_new_keyring: bool,
+
+        /// TUN device name for container networking (e.g., "tun99").
+        /// Requires a pre-configured TUN device on the host.
+        #[clap(long, value_name = "DEVICE")]
+        tun_device: Option<String>,
+
+        /// Enable lazy rewriting with tar + layered filesystem.
+        #[clap(long)]
+        lazy_rewrite: bool,
     },
 
     /// Start a created container (OCI lifecycle)
@@ -375,14 +393,36 @@ fn main() -> Result<()> {
             console_socket,
             no_pivot: _,       // Accepted, we never pivot anyway
             no_new_keyring: _, // Accepted, we don't use keyrings
+            tun_device,
+            lazy_rewrite,
         } => {
+            // Merge global and subcommand-level flags (Podman passes via global)
+            let tun_device = cli.tun_device.or(tun_device);
+            let lazy_rewrite = cli.lazy_rewrite || lazy_rewrite;
+
             tracing::info!(
                 container_id = %container_id,
                 bundle = %bundle.display(),
+                tun_device = ?tun_device,
                 "creating container"
             );
 
-            let state = lifecycle.create(&container_id, &bundle, console_socket.as_deref())?;
+            // Collect extra run args to forward to the child process
+            let mut extra_run_args = Vec::new();
+            if let Some(ref dev) = tun_device {
+                extra_run_args.push("--tun-device".to_string());
+                extra_run_args.push(dev.clone());
+            }
+            if lazy_rewrite {
+                extra_run_args.push("--lazy-rewrite".to_string());
+            }
+
+            let state = lifecycle.create(
+                &container_id,
+                &bundle,
+                console_socket.as_deref(),
+                &extra_run_args,
+            )?;
 
             // Write PID file if requested
             if let Some(pid_file) = pid_file

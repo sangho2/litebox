@@ -136,7 +136,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         match self {
             NetworkProxy::Stream(channel) => channel.try_read(buf, flags, source_addr),
             NetworkProxy::Datagram(channel) => channel.try_read(buf, flags, source_addr),
-            NetworkProxy::Raw => unimplemented!(),
+            NetworkProxy::Raw => Err(ReceiveError::SocketInInvalidState),
         }
     }
 
@@ -161,7 +161,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         match self {
             NetworkProxy::Stream(channel) => channel.try_write(buf),
             NetworkProxy::Datagram(channel) => channel.send_to(buf, destination),
-            NetworkProxy::Raw => unimplemented!(),
+            NetworkProxy::Raw => Err(SendError::UnsupportedProtocol),
         }
     }
 }
@@ -178,7 +178,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkP
         match self {
             NetworkProxy::Stream(channel) => channel.check_io_events(),
             NetworkProxy::Datagram(channel) => channel.check_io_events(),
-            NetworkProxy::Raw => unimplemented!(),
+            NetworkProxy::Raw => Events::empty(),
         }
     }
 }

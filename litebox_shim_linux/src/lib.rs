@@ -1216,6 +1216,13 @@ impl Task {
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::SetITimer {
+                which,
+                new_value,
+                old_value,
+            } => self
+                .sys_setitimer(which, new_value, old_value)
+                .map(|_| 0usize),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
