@@ -160,7 +160,7 @@ sudo ctr run --rm --runc-binary /usr/local/bin/litebox-oci \
 - **litebox-sh**: Fork-free minimal shell rewritten in Rust with musl static linking (435KB)
 - **Rootfs-aware symlink resolution**: Handles merged `/usr` layouts (Debian, Ubuntu, Fedora)
 - **chdir support**: `chdir()`/`fchdir()` syscall and `process.cwd` from OCI spec
-- **Multi-distro testing**: Alpine 96%, BusyBox 96%, Debian 100%, Ubuntu 100% — 110/112 tests pass (98%)
+- **Multi-distro testing**: Alpine 100%, BusyBox 96%, Debian 100%, Ubuntu 100% — 111/112 tests pass (99%)
 - **exec command**: Run commands in a container's rootfs
 - **--env / --env-file**: Inject environment variables at runtime
 - **--mount**: Bind mount host directories into container (snapshot)

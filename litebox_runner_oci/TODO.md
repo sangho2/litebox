@@ -42,7 +42,7 @@
 - [x] Shebang rewriting in rootfs: `#!/bin/sh` → `#!/bin/litebox-sh`
 - [x] Shebang entrypoint detection: `./script.sh` → `litebox-sh ./script.sh`
 - [x] litebox-sh rewritten in Rust with musl static linking (435KB)
-- [x] Multi-distro container testing (Alpine, BusyBox, Debian, Ubuntu — 110/112 98% pass)
+- [x] Multi-distro container testing (Alpine, BusyBox, Debian, Ubuntu — 111/112 99% pass)
 - [x] Pipeline orchestration: `echo hello | cat`, `ls / | grep bin` work via sequential re-exec
 - [x] Rootfs-aware symlink resolution for merged `/usr` layouts (Debian, Ubuntu, Fedora)
 

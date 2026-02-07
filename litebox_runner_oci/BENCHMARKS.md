@@ -295,11 +295,11 @@ Results show the combined impact of shell rewriting (Layers 1–3), pipeline orc
 
 | Distro | With Rewriting | Without Rewriting | Improvement |
 |--------|---------------|-------------------|-------------|
-| Alpine 3.x | 25/26 (96%) | 17/26 (65%) | +8 |
+| Alpine 3.x | 26/26 (100%) | 18/26 (69%) | +8 |
 | BusyBox | 25/26 (96%) | 17/26 (65%) | +8 |
 | Debian bookworm-slim | 30/30 (100%) | 15/30 (50%) | +15 |
 | Ubuntu 24.04 | 30/30 (100%) | 15/30 (50%) | +15 |
-| **Total** | **110/112 (98%)** | **64/112 (57%)** | **+46** |
+| **Total** | **111/112 (99%)** | **65/112 (58%)** | **+46** |
 
 ### What Shell Rewriting Fixes
 
@@ -328,18 +328,18 @@ all glibc-linked binaries to load correctly on Debian/Ubuntu images.
 
 | Category | Example | Root Cause |
 |----------|---------|------------|
-| `cd` + external cmd | `sh -c "cd /tmp && ls"` (Alpine) | litebox-sh `cd` then exec; BusyBox `ls` works but Alpine's doesn't in this context |
-| Missing files | `cat /etc/os-release` (BusyBox) | File doesn't exist in minimal BusyBox image |
+| Missing files | `cat /etc/os-release` (BusyBox) | File doesn't exist in minimal BusyBox image (not a LiteBox issue) |
 
 ### Key Insight: Near-Universal Compatibility
 
-- **Alpine**: musl-linked binaries — near-perfect compatibility (96%)
-- **BusyBox**: Statically linked binaries — near-perfect compatibility (96%)
+- **Alpine**: musl-linked binaries — **100% compatibility**
+- **BusyBox**: Statically linked binaries — 96% (1 failure is missing file in image)
 - **Debian**: glibc-linked with merged `/usr` — **100% compatibility** with symlink fix + rewriting
 - **Ubuntu**: glibc-linked with merged `/usr` — **100% compatibility** with symlink fix + rewriting
 
 The combination of shell rewriting, pipeline orchestration, and rootfs-aware symlink
-resolution brings overall compatibility from 57% to **98%** across all tested distros.
+resolution brings overall compatibility from 58% to **99%** across all tested distros.
+The single remaining failure is a missing file in the BusyBox image, not a LiteBox limitation.
 
 ## Version History
 
@@ -347,7 +347,7 @@ resolution brings overall compatibility from 57% to **98%** across all tested di
   - Layer 3: Shebang and script file rewriting
   - Layer 4: Pipeline orchestration (pipes via sequential re-exec)
   - Rootfs-aware symlink resolution (`resolve_in_rootfs`) for merged `/usr` layouts
-  - Multi-distro testing: Alpine, BusyBox, Debian, Ubuntu — 110/112 pass (98%)
+  - Multi-distro testing: Alpine, BusyBox, Debian, Ubuntu — 111/112 pass (99%)
   - Debian: 0% → 100% compatibility (symlink fix enables all glibc binaries)
   - litebox-sh rewritten in Rust with musl static linking (435KB)
 

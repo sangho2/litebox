@@ -143,7 +143,7 @@ LiteBox supports multi-threading but not multi-processing:
 - Pipes: `echo hello | cat` orchestrated as sequential LiteBox processes
 - Disable with `--no-rewrite-shell`
 
-**Container compatibility (with rewriting):** Alpine 96%, BusyBox 96%, Debian 100%, Ubuntu 100% (110/112 tests pass)
+**Container compatibility (with rewriting):** Alpine 100%, BusyBox 96%, Debian 100%, Ubuntu 100% (111/112 tests pass)
 
 ## Virtual /proc Filesystem
 
