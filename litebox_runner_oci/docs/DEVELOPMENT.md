@@ -88,7 +88,7 @@ The `runner.rs` module:
 2. Loads each file into LiteBox's in-memory filesystem
 3. Rewrites syscalls in executable ELF files
 4. Rewrites shebangs in script files (`#!/bin/sh` → `#!/bin/litebox-sh`)
-5. Flattens symlinks (LiteBox doesn't support symlinks)
+5. Resolves symlinks within rootfs context (handles absolute symlink chains)
 6. Injects litebox-sh binary into `/bin/litebox-sh`
 
 ### OCI Lifecycle
@@ -152,13 +152,15 @@ sudo ctr run --rm --runc-binary /usr/local/bin/litebox-oci \
 
 ## Recent Additions
 
-- **Automatic shell rewriting**: 3-layer system rewrites shell entrypoints for fork-free compatibility
+- **Automatic shell rewriting**: 4-layer system rewrites shell entrypoints for fork-free compatibility
   - Layer 1: `sh/bash/dash` → `litebox-sh` substitution
   - Layer 2: `exec` insertion before final external command
   - Layer 3: Script file args + shebang rewriting + entrypoint detection
+  - Layer 4: Pipeline orchestration (pipes via sequential re-exec)
 - **litebox-sh**: Fork-free minimal shell rewritten in Rust with musl static linking (435KB)
+- **Rootfs-aware symlink resolution**: Handles merged `/usr` layouts (Debian, Ubuntu, Fedora)
 - **chdir support**: `chdir()`/`fchdir()` syscall and `process.cwd` from OCI spec
-- **Multi-distro testing**: BusyBox, Debian, Ubuntu — 68/85 tests pass (80%)
+- **Multi-distro testing**: Alpine 96%, BusyBox 96%, Debian 100%, Ubuntu 100% — 110/112 tests pass (98%)
 - **exec command**: Run commands in a container's rootfs
 - **--env / --env-file**: Inject environment variables at runtime
 - **--mount**: Bind mount host directories into container (snapshot)

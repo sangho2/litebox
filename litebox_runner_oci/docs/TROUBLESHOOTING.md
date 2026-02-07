@@ -16,7 +16,7 @@ Common issues and solutions when using litebox-oci.
 - `#!/bin/sh` shebangs rewritten to `#!/bin/litebox-sh`
 - `./script.sh` detected and routed through litebox-sh
 
-If you still see fork errors, the pattern may be beyond litebox-sh's capabilities (e.g., pipes, subshells).
+If you still see fork errors, the pattern may be beyond litebox-sh's capabilities (e.g., subshells, background jobs).
 
 **Disable rewriting:** `--no-rewrite-shell` to use the original shell.
 
@@ -45,18 +45,21 @@ args: ["sh", "/entrypoint.sh"]
 
 # Direct script execution (shebang-based)
 args: ["/entrypoint.sh"]
+
+# Pipes (via pipeline orchestration)
+args: ["sh", "-c", "ls / | grep bin"]
+
+# Multi-stage pipes
+args: ["sh", "-c", "echo hello | cat | wc -c"]
 ```
 
 **What still fails (even with rewriting):**
 ```bash
-# Multiple external commands
-args: ["/bin/sh", "-c", "ls /; cat /etc/passwd"]  # FAILS
-
-# Pipes
-args: ["/bin/sh", "-c", "ls | grep bin"]  # FAILS
-
 # Command substitution
 args: ["/bin/sh", "-c", "echo $(date)"]  # FAILS
+
+# Background jobs
+args: ["/bin/sh", "-c", "sleep 1 &"]  # FAILS
 ```
 
 **Workarounds (if rewriting is insufficient):**

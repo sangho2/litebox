@@ -346,6 +346,8 @@ See [TODO.md](TODO.md) for detailed performance analysis and virtual block devic
 - ✅ `chdir()` syscall and `process.cwd` from OCI spec
 - ✅ Fork-free shell (litebox-sh) for container entrypoint scripts
 - ✅ Automatic shell rewriting for fork-free compatibility (`--no-rewrite-shell` to disable)
+- ✅ Pipeline orchestration (`echo hello | cat` works via sequential re-exec)
+- ✅ Rootfs-aware symlink resolution (merged `/usr` layouts work — Debian, Ubuntu, Fedora)
 
 ### Virtual /proc Filesystem
 
@@ -399,8 +401,8 @@ LiteBox supports **pthreads**, **execve**, and **chdir**, but not **fork()**:
 - ✅ Shell builtins work (`echo`, `cd`, `pwd`, `export`, `test`, etc.)
 - ✅ Shell `exec` works (`sh -c "export FOO=bar && exec /app/server"`)
 - ✅ `process.cwd` from OCI spec sets initial working directory
-- ❌ Shell scripts calling multiple external commands fail (needs fork for non-final commands)
-- ❌ Pipes (`|`), background jobs (`&`), subshells (`$(...)`) not supported
+- ✅ Pipes work via pipeline orchestration (`echo hello | cat`, `ls / | grep bin`)
+- ❌ Background jobs (`&`), subshells (`$(...)`) not supported
 
 **Shell support:** Alpine's `/bin/sh` (ash) works for builtin-only commands and
 single external commands (the last command is exec'd). For more complex scripts,
@@ -421,6 +423,7 @@ By default, LiteBox automatically rewrites shell entrypoints for fork-free compa
 2. **Exec insertion**: `exec` is added before the final external command if not already present
 3. **Script file args**: `sh /entrypoint.sh` → `litebox-sh /entrypoint.sh`
 4. **Shebang rewriting**: `#!/bin/sh` → `#!/bin/litebox-sh` in script files during rootfs loading
+5. **Pipeline orchestration**: `echo hello | cat` runs each pipe stage as a separate LiteBox process
 
 ```bash
 # Original entrypoint:        sh -c "export FOO=bar && /app/server"
@@ -444,10 +447,10 @@ litebox-oci run -b /bundle --no-rewrite-shell my-container
 - ❌ No fork() syscall (pthreads, execve, and chdir work; automatic shell rewriting handles most entrypoint patterns)
 - ❌ No per-container network isolation (all containers share same TUN IP)
 - ❌ No cgroup resource limits
-- ❌ Symlinks flattened to regular files
+- ❌ Symlinks flattened to regular files (but directory symlinks and symlink chains are resolved correctly)
 - ❌ Some syscalls unsupported (lgetxattr, listxattr)
 - ❌ Mounts are read-only snapshots (writes don't persist to host)
-- ⚠️ Debian/Ubuntu direct binary execution may fail (glibc syscall rewriting limitations); shell rewriting mitigates this
+- ⚠️ Background jobs (`&`) and subshells (`$(...)`) not supported
 
 ## Documentation
 

@@ -252,6 +252,59 @@ fn rewrite_shell_shebang(data: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Split a shell script string into pipeline stages at unquoted `|` characters.
+///
+/// Returns `None` if no pipes are found (single command).
+/// Respects single/double quoting and backslash escaping.
+fn split_pipeline(script: &str) -> Option<Vec<String>> {
+    let mut stages = Vec::new();
+    let mut current = String::new();
+    let mut chars = script.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if !in_single => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            '|' if !in_single && !in_double => {
+                // Check for || (logical OR) — not a pipe
+                if chars.peek() == Some(&'|') {
+                    current.push('|');
+                    current.push(chars.next().unwrap());
+                } else {
+                    let trimmed = current.trim().to_string();
+                    if trimmed.is_empty() {
+                        return None; // malformed
+                    }
+                    stages.push(trimmed);
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        stages.push(trimmed);
+    }
+
+    if stages.len() > 1 { Some(stages) } else { None }
+}
+
 /// Cache directory for rewritten binaries (used in eager mode)
 fn cache_dir() -> PathBuf {
     // Use XDG cache dir or fallback to ~/.cache
@@ -271,6 +324,40 @@ fn cache_dir() -> PathBuf {
 fn hash_bytes(data: &[u8]) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     format!("{:016x}_{:08x}", xxh3_64(data), data.len())
+}
+
+/// Resolve a symlink within the rootfs context, handling absolute symlinks
+/// that would otherwise escape the rootfs boundary.
+///
+/// Unlike `canonicalize()`, this resolves absolute symlinks relative to the
+/// rootfs (e.g., `/lib/foo` → `<rootfs>/lib/foo`). Prevents symlink chains
+/// from escaping the rootfs.
+fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathBuf> {
+    if max_depth == 0 {
+        return None; // prevent infinite loops
+    }
+
+    let metadata = path.symlink_metadata().ok()?;
+    if !metadata.file_type().is_symlink() {
+        // Not a symlink — return as-is if it exists
+        return if path.exists() {
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
+    }
+
+    let link_target = std::fs::read_link(path).ok()?;
+    let resolved = if link_target.is_absolute() {
+        // Absolute symlink: resolve within rootfs
+        rootfs.join(link_target.strip_prefix("/").unwrap_or(&link_target))
+    } else {
+        // Relative symlink
+        path.parent()?.join(&link_target)
+    };
+
+    // Recursively resolve if it's another symlink
+    resolve_in_rootfs(&resolved, rootfs, max_depth - 1)
 }
 
 /// Try to load a rewritten binary from cache
@@ -573,6 +660,8 @@ pub struct Mount {
 /// Stdio redirection configuration.
 #[derive(Debug, Clone, Default)]
 pub struct StdioRedirect {
+    /// Path to redirect stdin from
+    pub stdin: Option<PathBuf>,
     /// Path to redirect stdout to
     pub stdout: Option<PathBuf>,
     /// Path to redirect stderr to
@@ -826,6 +915,140 @@ impl litebox::fs::layered::ExecutableTransform for SyscallRewriter {
     }
 }
 
+/// Execute a shell pipeline sequentially, connecting stages via temp files.
+///
+/// Each stage runs as a separate process (via re-exec of litebox_runner_oci)
+/// because the LiteBox platform can only be initialized once per process.
+/// Stage N's stdout is captured to a temp file, which becomes stage N+1's stdin.
+fn run_pipeline(
+    stages: &[String],
+    bundle_path: &Path,
+    original_args: &[String],
+    extra_env: &[String],
+    _mounts: &[Mount],
+    _network: &NetworkConfig,
+    _lazy_mode: LazyMode,
+) -> Result<i32> {
+    use std::fs;
+
+    let temp_dir = std::env::temp_dir();
+    let pipe_id = std::process::id();
+    let mut prev_file: Option<PathBuf> = None;
+    let mut temp_files: Vec<PathBuf> = Vec::new();
+    let mut last_exit_code = 0;
+
+    // Get our own executable path for re-exec
+    let self_exe = std::env::current_exe().context("failed to get current executable path")?;
+
+    for (i, stage) in stages.iter().enumerate() {
+        let is_last = i == stages.len() - 1;
+
+        // Build the -c script for this stage, adding exec for final command
+        let stage_script = if let Some(rewritten) = add_exec_to_final_command(stage) {
+            rewritten
+        } else {
+            stage.clone()
+        };
+
+        tracing::info!(
+            stage = i + 1,
+            total = stages.len(),
+            cmd = %stage,
+            "executing pipeline stage"
+        );
+
+        // Build command: litebox_runner_oci run --bundle <path> <container-id>
+        // with overridden args via config.json rewrite
+        let container_id = format!("pipe-{}-{}", pipe_id, i);
+
+        // Write a temporary config.json with this stage's args
+        let stage_config_dir = temp_dir.join(format!(".litebox_pipe_cfg_{}_{}", pipe_id, i));
+        fs::create_dir_all(&stage_config_dir)?;
+
+        // Read original config and override args
+        let spec_path = bundle_path.join("config.json");
+        let mut spec: serde_json::Value = serde_json::from_reader(
+            fs::File::open(&spec_path).context("failed to open config.json")?,
+        )?;
+
+        // Override process.args to run this stage
+        let stage_args = serde_json::json!([
+            original_args[0], // /bin/litebox-sh
+            "-c",
+            stage_script
+        ]);
+        spec["process"]["args"] = stage_args;
+
+        // Point root.path to the original rootfs using absolute path
+        let rootfs_src = bundle_path.join(spec["root"]["path"].as_str().unwrap_or("rootfs"));
+        let rootfs_abs = rootfs_src.canonicalize().unwrap_or(rootfs_src);
+        spec["root"]["path"] = serde_json::json!(rootfs_abs.to_str().unwrap_or("rootfs"));
+
+        fs::write(
+            stage_config_dir.join("config.json"),
+            serde_json::to_string_pretty(&spec)?,
+        )?;
+        temp_files.push(stage_config_dir.clone());
+
+        // Set up output temp file for non-last stages
+        let output_file = if !is_last {
+            let path = temp_dir.join(format!(".litebox_pipe_{}_{}", pipe_id, i));
+            temp_files.push(path.clone());
+            Some(path)
+        } else {
+            None
+        };
+
+        // Build the command
+        let mut cmd = std::process::Command::new(&self_exe);
+        cmd.arg("run")
+            .arg("--bundle")
+            .arg(&stage_config_dir)
+            .arg(&container_id);
+
+        // Add extra env
+        for env_var in extra_env {
+            cmd.arg("--env").arg(env_var);
+        }
+
+        // Set up stdin from previous stage
+        if let Some(ref prev) = prev_file {
+            let stdin_file =
+                fs::File::open(prev).context("failed to open pipe input from previous stage")?;
+            cmd.stdin(std::process::Stdio::from(stdin_file));
+        }
+
+        // Set up stdout to temp file for non-last stages
+        if let Some(ref out_path) = output_file {
+            let stdout_file =
+                fs::File::create(out_path).context("failed to create pipe output file")?;
+            cmd.stdout(std::process::Stdio::from(stdout_file));
+        }
+
+        // Suppress stderr for pipeline stages (audit/debug noise)
+        cmd.stderr(std::process::Stdio::null());
+
+        // Run the stage
+        let status = cmd
+            .status()
+            .with_context(|| format!("failed to execute pipeline stage {}", i + 1))?;
+        last_exit_code = status.code().unwrap_or(1);
+
+        prev_file = output_file;
+    }
+
+    // Clean up temp files and directories
+    for path in temp_files.iter().rev() {
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    Ok(last_exit_code)
+}
+
 /// Internal implementation that handles both regular run and exec.
 #[allow(clippy::too_many_arguments)]
 fn run_container_internal(
@@ -839,6 +1062,11 @@ fn run_container_internal(
     rewrite_shell: bool,
 ) -> Result<i32> {
     // Set up stdio redirection before running
+    let _stdin_guard = if let Some(path) = &stdio.stdin {
+        Some(redirect_stdin(path)?)
+    } else {
+        None
+    };
     let _stdout_guard = if let Some(path) = &stdio.stdout {
         Some(redirect_stdout(path)?)
     } else {
@@ -905,6 +1133,26 @@ fn run_container_internal(
     } else {
         args
     };
+
+    // Detect pipeline patterns in -c script strings and execute sequentially
+    if rewrite_shell && args.len() >= 3 && args[1] == "-c" {
+        if let Some(stages) = split_pipeline(&args[2]) {
+            tracing::info!(
+                stages = stages.len(),
+                pipeline = %args[2],
+                "detected pipeline, executing stages sequentially"
+            );
+            return run_pipeline(
+                &stages,
+                bundle_path,
+                &args,
+                extra_env,
+                mounts,
+                network,
+                lazy_mode,
+            );
+        }
+    }
 
     tracing::info!(
         rootfs = %rootfs_path.display(),
@@ -1276,95 +1524,83 @@ fn run_container_internal(
                         file_mode,
                     );
                 } else if entry.file_type().is_symlink() {
-                    // Resolve symlink and copy the target file
-                    // LiteBox doesn't support symlinks, so we flatten them to regular files
-                    if let Ok(link_target) = std::fs::read_link(entry.path()) {
-                        // Build the full path and canonicalize to resolve .. and other relative components
-                        let full_path = if link_target.is_absolute() {
-                            effective_rootfs
-                                .join(link_target.strip_prefix("/").unwrap_or(&link_target))
-                        } else {
-                            entry
+                    // Resolve symlink within rootfs context
+                    // Uses rootfs-aware resolution to handle absolute symlinks correctly
+                    let Some(resolved) = resolve_in_rootfs(entry.path(), &effective_rootfs, 10)
+                    else {
+                        continue; // Skip broken symlinks
+                    };
+
+                    // Ensure the resolved path is still within rootfs
+                    if !resolved.starts_with(&effective_rootfs) {
+                        tracing::warn!(
+                            symlink = %target_str,
+                            target = %resolved.display(),
+                            "symlink target outside rootfs, skipping"
+                        );
+                        continue;
+                    }
+
+                    if resolved.is_file() {
+                        load_file_from_host(
+                            &mut in_mem,
+                            &resolved,
+                            target_str,
+                            exec_mode,
+                            file_mode,
+                        );
+                    } else if resolved.is_dir() {
+                        // Symlink to directory - create the directory AND copy all files
+                        // from target dir to both locations (e.g., /lib64 -> /usr/lib64)
+                        in_mem.with_root_privileges(|fs| {
+                            let _ = fs.mkdir(target_str, exec_mode);
+                        });
+
+                        // Walk the target directory and add files at symlink paths
+                        // This handles cases like /lib64/ld-linux-x86-64.so.2
+                        for sub_entry in WalkDir::new(&resolved)
+                            .follow_links(false)
+                            .into_iter()
+                            .filter_map(std::result::Result::ok)
+                        {
+                            let sub_rel = sub_entry
                                 .path()
-                                .parent()
-                                .unwrap_or(entry.path())
-                                .join(&link_target)
-                        };
+                                .strip_prefix(&resolved)
+                                .unwrap_or(sub_entry.path());
+                            if sub_rel == Path::new("") {
+                                continue;
+                            }
 
-                        // Canonicalize to resolve all symlinks and relative paths
-                        let Ok(resolved) = full_path.canonicalize() else {
-                            continue; // Skip broken symlinks
-                        };
+                            let symlink_target = Path::new(target_str).join(sub_rel);
+                            let symlink_target_str = symlink_target.to_str().unwrap_or("/");
 
-                        // Ensure the resolved path is still within rootfs
-                        if !resolved.starts_with(&effective_rootfs) {
-                            tracing::warn!(
-                                symlink = %target_str,
-                                target = %resolved.display(),
-                                "symlink target outside rootfs, skipping"
-                            );
-                            continue;
-                        }
-
-                        if resolved.is_file() {
-                            load_file_from_host(
-                                &mut in_mem,
-                                &resolved,
-                                target_str,
-                                exec_mode,
-                                file_mode,
-                            );
-                        } else if resolved.is_dir() {
-                            // Symlink to directory - create the directory AND copy all files
-                            // from target dir to both locations (e.g., /lib64 -> /usr/lib64)
-                            in_mem.with_root_privileges(|fs| {
-                                let _ = fs.mkdir(target_str, exec_mode);
-                            });
-
-                            // Walk the target directory and add files at symlink paths
-                            // This handles cases like /lib64/ld-linux-x86-64.so.2
-                            for sub_entry in WalkDir::new(&resolved)
-                                .follow_links(false)
-                                .into_iter()
-                                .filter_map(std::result::Result::ok)
-                            {
-                                let sub_rel = sub_entry
-                                    .path()
-                                    .strip_prefix(&resolved)
-                                    .unwrap_or(sub_entry.path());
-                                if sub_rel == Path::new("") {
-                                    continue;
-                                }
-
-                                let symlink_target = Path::new(target_str).join(sub_rel);
-                                let symlink_target_str = symlink_target.to_str().unwrap_or("/");
-
-                                if sub_entry.file_type().is_dir() {
-                                    in_mem.with_root_privileges(|fs| {
-                                        let _ = fs.mkdir(symlink_target_str, exec_mode);
-                                    });
-                                } else if sub_entry.file_type().is_file() {
-                                    load_file_from_host(
-                                        &mut in_mem,
-                                        sub_entry.path(),
-                                        symlink_target_str,
-                                        exec_mode,
-                                        file_mode,
-                                    );
-                                } else if sub_entry.file_type().is_symlink() {
-                                    // Resolve nested symlink
-                                    if let Ok(nested_target) = sub_entry.path().canonicalize() {
-                                        if nested_target.is_file()
-                                            && nested_target.starts_with(&effective_rootfs)
-                                        {
-                                            load_file_from_host(
-                                                &mut in_mem,
-                                                &nested_target,
-                                                symlink_target_str,
-                                                exec_mode,
-                                                file_mode,
-                                            );
-                                        }
+                            if sub_entry.file_type().is_dir() {
+                                in_mem.with_root_privileges(|fs| {
+                                    let _ = fs.mkdir(symlink_target_str, exec_mode);
+                                });
+                            } else if sub_entry.file_type().is_file() {
+                                load_file_from_host(
+                                    &mut in_mem,
+                                    sub_entry.path(),
+                                    symlink_target_str,
+                                    exec_mode,
+                                    file_mode,
+                                );
+                            } else if sub_entry.file_type().is_symlink() {
+                                // Resolve nested symlink within rootfs
+                                if let Some(nested_target) =
+                                    resolve_in_rootfs(sub_entry.path(), &effective_rootfs, 10)
+                                {
+                                    if nested_target.is_file()
+                                        && nested_target.starts_with(&effective_rootfs)
+                                    {
+                                        load_file_from_host(
+                                            &mut in_mem,
+                                            &nested_target,
+                                            symlink_target_str,
+                                            exec_mode,
+                                            file_mode,
+                                        );
                                     }
                                 }
                             }
@@ -1663,6 +1899,20 @@ impl Drop for StderrGuard {
     }
 }
 
+/// RAII guard for restoring stdin after redirection.
+struct StdinGuard {
+    original_fd: i32,
+}
+
+impl Drop for StdinGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.original_fd, libc::STDIN_FILENO);
+            libc::close(self.original_fd);
+        }
+    }
+}
+
 /// Redirect stdout to a file, returning a guard that restores it on drop.
 fn redirect_stdout(path: &Path) -> Result<StdoutGuard> {
     use std::fs::OpenOptions;
@@ -1715,6 +1965,32 @@ fn redirect_stderr(path: &Path) -> Result<StderrGuard> {
     }
 
     Ok(StderrGuard { original_fd })
+}
+
+/// Redirect stdin from a file, returning a guard that restores it on drop.
+fn redirect_stdin(path: &Path) -> Result<StdinGuard> {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("failed to open stdin file: {}", path.display()))?;
+
+    // Safety: dup/dup2 are standard POSIX calls, single-threaded at this point
+    let original_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+    if original_fd < 0 {
+        anyhow::bail!("failed to dup stdin");
+    }
+
+    unsafe {
+        if libc::dup2(file.as_raw_fd(), libc::STDIN_FILENO) < 0 {
+            libc::close(original_fd);
+            anyhow::bail!("failed to redirect stdin");
+        }
+    }
+
+    Ok(StdinGuard { original_fd })
 }
 
 #[cfg(test)]
@@ -1984,5 +2260,59 @@ mod tests {
     #[test]
     fn test_shebang_no_rewrite_empty() {
         assert!(rewrite_shell_shebang(b"").is_none());
+    }
+
+    // ── Pipeline parsing ──
+
+    #[test]
+    fn test_split_pipeline_simple() {
+        let stages = split_pipeline("echo hello | cat").unwrap();
+        assert_eq!(stages, vec!["echo hello", "cat"]);
+    }
+
+    #[test]
+    fn test_split_pipeline_three_stages() {
+        let stages = split_pipeline("ls / | grep bin | head -n 5").unwrap();
+        assert_eq!(stages, vec!["ls /", "grep bin", "head -n 5"]);
+    }
+
+    #[test]
+    fn test_split_pipeline_no_pipe() {
+        assert!(split_pipeline("echo hello && echo world").is_none());
+    }
+
+    #[test]
+    fn test_split_pipeline_or_not_pipe() {
+        // || is logical OR, not a pipe
+        assert!(split_pipeline("echo hello || echo fallback").is_none());
+    }
+
+    #[test]
+    fn test_split_pipeline_pipe_in_single_quotes() {
+        // Pipe inside quotes is literal
+        assert!(split_pipeline("echo 'hello | world'").is_none());
+    }
+
+    #[test]
+    fn test_split_pipeline_pipe_in_double_quotes() {
+        assert!(split_pipeline("echo \"hello | world\"").is_none());
+    }
+
+    #[test]
+    fn test_split_pipeline_mixed_pipe_and_chain() {
+        let stages = split_pipeline("echo hello | grep hello && echo done").unwrap();
+        assert_eq!(stages, vec!["echo hello", "grep hello && echo done"]);
+    }
+
+    #[test]
+    fn test_split_pipeline_escaped_pipe() {
+        // Backslash-escaped pipe is literal
+        assert!(split_pipeline("echo hello \\| world").is_none());
+    }
+
+    #[test]
+    fn test_split_pipeline_with_redirects() {
+        let stages = split_pipeline("cat /etc/os-release | grep -i name").unwrap();
+        assert_eq!(stages, vec!["cat /etc/os-release", "grep -i name"]);
     }
 }

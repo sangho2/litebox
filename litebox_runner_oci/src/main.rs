@@ -557,6 +557,7 @@ fn main() -> Result<()> {
 
             // Set up stdio redirection if requested
             let stdio = litebox_runner_oci::StdioRedirect {
+                stdin: None,
                 stdout: stdout.clone(),
                 stderr: stderr.clone(),
             };

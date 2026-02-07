@@ -139,7 +139,8 @@ Core execution logic:
         │
         ├──▶ Layer 1: sh/bash/dash → litebox-sh
         ├──▶ Layer 2: Add exec before final external command
-        └──▶ Layer 3: sh /script.sh → litebox-sh /script.sh
+        ├──▶ Layer 3: sh /script.sh → litebox-sh /script.sh
+        └──▶ Layer 4: Pipeline detection (pipes → sequential re-exec)
         │
         ▼
 3. Initialize LiteBox platform
@@ -156,8 +157,8 @@ Core execution logic:
         │
         ├──▶ Script file: rewrite shebang (#!/bin/sh → #!/bin/litebox-sh)
         │
-        └──▶ Symlink: resolve and copy target
-                │
+        └──▶ Symlink: resolve within rootfs context and copy target
+                │    (handles absolute symlink chains in merged /usr)
                 ▼
 6. Inject litebox-sh into /bin/litebox-sh
         │
@@ -177,7 +178,7 @@ Core execution logic:
 ## Shell Rewriting
 
 LiteBox automatically rewrites shell entrypoints for fork-free compatibility.
-This is a 3-layer system applied during container setup:
+This is a 4-layer system applied during container setup:
 
 ```
                     OCI config.json args
@@ -199,6 +200,12 @@ This is a 3-layer system applied during container setup:
               │  Layer 3: Script File  │
               │  sh /script.sh         │──▶ litebox-sh /script.sh
               └────────────────────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Layer 4: Pipes        │
+              │  cmd1 | cmd2 | cmd3    │──▶ sequential re-exec
+              └────────────────────────┘
 
   During rootfs loading:
   ┌───────────────────────────────┐
@@ -216,6 +223,12 @@ This is a 3-layer system applied during container setup:
 
 litebox-sh is a Rust binary statically linked with musl (~435KB), embedded
 via `include_bytes!` and injected into `/bin/litebox-sh` in the rootfs.
+
+Pipeline orchestration (Layer 4) detects pipes in `-c` strings and runs each
+stage as a separate LiteBox process via `std::process::Command` re-exec.
+Stages are connected via temp files (stdout → file → stdin). Each stage gets
+its own LiteBox instance, solving the set_platform once-only constraint.
+
 Disable all rewriting with `--no-rewrite-shell`.
 
 ## Syscall Interception
@@ -292,7 +305,7 @@ Key compatibility requirements:
 | Syscall interception | ptrace/KVM | Syscall rewriting |
 | Filesystem | Gofer (9P) | In-memory |
 | Network | Netstack | smoltcp (TUN-based) |
-| Shell support | Native (has fork) | litebox-sh + auto-rewriting |
+| Shell support | Native (has fork) | litebox-sh + auto-rewriting + pipes |
 | Platform | Sentry kernel | LiteBox shim |
 | OCI compliance | Full | Basic lifecycle |
 
@@ -303,5 +316,5 @@ Key compatibility requirements:
 3. **No seccomp filters**: Uses rewriter instead
 4. **No user namespaces**: Runs as invoking user
 5. **x86_64 only**: rtld_audit.so is architecture-specific
-6. **No symlinks**: Flattened during rootfs loading
-7. **No fork()**: Mitigated by automatic shell rewriting (litebox-sh)
+6. **No symlinks**: Flattened during rootfs loading (directory symlinks resolved within rootfs context)
+7. **No fork()**: Mitigated by automatic shell rewriting (litebox-sh) and pipeline orchestration

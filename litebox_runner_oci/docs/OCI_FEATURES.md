@@ -126,9 +126,13 @@ LiteBox supports multi-threading but not multi-processing:
 - Programs using execve to run other programs
 
 **What doesn't work:**
-- Pipes (`|`) — requires `fork()`
 - Subshells (`$(...)`) — requires `fork()`
+- Background jobs (`&`) — requires `fork()`
 - Daemon-style process spawning
+
+**What works (via pipeline orchestration):**
+- Pipes (`|`) — `echo hello | cat`, `ls / | grep bin`, `echo a | cat | cat`
+- Each pipe stage runs as a separate LiteBox process via re-exec
 
 **Automatic shell rewriting** (enabled by default) handles most entrypoint patterns transparently:
 - `sh -c "..."` → `litebox-sh -c "..."` (litebox-sh uses execve, not fork)
@@ -136,9 +140,10 @@ LiteBox supports multi-threading but not multi-processing:
 - `sh /script.sh` → `litebox-sh /script.sh`
 - `#!/bin/sh` shebangs rewritten to `#!/bin/litebox-sh` in rootfs
 - Direct `./script.sh` execution detected and routed through litebox-sh
+- Pipes: `echo hello | cat` orchestrated as sequential LiteBox processes
 - Disable with `--no-rewrite-shell`
 
-**Container compatibility (with rewriting):** BusyBox 92%, Debian 59%, Ubuntu 91% (68/85 tests pass)
+**Container compatibility (with rewriting):** Alpine 96%, BusyBox 96%, Debian 100%, Ubuntu 100% (110/112 tests pass)
 
 ## Virtual /proc Filesystem
 

@@ -101,7 +101,9 @@ test N1 -ge N2  # integer greater or equal
 
 ## Limitations
 
-- **No pipes** (`|`) — requires `fork()` to create concurrent processes
+- **No pipes** (`|`) — litebox-sh itself doesn't support pipes, but the OCI runner's
+  **pipeline orchestration** (Layer 4) handles pipes by running each stage as a separate
+  LiteBox process. So `sh -c "ls / | grep bin"` works when run through the OCI runner.
 - **No background jobs** (`&`) — requires `fork()`
 - **No subshells** (`$(...)`, `` `...` ``) — requires `fork()`
 - **External commands replace the shell** — after `execve()`, the shell process is gone.

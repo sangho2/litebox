@@ -42,7 +42,9 @@
 - [x] Shebang rewriting in rootfs: `#!/bin/sh` → `#!/bin/litebox-sh`
 - [x] Shebang entrypoint detection: `./script.sh` → `litebox-sh ./script.sh`
 - [x] litebox-sh rewritten in Rust with musl static linking (435KB)
-- [x] Multi-distro container testing (BusyBox, Debian, Ubuntu — 68/85 80% pass)
+- [x] Multi-distro container testing (Alpine, BusyBox, Debian, Ubuntu — 110/112 98% pass)
+- [x] Pipeline orchestration: `echo hello | cat`, `ls / | grep bin` work via sequential re-exec
+- [x] Rootfs-aware symlink resolution for merged `/usr` layouts (Debian, Ubuntu, Fedora)
 
 ## TODO
 
@@ -82,7 +84,8 @@
 4. **Alpine cleanup segfault**: Sometimes segfaults during cleanup (doesn't affect execution)
 5. **Raw sockets not supported**: ping and other ICMP tools fail (SOCK_RAW not implemented in litebox)
 6. **Some TCP edge cases**: Certain socket state transitions cause panics in smoltcp stack
-7. **fork() not supported**: Standard shells can't run external commands. Use litebox-sh (see below) or direct exec instead. **Automatic shell rewriting** mitigates this for most container entrypoints.
+7. **fork() not supported**: Standard shells can't run external commands. Use litebox-sh (see below) or direct exec instead. **Automatic shell rewriting** mitigates this for most container entrypoints. **Pipeline orchestration** handles pipes.
+8. **Background jobs / subshells**: `&` and `$(...)` are not supported (require fork)
 
 ## Notes
 
@@ -135,6 +138,7 @@ LiteBox supports **pthreads** (multi-threading) and **execve**, but not **fork()
 - `sh /script.sh` → `litebox-sh /script.sh` (Layer 3)
 - `#!/bin/sh` → `#!/bin/litebox-sh` in script files (Layer 3)
 - Direct `./script.sh` execution detected and routed through litebox-sh
+- Pipes: `echo hello | cat` run as separate LiteBox processes (Layer 4)
 
 Disable with `--no-rewrite-shell`. Or manually use **litebox-sh**, a fork-free minimal shell included in `litebox_runner_oci/tools/litebox-sh/`:
 ```json
