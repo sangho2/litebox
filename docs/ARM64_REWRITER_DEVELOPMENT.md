@@ -74,6 +74,16 @@ Add ARM64 (aarch64) support to LiteBox using a syscall rewriter backend that:
 - Fixed rtld_audit `do_syscall` to use the per-thread TLS table instead of the old single-slot layout
 - Node.js (with 12+ shared libraries) now runs successfully inside the sandbox
 
+### Phase 7: ARM64 Signal Delivery (In Progress)
+- Ported x86 C test files to ARM64: `efault.c`, `execve.c`, `hello.c`, `signal.c`, `thread.c`, `thread_exit.c`, `unix.c`
+- Removed `passing_tests` filter from test runner — all C tests now run
+- Added `clear_guest_thread_local_storage()` for aarch64
+- Fixed ARM64 signal delivery without `SA_RESTORER`:
+  - Added sigreturn trampoline at trampoline header offset 24
+  - Added `get_sigreturn_trampoline_address()` to platform trait
+  - Modified `write_signal_frame()` to use platform sigreturn trampoline when `SA_RESTORER` is not set
+- **Status**: Signal handler IS called correctly, but `uc_mcontext.pc` modification by the handler is not picked up by `sys_rt_sigreturn` — causes infinite loop (Bug 25, OPEN)
+
 ---
 
 ## Technical Architecture
@@ -87,6 +97,10 @@ Trampoline Section (mapped at high address, e.g., 0x8f7000):
 │ ├── Offset 0-7:   "LITEBOX0" magic                         │
 │ ├── Offset 8-15:  Handler address (syscall_callback)       │
 │ └── Offset 16-23: Pointer to per-thread host TLS table     │
+├─────────────────────────────────────────────────────────────┤
+│ Sigreturn Trampoline (~64 bytes, offset 24)                 │
+│   Sets x8=139 (__NR_rt_sigreturn), looks up host TLS,      │
+│   jumps to syscall handler                                  │
 ├─────────────────────────────────────────────────────────────┤
 │ Entry 0 (for first SVC/MSR, ~32-64 bytes)                  │
 ├─────────────────────────────────────────────────────────────┤
@@ -686,7 +700,7 @@ Changed the design so the **trampoline** reserves stack space, not `switch_to_gu
 litebox_syscall_rewriter_arm64/
 ├── Cargo.toml           # Dependencies: yaxpeax-arm, object, thiserror
 ├── src/
-│   └── lib.rs           # ~1830 lines: decoder, encoder, SVC/MSR trampoline generator
+│   └── lib.rs           # ~1926 lines: decoder, encoder, SVC/MSR/sigreturn trampoline generator
 └── tests/
     ├── hello-arm64      # Test binary
     ├── snapshots/       # Insta snapshots
@@ -708,6 +722,7 @@ litebox_rtld_audit_arm64/
 | `generate_trampoline_indirect()` | Creates SVC trampoline for far branches |
 | `generate_msr_trampoline_direct()` | Creates MSR TPIDR_EL0 trampoline for near branches |
 | `generate_msr_trampoline_indirect()` | Creates MSR TPIDR_EL0 trampoline for far branches |
+| `generate_sigreturn_trampoline()` | Creates sigreturn trampoline at header offset 24 |
 | `is_msr_tpidr_el0()` | Detects MSR TPIDR_EL0 instructions |
 | `msr_tpidr_el0_source_reg()` | Extracts source register from MSR encoding |
 
@@ -744,10 +759,13 @@ litebox_rtld_audit_arm64/
 
 | File | Changes |
 |------|---------|
-| `litebox_platform_linux_userland/src/lib.rs` | `switch_to_guest` with per-thread TLS table update; `syscall_callback` loads saved regs from stack; signal handler with alt-stack TLS recovery; `update_host_tls_table()` for thread registration |
+| `litebox_platform_linux_userland/src/lib.rs` | `switch_to_guest` with per-thread TLS table update; `syscall_callback` loads saved regs from stack; signal handler with alt-stack TLS recovery; `update_host_tls_table()` for thread registration; `get_sigreturn_trampoline_address()` |
 | `litebox_shim_linux/src/lib.rs` | ARM64 syscall return value (ctx.regs[0]) |
 | `litebox_shim_linux/src/syscalls/process.rs` | ARM64 SETTLS for clone/new threads |
+| `litebox_shim_linux/src/syscalls/signal/mod.rs` | `deliver_signal()` and `process_signals()` with sigreturn trampoline support |
+| `litebox_shim_linux/src/syscalls/signal/aarch64.rs` | `write_signal_frame()` with platform sigreturn trampoline fallback |
 | `litebox_common_linux/src/loader.rs` | Trampoline section loading and mapping |
+| `litebox/src/platform/mod.rs` | `SystemInfoProvider` trait with `get_sigreturn_trampoline_address()` |
 | `litebox_rtld_audit_arm64/rtld_audit_arm64.c` | `do_syscall` with per-thread TLS table lookup; shared library trampoline patching with table pointer propagation |
 
 ---
@@ -792,18 +810,81 @@ litebox_rtld_audit_arm64/
 - Must intercept these instructions to keep the host TLS table synchronized
 - The MSR may execute before the platform registers the thread — sentinel checks prevent infinite loops
 
+### Bug 24: ARM64 Signal Delivery Without SA_RESTORER (PARTIALLY FIXED)
+
+**Symptoms**: The `signal.c` test immediately crashed with `Fatal signal` — the shim's `write_signal_frame()` returned `Err(DeliverFault)` and the process was killed.
+
+**Root Cause**: On ARM64, glibc does NOT set `SA_RESTORER` when calling `sigaction()`. On x86_64, glibc always sets `SA_RESTORER` with a `__restore_rt` trampoline. On ARM64, the kernel handles sigreturn via the vDSO.
+
+The shim's `write_signal_frame()` checked `if !action.flags.contains(SaFlags::RESTORER) { return Err(DeliverFault); }`. Since `SA_RESTORER` was never set on ARM64, signal delivery always failed.
+
+**Solution (3 parts)**:
+
+1. **Sigreturn Trampoline in Rewriter** (`litebox_syscall_rewriter_arm64/src/lib.rs`):
+   - Added `generate_sigreturn_trampoline()` that emits code at offset 24 in the trampoline header
+   - Sets `x8 = 139` (__NR_rt_sigreturn), looks up host TLS from per-thread table, jumps to handler
+
+2. **Platform Trait Extension** (`litebox/src/platform/mod.rs`, `litebox_platform_linux_userland/src/lib.rs`):
+   - Added `get_sigreturn_trampoline_address()` to `SystemInfoProvider` trait
+   - Returns `Some(trampoline_base + 24)` in rewriter mode, `None` otherwise
+
+3. **ARM64 Signal Delivery** (`litebox_shim_linux/src/syscalls/signal/aarch64.rs`, `mod.rs`, `x86_64.rs`, `x86.rs`):
+   - Modified `write_signal_frame()` to use platform sigreturn trampoline when `SA_RESTORER` is not set
+   - Also populated `fault_address` in Sigcontext from `last_exception.far`
+
+**Current status**: Signal delivery now works — the guest handler IS called and prints correct info. However, the handler's modification of `uc_mcontext.pc` is not picked up by `sys_rt_sigreturn`, causing an infinite loop (see Bug 25).
+
+**Files**:
+- `litebox_syscall_rewriter_arm64/src/lib.rs` — `generate_sigreturn_trampoline()`
+- `litebox/src/platform/mod.rs` — `get_sigreturn_trampoline_address()` trait method
+- `litebox_platform_linux_userland/src/lib.rs` — trait implementation
+- `litebox_shim_linux/src/syscalls/signal/aarch64.rs` — `write_signal_frame()` rewrite
+- `litebox_shim_linux/src/syscalls/signal/mod.rs` — `deliver_signal()` / `process_signals()` updates
+- `litebox_shim_linux/src/syscalls/signal/x86_64.rs` — signature update (unused param)
+- `litebox_shim_linux/src/syscalls/signal/x86.rs` — signature update (unused param)
+
+---
+
+### Bug 25: Signal Handler PC Modification Not Restored by sys_rt_sigreturn (OPEN)
+
+**Symptoms**: The `signal.c` test enters an infinite loop. The SIGSEGV handler correctly fires, prints "Caught signal 11" with fault address `0xdeadbeef`, and modifies `uc_mcontext.pc = recover_ip`. But after the handler returns through the sigreturn trampoline, execution resumes at the **original faulting instruction** instead of `recover_ip`.
+
+**Flow**:
+1. Guest faults at `*p = 42` (writes to 0xdeadbeef) → SIGSEGV
+2. Shim delivers signal, writes SignalFrame to guest stack
+3. Guest handler runs, modifies `uc_mcontext.pc = recover_ip`
+4. Handler returns → sigreturn trampoline → shim's `sys_rt_sigreturn`
+5. `sys_rt_sigreturn` restores context from Ucontext on stack
+6. **Execution resumes at faulting instruction** → repeat
+
+**Most likely root cause**: A `Ucontext`/`Sigcontext` struct layout mismatch between the shim's Rust definitions and the C ABI. When the C handler writes `ctx->uc_mcontext.pc = recover_ip`, it writes to the offset defined by the C `ucontext_t`. But `sys_rt_sigreturn` reads from the Rust `Ucontext` struct. If the offset of `pc` within `mcontext` differs between the two, `sys_rt_sigreturn` reads the unmodified `pc` from a different offset.
+
+**Key areas to investigate**:
+1. `litebox_common_linux/src/signal/aarch64.rs` — `Sigcontext` struct layout vs Linux kernel's `struct sigcontext`
+2. `litebox_common_linux/src/signal/mod.rs` — `Ucontext` struct layout vs C `ucontext_t`:
+   - `SigAltStack` struct size and padding (affects offset of subsequent fields)
+   - `SigSet` size (128 bytes? 8 bytes?)
+   - Offset of `uc_mcontext` within `Ucontext`
+3. `sys_rt_sigreturn` — verify it reads from the correct stack address
+4. A small C program printing `offsetof(ucontext_t, uc_mcontext.pc)` would definitively identify mismatches
+
+**Status**: OPEN — this is the primary blocking issue.
+
 ---
 
 ## Future Work
 
-### Short-term (Cleanup)
-1. Remove temporary debug `eprintln!` logging from `litebox_platform_linux_userland/src/lib.rs` (7 statements with `[DEBUG]` prefix)
-2. Fix `dead_code` warning on `backend` field in `litebox_runner_linux_arm64_userland/tests/run.rs`
-3. Run systrap tests for regression (`test_static_exec_with_systrap`, `test_dynamic_lib_with_systrap`)
+### Immediate (Blocking)
+1. **Fix Bug 25** — signal handler PC modification not restored by `sys_rt_sigreturn`
+   - Write a C program to verify `offsetof(ucontext_t, uc_mcontext.pc)` and compare with Rust struct
+   - Fix any struct layout mismatches in `Ucontext`, `Sigcontext`, `SigAltStack`, `SigSet`
+   - Verify `sys_rt_sigreturn` reads Ucontext from the correct address after sigreturn trampoline
 
-### Short-term (Features)
-1. Implement `faccessat2` (syscall 439) — only `faccessat` (syscall 48) is currently supported
-2. Respect `statx` flags parameter (currently `_flags` is ignored — could honor `AT_SYMLINK_NOFOLLOW`)
+### Short-term (After signal.c works)
+1. Run remaining tests: `thread.c`, `thread_exit.c`, `unix.c`
+2. Run clippy and fix any new warnings
+3. Implement `faccessat2` (syscall 439) — only `faccessat` (syscall 48) is currently supported
+4. Respect `statx` flags parameter (currently `_flags` is ignored)
 
 ### Medium-term
 1. Fix seccomp backend timing issues
@@ -859,26 +940,37 @@ coredumpctl debug -1 -A "-batch -ex 'bt' -ex 'info registers'"
 
 ## Current Status
 
-### All Rewriter Tests Passing
-- `test_static_exec_with_rewriter` — static binary (hello world)
-- `test_dynamic_lib_with_rewriter` — dynamically linked binary
-- `test_node_with_rewriter` — Node.js with 12+ shared libraries
+### C Test Results (Static Rewriter)
 
-### Clippy Clean
-Zero warnings across all packages.
+| Test | Status | Notes |
+|------|--------|-------|
+| `efault.c` | PASS | EFAULT handling works |
+| `execve.c` | PASS | execve + CLOEXEC + 20 spin threads |
+| `hello.c` | PASS | Basic hello world, argv/envp |
+| `signal.c` | **FAIL** | Infinite loop — handler fires but `uc_mcontext.pc` change ignored by `sys_rt_sigreturn` (Bug 25) |
+| `thread.c` | NOT TESTED | Blocked by signal.c hang in test iteration |
+| `thread_exit.c` | NOT TESTED | Blocked by signal.c hang |
+| `unix.c` | NOT TESTED | Blocked by signal.c hang |
 
-### Uncommitted Changes
-5 files modified (+1,179 / -196 lines), all unstaged:
-- `litebox_platform_linux_userland/src/lib.rs` — per-thread TLS table, signal handling, debug logging
-- `litebox_rtld_audit_arm64/litebox_rtld_audit_arm64.so` — recompiled shared library
-- `litebox_rtld_audit_arm64/rtld_audit_arm64.c` — table lookup in `do_syscall`
-- `litebox_shim_linux/src/syscalls/process.rs` — ARM64 SETTLS
-- `litebox_syscall_rewriter_arm64/src/lib.rs` — MSR interception, TLS table lookup in trampolines
+### Other Tests
 
-### Remaining Cleanup
-1. Remove 7 debug `eprintln!` statements (search `[DEBUG]` in `litebox_platform_linux_userland/src/lib.rs`)
-2. Fix `dead_code` warning on `backend` field in test runner
-3. Verify systrap tests still pass
+| Test | Status | Notes |
+|------|--------|-------|
+| `test_runner_with_ls` | NOT TESTED | Blocked by signal.c hang in `test_static_exec_with_rewriter` (different test function, may pass independently) |
+| `test_node_with_rewriter` | NOT TESTED | Same — may pass independently |
+
+### Uncommitted Changes (8 files)
+All unstaged:
+- `litebox/src/platform/mod.rs` — `get_sigreturn_trampoline_address()` trait method
+- `litebox_platform_linux_userland/src/lib.rs` — trait implementation
+- `litebox_runner_linux_arm64_userland/tests/run.rs` — removed `passing_tests` filter
+- `litebox_shim_linux/src/syscalls/signal/aarch64.rs` — `write_signal_frame()` rewrite
+- `litebox_shim_linux/src/syscalls/signal/mod.rs` — `deliver_signal()` / `process_signals()` updates
+- `litebox_shim_linux/src/syscalls/signal/x86_64.rs` — signature update
+- `litebox_shim_linux/src/syscalls/signal/x86.rs` — signature update
+- `litebox_syscall_rewriter_arm64/src/lib.rs` — `generate_sigreturn_trampoline()`
+
+### Git: 8 commits ahead of origin/main (not pushed)
 
 ---
 
@@ -891,4 +983,4 @@ Zero warnings across all packages.
 
 ---
 
-*Last updated: 2026-02-07*
+*Last updated: 2026-02-07 (Session 13)*

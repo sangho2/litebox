@@ -9,12 +9,13 @@ This document describes the ARM64 (aarch64) support for LiteBox, implemented in 
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Platform layer | ✅ Complete | TLS, context switching, signal handling |
-| Syscall rewriter crate | ✅ Complete | ELF rewriting, trampoline generation, ADRP+ADD for ±4GB |
+| Syscall rewriter crate | ✅ Complete | ELF rewriting, trampoline generation, ADRP+ADD for ±4GB, sigreturn trampoline |
 | Runner integration | ✅ Complete | CLI with backend selection |
 | Seccomp backend | ⚠️ Issues | Timing bug with SIGSYS outside guest mode |
 | Rewriter backend | ✅ Working | Static and dynamically linked binaries work |
 | Dynamic linking | ✅ Working | LD_AUDIT-based trampoline discovery via `litebox_rtld_audit_arm64` |
-| Tests | ✅ Core tests passing | `test_static_exec`, `test_dynamic_lib`, `test_runner_with_ls` all pass |
+| Signal delivery | ⚠️ Partial | Handler fires correctly, but `uc_mcontext.pc` modification not restored by `sys_rt_sigreturn` (infinite loop) |
+| Tests | ⚠️ Partial | `efault.c`, `execve.c`, `hello.c` pass; `signal.c` fails (infinite loop); others blocked |
 
 ### Supported Syscalls
 
@@ -119,13 +120,22 @@ These x86 syscalls don't exist on ARM64 and must use alternatives:
 
 **Fix needed**: Use raw syscalls with backdoor magic for all operations between filter application and guest entry.
 
-### 2. Threading/Signal Tests
+### 2. Signal Handler PC Modification Not Restored (Critical)
 
-**Problem**: Tests involving threading (thread.c, thread_exit.c) and signals (signal.c) are currently skipped due to host TLS race condition in multi-threaded scenarios.
+**Problem**: `signal.c` test enters infinite loop. The guest SIGSEGV handler correctly fires, modifies `uc_mcontext.pc = recover_ip`, but `sys_rt_sigreturn` does not pick up the modified PC. Execution resumes at the faulting instruction.
 
-**Root Cause**: The host TLS pointer stored at `trampoline_base+16` is a single global location. In multi-threaded scenarios, one thread can overwrite another thread's TLS pointer.
+**Root Cause (suspected)**: Struct layout mismatch between Rust `Ucontext`/`Sigcontext` definitions and the C ABI `ucontext_t`. The C handler writes `ctx->uc_mcontext.pc` at the C-defined offset, but `sys_rt_sigreturn` reads from the Rust-defined offset, which may differ due to:
+- `SigAltStack` struct size/padding differences
+- `SigSet` size (128 bytes vs 8 bytes)
+- Alignment of `uc_mcontext` within `Ucontext`
 
-**Workaround**: These tests are skipped in the test suite until per-thread TLS storage is implemented.
+**Debugging approach**: Write a C program to print `offsetof(ucontext_t, uc_mcontext.pc)` and compare with Rust struct layout.
+
+### 3. Test Iteration Blocked by signal.c
+
+**Problem**: `test_static_exec_with_rewriter` and `test_dynamic_lib_with_rewriter` iterate ALL C test files. When signal.c hangs, subsequent tests (thread.c, thread_exit.c, unix.c) are never reached.
+
+**Workaround**: Could temporarily skip signal.c or run individual tests separately. The `ls` and `node` tests are separate test functions and can be run independently.
 
 ## Files
 
@@ -181,17 +191,29 @@ litebox_rtld_audit_arm64/
 
 ## Testing
 
-Core tests pass with the rewriter backend:
+C test results with the rewriter backend:
+
+| Test | Static | Dynamic | Notes |
+|------|--------|---------|-------|
+| `efault.c` | PASS | NOT TESTED | EFAULT handling |
+| `execve.c` | PASS | NOT TESTED | execve + CLOEXEC + threads |
+| `hello.c` | PASS | NOT TESTED | argv/envp |
+| `signal.c` | **FAIL** | NOT TESTED | Infinite loop (Bug 25) |
+| `thread.c` | NOT TESTED | NOT TESTED | Blocked by signal.c |
+| `thread_exit.c` | NOT TESTED | NOT TESTED | Blocked by signal.c |
+| `unix.c` | NOT TESTED | NOT TESTED | Blocked by signal.c |
+
+Other tests (separate test functions, should run independently):
+- `test_runner_with_ls` — Previously passing, not retested since signal changes
+- `test_node_with_rewriter` — Previously passing, not retested
 
 ```bash
 # Run all runner tests
 cargo test -p litebox_runner_linux_arm64_userland
-# test_static_exec_with_rewriter  ... ok
-# test_dynamic_lib_with_rewriter  ... ok
-# test_runner_with_ls             ... ok
-# test_node_with_rewriter         ... FAILED (requires node.js installed)
-# test_static_exec_with_systrap   ... ignored
-# test_dynamic_lib_with_systrap   ... ignored
+
+# Run specific test functions
+cargo test -p litebox_runner_linux_arm64_userland test_runner_with_ls -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland test_node_with_rewriter -- --nocapture
 
 # Run rewriter unit tests (4/4 pass)
 cargo test -p litebox_syscall_rewriter_arm64
