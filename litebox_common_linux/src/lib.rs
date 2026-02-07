@@ -771,7 +771,12 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
@@ -784,8 +789,18 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TCGETS(Platform::RawMutPointer<Termios>),
     /// Set the current serial port settings.
     TCSETS(Platform::RawConstPointer<Termios>),
+    /// Set serial port settings after output drain.
+    TCSETSW(Platform::RawConstPointer<Termios>),
+    /// Set serial port settings after output drain and input flush.
+    TCSETSF(Platform::RawConstPointer<Termios>),
+    /// Get foreground process group.
+    TIOCGPGRP(Platform::RawMutPointer<i32>),
+    /// Set foreground process group.
+    TIOCSPGRP(Platform::RawConstPointer<i32>),
     /// Get window size.
     TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
+    /// Set window size.
+    TIOCSWINSZ(Platform::RawConstPointer<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(Platform::RawMutPointer<u32>),
@@ -2610,7 +2625,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
+                        TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
+                        TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,

@@ -14,6 +14,99 @@ use anyhow::{Context, Result};
 
 use crate::state::{ContainerState, StateManager, Status};
 
+/// Set up a PTY and send the master fd over a console socket.
+///
+/// Creates a new pseudoterminal pair. Sends the master fd to the
+/// console-socket via SCM_RIGHTS (as runc does per OCI spec).
+/// Returns the slave fd which should be used for container stdio.
+fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // Open a new PTY master via posix_openpt
+    let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master_fd < 0 {
+        anyhow::bail!("posix_openpt failed: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: master_fd is a valid fd returned by posix_openpt
+    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+
+    if unsafe { libc::grantpt(master_fd) } != 0 {
+        anyhow::bail!("grantpt failed: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::unlockpt(master_fd) } != 0 {
+        anyhow::bail!("unlockpt failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Get slave path
+    let slave_name = unsafe { libc::ptsname(master_fd) };
+    if slave_name.is_null() {
+        anyhow::bail!("ptsname failed: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: ptsname returned a valid C string
+    let slave_path = unsafe { std::ffi::CStr::from_ptr(slave_name) };
+    let slave_fd = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR) };
+    if slave_fd < 0 {
+        anyhow::bail!(
+            "failed to open PTY slave: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: slave_fd is a valid fd returned by open
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+
+    // Connect to the console-socket and send master fd via SCM_RIGHTS
+    let sock = UnixStream::connect(console_socket_path).with_context(|| {
+        format!(
+            "failed to connect to console-socket: {}",
+            console_socket_path.display()
+        )
+    })?;
+
+    // Send master fd using sendmsg + SCM_RIGHTS
+    let sock_fd = sock.as_raw_fd();
+    let data: [u8; 1] = [0];
+    let iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // Build cmsg with SCM_RIGHTS containing master fd
+    #[repr(C)]
+    struct CmsgFd {
+        hdr: libc::cmsghdr,
+        fd: i32,
+    }
+    let mut cmsg_buf = CmsgFd {
+        hdr: libc::cmsghdr {
+            cmsg_len: unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) } as _,
+            cmsg_level: libc::SOL_SOCKET,
+            cmsg_type: libc::SCM_RIGHTS,
+        },
+        fd: master.as_raw_fd(),
+    };
+    let msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &iov as *const _ as *mut _,
+        msg_iovlen: 1,
+        msg_control: &mut cmsg_buf as *mut _ as *mut libc::c_void,
+        msg_controllen: std::mem::size_of::<CmsgFd>(),
+        msg_flags: 0,
+    };
+    let ret = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
+    if ret < 0 {
+        anyhow::bail!(
+            "sendmsg (SCM_RIGHTS) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Close the master fd and socket — orchestrator now owns the master
+    drop(master);
+    drop(sock);
+
+    Ok(slave)
+}
+
 /// OCI lifecycle manager.
 pub struct Lifecycle {
     state_manager: StateManager,
@@ -36,7 +129,12 @@ impl Lifecycle {
     /// - Failed to signal ready to parent
     /// - Failed to accept start connection
     /// - Failed to read start signal
-    pub fn create(&self, id: &str, bundle: &Path) -> Result<ContainerState> {
+    pub fn create(
+        &self,
+        id: &str,
+        bundle: &Path,
+        console_socket: Option<&Path>,
+    ) -> Result<ContainerState> {
         // Validate bundle
         let bundle = bundle
             .canonicalize()
@@ -99,6 +197,30 @@ impl Lifecycle {
                 // Create a listener socket that start() will connect to
                 let listener =
                     UnixListener::bind(&sync_path).expect("child: failed to bind sync socket");
+
+                // Set up PTY before signaling ready — orchestrators (conmon, containerd)
+                // expect the console-socket connection to complete during `create`.
+                if let Some(cs_path) = console_socket {
+                    use std::os::fd::AsRawFd;
+                    match setup_console_socket(cs_path) {
+                        Ok(slave_fd) => {
+                            let raw = slave_fd.as_raw_fd();
+                            // Dup slave fd onto stdin/stdout/stderr
+                            unsafe {
+                                libc::setsid();
+                                libc::dup2(raw, 0); // stdin
+                                libc::dup2(raw, 1); // stdout
+                                libc::dup2(raw, 2); // stderr
+                                libc::ioctl(raw, libc::TIOCSCTTY, 0);
+                            }
+                            drop(slave_fd); // Close the original fd (duped onto 0/1/2)
+                        }
+                        Err(e) => {
+                            eprintln!("child: console-socket setup failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
 
                 // Signal parent we're ready
                 child_sock
@@ -320,7 +442,7 @@ mod tests {
     fn test_create_bundle_not_found() {
         let (_temp, lifecycle) = create_temp_lifecycle();
 
-        let result = lifecycle.create("test-id", Path::new("/nonexistent/bundle"));
+        let result = lifecycle.create("test-id", Path::new("/nonexistent/bundle"), None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("bundle not found"));
@@ -334,7 +456,7 @@ mod tests {
         let bundle_dir = temp.path().join("bundle");
         fs::create_dir_all(&bundle_dir).unwrap();
 
-        let result = lifecycle.create("test-id", &bundle_dir);
+        let result = lifecycle.create("test-id", &bundle_dir, None);
 
         assert!(result.is_err());
         assert!(
@@ -354,7 +476,7 @@ mod tests {
         let state = ContainerState::new("test-id".to_string(), bundle.clone());
         lifecycle.state_manager.save(&state).unwrap();
 
-        let result = lifecycle.create("test-id", &bundle);
+        let result = lifecycle.create("test-id", &bundle, None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));

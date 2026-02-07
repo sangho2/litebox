@@ -865,7 +865,11 @@ impl Task {
             | litebox_common_linux::RlimitResource::STACK => {
                 self.thread.process.limits.get_rlimit(resource)
             }
-            _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
+            // Return unlimited for other resources
+            _ => litebox_common_linux::Rlimit {
+                rlim_cur: usize::MAX,
+                rlim_max: usize::MAX,
+            },
         };
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {

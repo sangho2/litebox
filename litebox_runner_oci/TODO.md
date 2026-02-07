@@ -53,7 +53,8 @@
 - [x] Test with multi-process workloads (pthreads ✓, execve ✓, fork ✗)
 
 ### Medium-term
-- [ ] Implement console-socket for TTY support
+- [x] Implement console-socket for TTY support
+- [ ] Interactive shell support (stdin polling for pselect/select on raw fds)
 - [x] Implement `events` command for container metrics (basic stats output)
 - [x] Optimize rootfs loading for large images (lazy loading implemented)
 - [x] Lazy file loading (`--lazy-tar`, `--lazy` flags)

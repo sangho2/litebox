@@ -42,10 +42,10 @@ These flags extend OCI functionality for the `run` and `exec` commands:
 | `user.uid` | ⚠️ Ignored | Runs as invoking user |
 | `user.gid` | ⚠️ Ignored | Runs as invoking user |
 | `capabilities` | ❌ Not supported | No capability management |
-| `rlimits` | ❌ Not supported | No resource limits |
+| `rlimits` | ⚠️ Partial | NOFILE and STACK tracked; others return unlimited |
 | `noNewPrivileges` | ⚠️ Ignored | Always no new privileges |
-| `terminal` | ❌ Not supported | No TTY support |
-| `consoleSize` | ❌ Not supported | No TTY support |
+| `terminal` | ✅ Supported | PTY via console-socket |
+| `consoleSize` | ⚠️ Ignored | Hardcoded 20×20 default |
 
 ### Linux-specific (`linux`)
 
@@ -100,9 +100,11 @@ LiteBox emulates syscalls in userspace. Most common syscalls are supported:
 - Misc: `getcwd`, `chdir`, `uname`
 
 ### Partially Supported
-- `ioctl` - Limited terminal ioctls
+- `ioctl` - Terminal ioctls (TCGETS, TCSETS/W/F, TIOCGWINSZ, TIOCSWINSZ, TIOCGPGRP, TIOCSPGRP)
 - `fcntl` - Basic operations only
 - `clone` - Threads only (`CLONE_VM|CLONE_THREAD`), not full processes
+- `pselect6` - Works for sockets/pipes; does not wake on raw stdio fd (PTY slave)
+- `prlimit64` - NOFILE and STACK tracked; others return unlimited
 
 ### Not Supported
 - `fork`, `vfork` - Returns ENOSYS (use execve directly)
@@ -238,7 +240,7 @@ litebox-oci is compatible with containerd's `io.containerd.runc.v2` shim:
 | `--pid-file` | ✅ Supported | Writes container PID |
 | `--no-pivot` | ✅ Accepted | Ignored (never pivots) |
 | `--no-new-keyring` | ✅ Accepted | Ignored |
-| `--console-socket` | ⚠️ Accepted | Not implemented |
+| `--console-socket` | ✅ Supported | PTY master sent via SCM_RIGHTS |
 
 ## Podman Compatibility
 
@@ -260,3 +262,34 @@ Podman user namespaces), state is stored in `$XDG_RUNTIME_DIR/litebox-oci/` inst
 of `/run/litebox-oci/`. No root or `sudo` required.
 
 **Tested:** Podman 4.9 with Alpine, Debian, Ubuntu — 21/21 tests pass.
+
+## TTY / Console Socket
+
+litebox-oci implements the OCI console-socket protocol for TTY support:
+
+1. Runtime creates a PTY master/slave pair via `posix_openpt`
+2. Master fd is sent to the orchestrator via `SCM_RIGHTS` over the console-socket
+3. Slave is dup2'd onto container stdio (fd 0/1/2) with `setsid` + `TIOCSCTTY`
+
+```bash
+# containerd
+sudo ctr run --tty --runc-binary /usr/local/bin/litebox-oci \
+    docker.io/library/alpine:latest test /bin/sh -c "echo hello"
+
+# Podman
+podman run --rm -t --runtime /usr/local/bin/litebox-oci \
+    alpine:latest /bin/echo "hello"
+```
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Console-socket (SCM_RIGHTS) | ✅ Works | All 4 distros tested |
+| TTY output (echo, ls, uname) | ✅ Works | Output flows through PTY |
+| TCGETS/TCSETS/TCSETSW/TCSETSF | ✅ Stubbed | Returns default termios |
+| TIOCGWINSZ/TIOCSWINSZ | ✅ Stubbed | Hardcoded 20×20, set ignored |
+| TIOCGPGRP/TIOCSPGRP | ✅ Stubbed | Returns pgrp=1, set ignored |
+| Interactive shell | ❌ Hangs | stdin polling (pselect) doesn't wake on PTY data |
+
+**Limitation:** Interactive shells (`/bin/sh`, `/bin/bash` without `-c`) show a prompt
+(bash shows `root@litebox:/#`) but hang waiting for input. The sandbox's `pselect`/`select`
+implementation cannot poll the host's raw stdio fd for incoming data.

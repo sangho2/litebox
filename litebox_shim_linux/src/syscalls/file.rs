@@ -1731,7 +1731,13 @@ impl Task {
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TCSETS(_) | IoctlArg::TCSETSW(_) | IoctlArg::TCSETSF(_) => Ok(0),
+            IoctlArg::TIOCGPGRP(ptr) => {
+                // Return process group 1 (init-like behavior in sandbox)
+                ptr.write_at_offset(0, 1).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(_) => Ok(0), // Accept and ignore
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
@@ -1745,6 +1751,7 @@ impl Task {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
+            IoctlArg::TIOCSWINSZ(_) => Ok(0), // Accept and ignore window size changes
             IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
             _ => todo!(),
         }
@@ -1849,8 +1856,13 @@ impl Task {
             },
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TCSETSW(..)
+            | IoctlArg::TCSETSF(..)
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => match desc {
+            | IoctlArg::TIOCGWINSZ(..)
+            | IoctlArg::TIOCSWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                     *raw_fd,
                     |fd| {
@@ -1871,7 +1883,7 @@ impl Task {
             _ => {
                 #[cfg(debug_assertions)]
                 litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
-                todo!()
+                Err(Errno::ENOTTY)
             }
         }
     }
@@ -2134,7 +2146,7 @@ impl Task {
         sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
     ) -> Result<usize, Errno> {
         if sigsetpack.is_some() {
-            unimplemented!("no sigsetpack support yet");
+            // Signal mask ignored — sandbox doesn't support signal delivery
         }
         let timeout = timeout.read()?;
         if nfds >= i32::MAX as u32

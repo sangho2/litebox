@@ -123,7 +123,7 @@ Container state is stored in JSON format:
 2. **No symlink support**: Symlinks are flattened to regular files
 3. **Large rootfs slow**: Loading thousands of files takes time
 4. **Some syscalls unsupported**: lgetxattr, listxattr, etc. (warnings only)
-5. **No TTY support**: console-socket flag is accepted but not implemented
+5. **TTY support**: console-socket creates PTY pair and sends master via SCM_RIGHTS; command output works through PTY; interactive shells hang (stdin polling limitation)
 
 ## Testing
 
@@ -152,6 +152,7 @@ sudo ctr run --rm --runc-binary /usr/local/bin/litebox-oci \
 
 ## Recent Additions
 
+- **TTY/console-socket**: PTY pair creation and SCM_RIGHTS fd passing for interactive containers
 - **Podman integration**: `--systemd-cgroup` flag, rootless state dir via `XDG_RUNTIME_DIR` (21/21 pass)
 - **Automatic shell rewriting**: 4-layer system rewrites shell entrypoints for fork-free compatibility
   - Layer 1: `sh/bash/dash` → `litebox-sh` substitution
@@ -199,7 +200,8 @@ The cache is automatically invalidated when binary content changes.
 
 ## Future Work
 
-- [ ] Implement console-socket for TTY support
+- [x] Implement console-socket for TTY support
+- [ ] Interactive shell support (stdin polling for pselect/select on raw fds)
 - [ ] Kubernetes/CRI-O integration testing
 - [ ] Lazy file loading (load on first access)
 - [ ] Raw socket support (ICMP/ping)

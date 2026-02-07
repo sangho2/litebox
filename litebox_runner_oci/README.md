@@ -363,6 +363,8 @@ See [TODO.md](TODO.md) for detailed performance analysis and virtual block devic
 - ✅ Automatic shell rewriting for fork-free compatibility (`--no-rewrite-shell` to disable)
 - ✅ Pipeline orchestration (`echo hello | cat` works via sequential re-exec)
 - ✅ Rootfs-aware symlink resolution (merged `/usr` layouts work — Debian, Ubuntu, Fedora)
+- ✅ TTY support via console-socket (PTY master sent via SCM_RIGHTS per OCI spec)
+- ✅ Podman integration (`--systemd-cgroup`, rootless state dir)
 
 ### Virtual /proc Filesystem
 
@@ -466,6 +468,7 @@ litebox-oci run -b /bundle --no-rewrite-shell my-container
 - ❌ Some syscalls unsupported (lgetxattr, listxattr)
 - ❌ Mounts are read-only snapshots (writes don't persist to host)
 - ⚠️ Background jobs (`&`) and subshells (`$(...)`) not supported
+- ⚠️ Interactive shells hang (stdin polling not yet supported; `bash` prints prompt but `pselect` on stdin doesn't wake)
 
 ## Documentation
 

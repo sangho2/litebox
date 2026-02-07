@@ -67,7 +67,8 @@ enum Command {
         #[clap(long)]
         pid_file: Option<PathBuf>,
 
-        /// Console socket for terminal (accepted but not implemented)
+        /// Console socket path for TTY support.
+        /// A PTY is created and the master fd is sent via SCM_RIGHTS.
         #[clap(long)]
         console_socket: Option<PathBuf>,
 
@@ -371,7 +372,7 @@ fn main() -> Result<()> {
             bundle,
             container_id,
             pid_file,
-            console_socket: _, // Accepted but not implemented
+            console_socket,
             no_pivot: _,       // Accepted, we never pivot anyway
             no_new_keyring: _, // Accepted, we don't use keyrings
         } => {
@@ -381,7 +382,7 @@ fn main() -> Result<()> {
                 "creating container"
             );
 
-            let state = lifecycle.create(&container_id, &bundle)?;
+            let state = lifecycle.create(&container_id, &bundle, console_socket.as_deref())?;
 
             // Write PID file if requested
             if let Some(pid_file) = pid_file
