@@ -42,9 +42,13 @@ litebox_runner_oci/
 ├── src/
 │   ├── main.rs       # CLI entry point
 │   ├── lib.rs        # Public API
-│   ├── runner.rs     # Core container execution
+│   ├── runner.rs     # Core container execution + shell rewriting
 │   ├── state.rs      # Container state persistence
 │   └── lifecycle.rs  # OCI lifecycle (create/start/kill/delete)
+├── tools/
+│   └── litebox-sh/   # Fork-free shell (Rust + musl, ~435KB static binary)
+│       ├── Cargo.toml
+│       └── src/main.rs
 ├── scripts/
 │   ├── bundle.py     # Bundle creation utility
 │   └── integration_test.sh
@@ -82,8 +86,10 @@ The seccomp backend exists but is currently marked as ignored in tests due to co
 The `runner.rs` module:
 1. Walks the OCI rootfs directory
 2. Loads each file into LiteBox's in-memory filesystem
-3. Rewrites syscalls in executable files
-4. Flattens symlinks (LiteBox doesn't support symlinks)
+3. Rewrites syscalls in executable ELF files
+4. Rewrites shebangs in script files (`#!/bin/sh` → `#!/bin/litebox-sh`)
+5. Flattens symlinks (LiteBox doesn't support symlinks)
+6. Injects litebox-sh binary into `/bin/litebox-sh`
 
 ### OCI Lifecycle
 
@@ -146,6 +152,13 @@ sudo ctr run --rm --runc-binary /usr/local/bin/litebox-oci \
 
 ## Recent Additions
 
+- **Automatic shell rewriting**: 3-layer system rewrites shell entrypoints for fork-free compatibility
+  - Layer 1: `sh/bash/dash` → `litebox-sh` substitution
+  - Layer 2: `exec` insertion before final external command
+  - Layer 3: Script file args + shebang rewriting + entrypoint detection
+- **litebox-sh**: Fork-free minimal shell rewritten in Rust with musl static linking (435KB)
+- **chdir support**: `chdir()`/`fchdir()` syscall and `process.cwd` from OCI spec
+- **Multi-distro testing**: BusyBox, Debian, Ubuntu — 68/85 tests pass (80%)
 - **exec command**: Run commands in a container's rootfs
 - **--env / --env-file**: Inject environment variables at runtime
 - **--mount**: Bind mount host directories into container (snapshot)

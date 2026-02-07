@@ -9,9 +9,6 @@ Standard shells (`bash`, `dash`, `ash`) require `fork()` to run external command
 ## Usage
 
 ```sh
-# Compile
-make
-
 # Run with -c (primary use case for OCI containers)
 ./litebox-sh -c 'export FOO=bar && echo $FOO && exec /app/server'
 
@@ -21,6 +18,9 @@ make
 # Interactive mode
 ./litebox-sh
 ```
+
+> **Note:** In the OCI runner, litebox-sh is automatically injected into containers and
+> shell entrypoints are rewritten to use it. You don't need to build or install it manually.
 
 ## Supported Features
 

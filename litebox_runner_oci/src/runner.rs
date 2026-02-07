@@ -52,13 +52,12 @@ const SHELL_BUILTINS: &[&str] = &[
 
 /// Rewrite shell entrypoint args for fork-free compatibility.
 ///
-/// Layer 1: Replace `sh -c "..."` with `/bin/litebox-sh -c "..."`
+/// Layer 1: Replace `sh -c "..."` or `sh /script.sh` with litebox-sh
 /// Layer 2: Add `exec` before final external command in `-c` string
 ///
 /// Returns the (possibly modified) args and whether any rewriting occurred.
 fn rewrite_shell_args(args: Vec<String>) -> Vec<String> {
-    // Layer 1: Detect shell -c pattern
-    if args.len() < 3 || args[1] != "-c" {
+    if args.is_empty() {
         return args;
     }
 
@@ -66,29 +65,47 @@ fn rewrite_shell_args(args: Vec<String>) -> Vec<String> {
         return args;
     }
 
-    let original_shell = &args[0];
-    let mut new_args = args.clone();
+    // Pattern 1: sh -c "inline script"
+    if args.len() >= 3 && args[1] == "-c" {
+        let original_shell = &args[0];
+        let mut new_args = args.clone();
 
-    // Replace shell with litebox-sh
-    new_args[0] = "/bin/litebox-sh".to_string();
-    tracing::info!(
-        original = %original_shell,
-        "rewriting shell entrypoint: {} -> /bin/litebox-sh",
-        original_shell
-    );
-
-    // Layer 2: Add exec before final external command in -c string
-    let script = &args[2];
-    if let Some(rewritten) = add_exec_to_final_command(script) {
+        new_args[0] = "/bin/litebox-sh".to_string();
         tracing::info!(
-            original = %script,
-            rewritten = %rewritten,
-            "added exec before final external command"
+            original = %original_shell,
+            "rewriting shell entrypoint: {} -> /bin/litebox-sh",
+            original_shell
         );
-        new_args[2] = rewritten;
+
+        // Layer 2: Add exec before final external command in -c string
+        let script = &args[2];
+        if let Some(rewritten) = add_exec_to_final_command(script) {
+            tracing::info!(
+                original = %script,
+                rewritten = %rewritten,
+                "added exec before final external command"
+            );
+            new_args[2] = rewritten;
+        }
+
+        return new_args;
     }
 
-    new_args
+    // Pattern 2: sh /script.sh [args...] or sh script.sh [args...]
+    if args.len() >= 2 && args[1] != "-c" && !args[1].starts_with('-') {
+        let original_shell = &args[0];
+        let mut new_args = args.clone();
+        new_args[0] = "/bin/litebox-sh".to_string();
+        tracing::info!(
+            original = %original_shell,
+            script = %args[1],
+            "rewriting shell script entrypoint: {} -> /bin/litebox-sh",
+            original_shell
+        );
+        return new_args;
+    }
+
+    args
 }
 
 /// Parse a `-c` script string and add `exec` before the final external command.
@@ -182,6 +199,55 @@ fn extract_command_name(cmd: &str) -> Option<String> {
             word
         };
         return Some(base.to_string());
+    }
+    None
+}
+
+/// Shell interpreter paths that should be replaced in shebangs.
+const SHEBANG_SHELLS: &[&str] = &[
+    "#!/bin/sh",
+    "#!/usr/bin/sh",
+    "#!/bin/bash",
+    "#!/usr/bin/bash",
+    "#!/bin/dash",
+    "#!/usr/bin/dash",
+    "#!/bin/ash",
+    "#!/usr/bin/env sh",
+    "#!/usr/bin/env bash",
+    "#!/usr/bin/env dash",
+];
+
+/// Rewrite shell shebangs in script files to use litebox-sh.
+///
+/// Detects files starting with `#!/bin/sh` (or similar) and replaces
+/// the interpreter with `#!/bin/litebox-sh`. Returns None if no change needed.
+fn rewrite_shell_shebang(data: &[u8]) -> Option<Vec<u8>> {
+    // Must start with #!
+    if data.len() < 2 || data[0] != b'#' || data[1] != b'!' {
+        return None;
+    }
+
+    // Find end of first line
+    let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+    let shebang_line = std::str::from_utf8(&data[..line_end]).ok()?;
+
+    // Check if shebang matches a known shell
+    let trimmed = shebang_line.trim();
+    for shell in SHEBANG_SHELLS {
+        if trimmed == *shell || trimmed.starts_with(&format!("{shell} ")) {
+            let mut result = b"#!/bin/litebox-sh".to_vec();
+            // Preserve any flags after the interpreter (e.g., "#!/bin/sh -e")
+            let suffix = &trimmed[shell.len()..];
+            if !suffix.is_empty() {
+                result.extend_from_slice(suffix.as_bytes());
+            }
+            result.extend_from_slice(&data[line_end..]);
+            tracing::debug!(
+                original = %trimmed,
+                "rewrote shebang to #!/bin/litebox-sh"
+            );
+            return Some(result);
+        }
     }
     None
 }
@@ -904,6 +970,14 @@ fn run_container_internal(
                     tracing::debug!(path = %target_str, "rewrote syscalls in executable");
                 }
                 rewritten.into()
+            } else if rewrite_shell {
+                // Rewrite shell shebangs in script files
+                if let Some(rewritten) = rewrite_shell_shebang(&data) {
+                    tracing::debug!(path = %target_str, "rewrote shell shebang");
+                    rewritten.into()
+                } else {
+                    data.into()
+                }
             } else {
                 data.into()
             };
@@ -1416,6 +1490,51 @@ fn run_container_internal(
     // Using rewriter backend - no seccomp setup needed
     // The syscalls have been rewritten in the ELF files
 
+    // If the entrypoint is a script file (not ELF), rewrite to use litebox-sh as interpreter
+    let args = if rewrite_shell && !args.is_empty() && !SHELL_NAMES.contains(&args[0].as_str()) {
+        let entry = &args[0];
+        let host_path = if entry.starts_with('/') {
+            effective_rootfs.join(entry.trim_start_matches('/'))
+        } else {
+            effective_rootfs.join(entry)
+        };
+        if host_path.exists() {
+            if let Ok(header) = std::fs::read(&host_path).map(|d| d[..d.len().min(128)].to_vec()) {
+                if header.starts_with(b"#!") {
+                    // It's a script — check if shebang is a shell
+                    let line_end = header
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .unwrap_or(header.len());
+                    let shebang = String::from_utf8_lossy(&header[..line_end]);
+                    let is_shell_shebang = SHEBANG_SHELLS.iter().any(|s| {
+                        shebang.trim() == *s || shebang.trim().starts_with(&format!("{s} "))
+                    });
+                    if is_shell_shebang {
+                        tracing::info!(
+                            script = %entry,
+                            shebang = %shebang.trim(),
+                            "script entrypoint detected, prepending /bin/litebox-sh"
+                        );
+                        let mut new_args = vec!["/bin/litebox-sh".to_string()];
+                        new_args.extend(args);
+                        new_args
+                    } else {
+                        args
+                    }
+                } else {
+                    args
+                }
+            } else {
+                args
+            }
+        } else {
+            args
+        }
+    } else {
+        args
+    };
+
     // Prepare argv (named differently to avoid confusion with args from OCI spec)
     let argv_cstrings: Vec<CString> = args
         .iter()
@@ -1644,10 +1763,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_shell_args_ignores_without_c_flag() {
+    fn test_rewrite_shell_args_rewrites_script_file() {
         let args = vec!["sh".to_string(), "/entrypoint.sh".to_string()];
-        let result = rewrite_shell_args(args.clone());
-        assert_eq!(result, args);
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+        assert_eq!(result[1], "/entrypoint.sh");
     }
 
     #[test]
@@ -1784,5 +1904,85 @@ mod tests {
         assert_eq!(result[0], "/bin/litebox-sh");
         // No exec added since echo is a builtin
         assert_eq!(result[2], "export FOO=bar && echo hello");
+    }
+
+    // ── Script file args rewriting ──
+
+    #[test]
+    fn test_rewrite_shell_script_file() {
+        let args = vec!["sh".to_string(), "/entrypoint.sh".to_string()];
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+        assert_eq!(result[1], "/entrypoint.sh");
+    }
+
+    #[test]
+    fn test_rewrite_shell_script_with_args() {
+        let args = vec![
+            "/bin/bash".to_string(),
+            "/start.sh".to_string(),
+            "--port".to_string(),
+            "8080".to_string(),
+        ];
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+        assert_eq!(result[1], "/start.sh");
+        assert_eq!(result[2], "--port");
+    }
+
+    #[test]
+    fn test_rewrite_ignores_shell_with_flags() {
+        // sh -e shouldn't be treated as a script file
+        let args = vec!["sh".to_string(), "-e".to_string()];
+        let result = rewrite_shell_args(args.clone());
+        assert_eq!(result, args);
+    }
+
+    // ── Shebang rewriting ──
+
+    #[test]
+    fn test_shebang_rewrite_bin_sh() {
+        let data = b"#!/bin/sh\necho hello\n";
+        let result = rewrite_shell_shebang(data).unwrap();
+        assert_eq!(&result[..18], b"#!/bin/litebox-sh\n");
+        assert!(result.ends_with(b"echo hello\n"));
+    }
+
+    #[test]
+    fn test_shebang_rewrite_bin_bash() {
+        let data = b"#!/bin/bash\nset -e\necho hi\n";
+        let result = rewrite_shell_shebang(data).unwrap();
+        assert!(result.starts_with(b"#!/bin/litebox-sh\n"));
+    }
+
+    #[test]
+    fn test_shebang_rewrite_usr_bin_env_sh() {
+        let data = b"#!/usr/bin/env sh\necho hi\n";
+        let result = rewrite_shell_shebang(data).unwrap();
+        assert!(result.starts_with(b"#!/bin/litebox-sh\n"));
+    }
+
+    #[test]
+    fn test_shebang_rewrite_with_flags() {
+        let data = b"#!/bin/sh -e\necho hi\n";
+        let result = rewrite_shell_shebang(data).unwrap();
+        assert!(result.starts_with(b"#!/bin/litebox-sh -e\n"));
+    }
+
+    #[test]
+    fn test_shebang_no_rewrite_python() {
+        let data = b"#!/usr/bin/python3\nprint('hi')\n";
+        assert!(rewrite_shell_shebang(data).is_none());
+    }
+
+    #[test]
+    fn test_shebang_no_rewrite_non_script() {
+        let data = b"\x7fELF binary data";
+        assert!(rewrite_shell_shebang(data).is_none());
+    }
+
+    #[test]
+    fn test_shebang_no_rewrite_empty() {
+        assert!(rewrite_shell_shebang(b"").is_none());
     }
 }

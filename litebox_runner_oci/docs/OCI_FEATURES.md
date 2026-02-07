@@ -38,7 +38,7 @@ These flags extend OCI functionality for the `run` and `exec` commands:
 |-------|--------|-------|
 | `args` | ✅ Supported | Command and arguments |
 | `env` | ✅ Supported | Environment variables |
-| `cwd` | ⚠️ Partial | Parsed but not enforced |
+| `cwd` | ✅ Supported | Working directory via `chdir()` syscall |
 | `user.uid` | ⚠️ Ignored | Runs as invoking user |
 | `user.gid` | ⚠️ Ignored | Runs as invoking user |
 | `capabilities` | ❌ Not supported | No capability management |
@@ -126,11 +126,19 @@ LiteBox supports multi-threading but not multi-processing:
 - Programs using execve to run other programs
 
 **What doesn't work:**
-- Shell scripts running external commands (`sh -c "ls"`)
-- Traditional fork-then-exec patterns
+- Pipes (`|`) — requires `fork()`
+- Subshells (`$(...)`) — requires `fork()`
 - Daemon-style process spawning
 
-**Workaround:** Instead of `["sh", "-c", "command"]`, use direct execution `["/path/to/command", "args"]`.
+**Automatic shell rewriting** (enabled by default) handles most entrypoint patterns transparently:
+- `sh -c "..."` → `litebox-sh -c "..."` (litebox-sh uses execve, not fork)
+- `exec` inserted before final external command
+- `sh /script.sh` → `litebox-sh /script.sh`
+- `#!/bin/sh` shebangs rewritten to `#!/bin/litebox-sh` in rootfs
+- Direct `./script.sh` execution detected and routed through litebox-sh
+- Disable with `--no-rewrite-shell`
+
+**Container compatibility (with rewriting):** BusyBox 92%, Debian 59%, Ubuntu 91% (68/85 tests pass)
 
 ## Virtual /proc Filesystem
 

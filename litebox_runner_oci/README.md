@@ -419,10 +419,17 @@ By default, LiteBox automatically rewrites shell entrypoints for fork-free compa
 
 1. **Shell replacement**: `sh -c "..."` → `litebox-sh -c "..."` (litebox-sh is injected into `/bin/litebox-sh`)
 2. **Exec insertion**: `exec` is added before the final external command if not already present
+3. **Script file args**: `sh /entrypoint.sh` → `litebox-sh /entrypoint.sh`
+4. **Shebang rewriting**: `#!/bin/sh` → `#!/bin/litebox-sh` in script files during rootfs loading
 
 ```bash
 # Original entrypoint:        sh -c "export FOO=bar && /app/server"
 # After rewriting:   litebox-sh -c "export FOO=bar && exec /app/server"
+
+# Script shebangs are also rewritten:
+# #!/bin/sh → #!/bin/litebox-sh
+# #!/bin/bash → #!/bin/litebox-sh
+# #!/usr/bin/env sh → #!/bin/litebox-sh
 ```
 
 This is safe and conservative — commands are never reordered or removed. Disable with `--no-rewrite-shell`:
@@ -434,12 +441,13 @@ litebox-oci run -b /bundle --no-rewrite-shell my-container
 ## Limitations
 
 - ❌ x86_64 only (ARM64 not yet supported)
-- ❌ No fork() syscall (pthreads, execve, and chdir work; use litebox-sh for shell scripts)
+- ❌ No fork() syscall (pthreads, execve, and chdir work; automatic shell rewriting handles most entrypoint patterns)
 - ❌ No per-container network isolation (all containers share same TUN IP)
 - ❌ No cgroup resource limits
 - ❌ Symlinks flattened to regular files
 - ❌ Some syscalls unsupported (lgetxattr, listxattr)
 - ❌ Mounts are read-only snapshots (writes don't persist to host)
+- ⚠️ Debian/Ubuntu direct binary execution may fail (glibc syscall rewriting limitations); shell rewriting mitigates this
 
 ## Documentation
 

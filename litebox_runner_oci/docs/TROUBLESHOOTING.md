@@ -8,9 +8,19 @@ Common issues and solutions when using litebox-oci.
 
 **Problem:** Shell scripts that run external commands fail with fork error.
 
-**Cause:** LiteBox doesn't support `fork()` syscall. Shell needs fork to run external commands.
+**Cause:** LiteBox doesn't support `fork()` syscall. Standard shells need fork to run external commands.
 
-**What works:**
+**Automatic mitigation:** Shell rewriting (enabled by default) handles most patterns:
+- `sh -c "..."` → `litebox-sh -c "..."` (no fork needed)
+- `sh /script.sh` → `litebox-sh /script.sh`
+- `#!/bin/sh` shebangs rewritten to `#!/bin/litebox-sh`
+- `./script.sh` detected and routed through litebox-sh
+
+If you still see fork errors, the pattern may be beyond litebox-sh's capabilities (e.g., pipes, subshells).
+
+**Disable rewriting:** `--no-rewrite-shell` to use the original shell.
+
+**What works (with or without rewriting):**
 ```bash
 # Direct execution (no shell)
 args: ["/bin/ls", "/"]
@@ -22,7 +32,22 @@ args: ["/bin/sh", "-c", "echo hello; pwd; echo $((1+2))"]
 args: ["/bin/sh", "-c", "VAR=setup; exec /bin/echo $VAR"]
 ```
 
-**What fails:**
+**What works (with rewriting — automatic):**
+```bash
+# Shell -c with external commands
+args: ["sh", "-c", "ls /"]
+
+# Chains with builtins and externals
+args: ["sh", "-c", "export FOO=bar && echo $FOO"]
+
+# Script file execution
+args: ["sh", "/entrypoint.sh"]
+
+# Direct script execution (shebang-based)
+args: ["/entrypoint.sh"]
+```
+
+**What still fails (even with rewriting):**
 ```bash
 # Multiple external commands
 args: ["/bin/sh", "-c", "ls /; cat /etc/passwd"]  # FAILS
@@ -34,9 +59,11 @@ args: ["/bin/sh", "-c", "ls | grep bin"]  # FAILS
 args: ["/bin/sh", "-c", "echo $(date)"]  # FAILS
 ```
 
-**Workarounds:**
+**Workarounds (if rewriting is insufficient):**
 
-1. **Direct execution** - Run commands directly without shell wrapper:
+1. **Automatic shell rewriting** (default) — handles most patterns. If something still fails, check if the pattern involves pipes or subshells.
+
+2. **Direct execution** - Run commands directly without shell wrapper:
    ```json
    // Instead of: ["sh", "-c", "ls -la /"]
    // Use:
@@ -138,11 +165,13 @@ litebox-oci start <container-id>
 - Binary doesn't exist in rootfs
 - Binary is not a valid x86_64 ELF
 - Binary is for a different architecture (e.g., ARM)
+- Script file without shell rewriting (shebang scripts need rewriting enabled)
 
 **Solution:**
 1. Verify the binary exists: `ls /path/to/bundle/rootfs/bin/`
 2. Check it's x86_64: `file /path/to/bundle/rootfs/bin/program`
 3. Ensure it's a Linux ELF, not a script
+4. For script files, ensure shell rewriting is enabled (don't use `--no-rewrite-shell`)
 
 ### Syscall warnings (lgetxattr, listxattr)
 

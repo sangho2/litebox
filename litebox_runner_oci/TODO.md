@@ -38,6 +38,11 @@
 - [x] `chdir()` / `fchdir()` syscall support and `process.cwd` from OCI spec
 - [x] litebox-sh: fork-free minimal shell for container entrypoints
 - [x] Automatic shell rewriting: `sh -c` → `litebox-sh -c` with exec insertion
+- [x] Shell script file rewriting: `sh /script.sh` → `litebox-sh /script.sh`
+- [x] Shebang rewriting in rootfs: `#!/bin/sh` → `#!/bin/litebox-sh`
+- [x] Shebang entrypoint detection: `./script.sh` → `litebox-sh ./script.sh`
+- [x] litebox-sh rewritten in Rust with musl static linking (435KB)
+- [x] Multi-distro container testing (BusyBox, Debian, Ubuntu — 68/85 80% pass)
 
 ## TODO
 
@@ -77,7 +82,7 @@
 4. **Alpine cleanup segfault**: Sometimes segfaults during cleanup (doesn't affect execution)
 5. **Raw sockets not supported**: ping and other ICMP tools fail (SOCK_RAW not implemented in litebox)
 6. **Some TCP edge cases**: Certain socket state transitions cause panics in smoltcp stack
-7. **fork() not supported**: Standard shells can't run external commands. Use litebox-sh (see below) or direct exec instead
+7. **fork() not supported**: Standard shells can't run external commands. Use litebox-sh (see below) or direct exec instead. **Automatic shell rewriting** mitigates this for most container entrypoints.
 
 ## Notes
 
@@ -124,7 +129,14 @@ LiteBox supports **pthreads** (multi-threading) and **execve**, but not **fork()
 - Standard shells (bash, dash, ash) can't run external commands (they need fork)
 - Traditional fork-then-exec patterns don't work
 
-**Workaround:** Use **litebox-sh**, a fork-free minimal shell included in `litebox_runner_oci/tools/litebox-sh/`:
+**Workaround:** **Automatic shell rewriting** (enabled by default) handles this transparently:
+- `sh -c "..."` → `litebox-sh -c "..."` (Layer 1)
+- `exec` inserted before final external command (Layer 2)
+- `sh /script.sh` → `litebox-sh /script.sh` (Layer 3)
+- `#!/bin/sh` → `#!/bin/litebox-sh` in script files (Layer 3)
+- Direct `./script.sh` execution detected and routed through litebox-sh
+
+Disable with `--no-rewrite-shell`. Or manually use **litebox-sh**, a fork-free minimal shell included in `litebox_runner_oci/tools/litebox-sh/`:
 ```json
 // litebox-sh supports builtins + final exec:
 ["litebox-sh", "-c", "export FOO=bar && echo $FOO && exec /app/server"]

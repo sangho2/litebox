@@ -28,8 +28,8 @@
 │  │  lifecycle  │  │    state    │  │         runner          │  │
 │  │  create     │  │  load/save  │  │  rootfs loading         │  │
 │  │  start      │  │  refresh    │  │  syscall rewriting      │  │
-│  │  kill       │  │             │  │  program execution      │  │
-│  │  delete     │  │             │  │                         │  │
+│  │  kill       │  │             │  │  shell rewriting        │  │
+│  │  delete     │  │             │  │  program execution      │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                                 │
@@ -135,36 +135,88 @@ Core execution logic:
 1. Parse config.json (OCI spec)
         │
         ▼
-2. Initialize LiteBox platform
+2. Shell Rewriting (if enabled)
+        │
+        ├──▶ Layer 1: sh/bash/dash → litebox-sh
+        ├──▶ Layer 2: Add exec before final external command
+        └──▶ Layer 3: sh /script.sh → litebox-sh /script.sh
         │
         ▼
-3. Create in-memory filesystem
+3. Initialize LiteBox platform
         │
         ▼
-4. Walk rootfs directory
+4. Create in-memory filesystem
+        │
+        ▼
+5. Walk rootfs directory
         │
         ├──▶ Directory: mkdir() in sandbox
         │
-        ├──▶ Regular file:
-        │       │
-        │       ├── If executable: rewrite syscalls
-        │       │
-        │       └── Load into sandbox fs
+        ├──▶ Executable: rewrite syscalls, load into sandbox
+        │
+        ├──▶ Script file: rewrite shebang (#!/bin/sh → #!/bin/litebox-sh)
         │
         └──▶ Symlink: resolve and copy target
                 │
                 ▼
-5. Add rtld_audit.so for dynamic libraries
+6. Inject litebox-sh into /bin/litebox-sh
         │
         ▼
-6. Build LiteBox shim
+7. Detect script entrypoints (shebang → prepend litebox-sh)
         │
         ▼
-7. Resolve program path (search PATH)
+8. Add rtld_audit.so for dynamic libraries
         │
         ▼
-8. Load and run program through LiteBox
+9. Build LiteBox shim, resolve program path
+        │
+        ▼
+10. Load and run program through LiteBox
 ```
+
+## Shell Rewriting
+
+LiteBox automatically rewrites shell entrypoints for fork-free compatibility.
+This is a 3-layer system applied during container setup:
+
+```
+                    OCI config.json args
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Layer 1: Shell Name   │
+              │  sh/bash/dash/ash      │──▶ /bin/litebox-sh
+              └────────────────────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Layer 2: Exec Insert  │
+              │  -c "... && cmd"       │──▶ -c "... && exec cmd"
+              └────────────────────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Layer 3: Script File  │
+              │  sh /script.sh         │──▶ litebox-sh /script.sh
+              └────────────────────────┘
+
+  During rootfs loading:
+  ┌───────────────────────────────┐
+  │  Shebang Rewriting            │
+  │  #!/bin/sh    → #!/bin/litebox-sh  │
+  │  #!/bin/bash  → #!/bin/litebox-sh  │
+  └───────────────────────────────┘
+
+  At program load:
+  ┌───────────────────────────────┐
+  │  Entrypoint Detection         │
+  │  ./script.sh (has #!/bin/sh)  │──▶ litebox-sh ./script.sh
+  └───────────────────────────────┘
+```
+
+litebox-sh is a Rust binary statically linked with musl (~435KB), embedded
+via `include_bytes!` and injected into `/bin/litebox-sh` in the rootfs.
+Disable all rewriting with `--no-rewrite-shell`.
 
 ## Syscall Interception
 
@@ -239,15 +291,17 @@ Key compatibility requirements:
 | Language | Go | Rust |
 | Syscall interception | ptrace/KVM | Syscall rewriting |
 | Filesystem | Gofer (9P) | In-memory |
-| Network | Netstack | Not implemented |
+| Network | Netstack | smoltcp (TUN-based) |
+| Shell support | Native (has fork) | litebox-sh + auto-rewriting |
 | Platform | Sentry kernel | LiteBox shim |
 | OCI compliance | Full | Basic lifecycle |
 
 ## Limitations
 
-1. **No network namespace**: Containers share host network
+1. **No network namespace**: Containers share host network (TUN-based networking available)
 2. **No cgroup limits**: Resource limits not enforced
 3. **No seccomp filters**: Uses rewriter instead
 4. **No user namespaces**: Runs as invoking user
 5. **x86_64 only**: rtld_audit.so is architecture-specific
 6. **No symlinks**: Flattened during rootfs loading
+7. **No fork()**: Mitigated by automatic shell rewriting (litebox-sh)

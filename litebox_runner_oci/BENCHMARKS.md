@@ -285,48 +285,54 @@ cargo test --package litebox_runner_linux_userland --test run --release \
     -- test_tun_tcp_latency --exact --nocapture
 ```
 
-## Container Compatibility (Alpine)
+## Container Compatibility
 
-Tested with Alpine 3.23 using the OCI runner. Results show which shell and
-command patterns work with LiteBox's fork-free process model.
+Tested with BusyBox, Debian bookworm-slim, and Ubuntu 24.04 using the OCI runner.
+Results show shell rewriting impact across distros.
 
-### Test Results
+### Summary
 
-| # | Pattern | Result | Notes |
-|---|---------|--------|-------|
-| 1 | `/bin/echo "Hello"` | ✅ PASS | Direct exec |
-| 2 | `/bin/ls /` | ✅ PASS | Directory listing |
-| 3 | `/bin/cat /etc/os-release` | ✅ PASS | File reading |
-| 4 | `/bin/uname -a` | ✅ PASS | System info |
-| 5 | `/usr/bin/seq 1 5` | ✅ PASS | Utility command |
-| 6 | `process.cwd=/etc` + `pwd` | ✅ PASS | **NEW: chdir support** |
-| 7 | `sh -c 'echo hello'` | ✅ PASS | Shell builtin |
-| 8 | `sh -c 'cd /tmp && pwd'` | ✅ PASS | **NEW: chdir syscall** |
-| 9 | `sh -c 'export FOO=bar && echo $FOO'` | ✅ PASS | Shell builtins chain |
-| 10 | `sh -c 'export MODE=prod && exec echo $MODE'` | ✅ PASS | OCI entrypoint pattern |
-| 11 | `sh -c 'echo hello > /tmp/f && exec cat /tmp/f'` | ✅ PASS | Redirect + exec |
-| 12 | `sh -c 'test -d /etc && echo exists'` | ✅ PASS | Test builtin |
-| 13 | `sh -c 'false \|\| echo fallback'` | ✅ PASS | `\|\|` operator |
-| 14 | `sh -c 'ls /'` | ✅ PASS | Last cmd → exec'd by ash |
-| 15 | `sh -c 'ls / && echo done'` | ❌ FAIL | Fork needed for non-final external |
+| Distro | With Rewriting | Without Rewriting | Improvement |
+|--------|---------------|-------------------|-------------|
+| BusyBox | 22/24 pass | 20/24 pass | +2 |
+| Debian bookworm-slim | 17/29 pass | 0/29 pass | +17 |
+| Ubuntu 24.04 | 29/32 pass | 15/32 pass | +14 |
+| **Total** | **68/85 pass (80%)** | **35/85 pass (41%)** | **+33** |
 
-### What Works
+### What Shell Rewriting Fixes
 
-- **All builtins** in Alpine's ash: `echo`, `cd`, `pwd`, `export`, `test`, `true`, `false`, `exit`, `read`, `set`
-- **Operator chains** of builtins: `&&`, `||`, `;`
-- **Single external command** as last command (ash optimizes to exec)
-- **`export && exec app`** pattern (most common OCI entrypoint)
-- **File redirection**: `>`, `>>`, `<`
-- **`process.cwd`** from OCI config.json
+| Pattern | Mechanism |
+|---------|-----------|
+| `sh -c "echo hello"` | Shell → litebox-sh (Debian/Ubuntu shells fail under syscall rewriting) |
+| `sh -c "ls / && echo done"` | litebox-sh exec's the external cmd instead of fork+exec |
+| `bash -c "echo hello"` | bash → litebox-sh substitution |
+| `dash -c "echo hello"` | dash → litebox-sh substitution |
+| `sh /script.sh` | Shell → litebox-sh for script file execution |
+| `./script.sh` (shebang) | `#!/bin/sh` → `#!/bin/litebox-sh` in rootfs + interpreter prepended |
+| `sh -c "export X=1 && echo $X"` | litebox-sh handles builtins natively |
 
-### What Doesn't Work
+### Remaining Failures
 
-- **Multiple external commands**: `ls / && cat /etc/hostname` (needs fork for first command)
-- **Pipes**: `echo hello | wc -w` (needs fork)
-- **Debian/Ubuntu images**: Symlink resolution (`/bin → usr/bin`) not fully supported
-- **whoami**: Needs `/etc/passwd` support
+| Category | Example | Root Cause |
+|----------|---------|------------|
+| Missing files | `cat /etc/hostname` | File doesn't exist in container |
+| Debian direct exec | `/bin/echo hello` | glibc-linked binaries fail syscall rewriting |
+| External cmd chains | `sh -c "ls / && cat /etc/hostname"` (Debian) | litebox-sh can't exec external commands on Debian (glibc issue) |
+
+### Key Insight: Debian vs BusyBox/Ubuntu
+
+- **BusyBox**: Statically linked binaries — syscall rewriting works on all binaries
+- **Ubuntu**: Dynamically linked but compatible with syscall rewriting — most patterns work
+- **Debian**: Same architecture as Ubuntu but simpler image — direct binary execution fails due to library resolution. Shell rewriting makes Debian **usable** (17/29 pass vs 0/29 without)
 
 ## Version History
+
+- **2026-02-07**: Shell rewriting Layer 3 — shebang and script file support
+  - Script file args: `sh /script.sh` → `litebox-sh /script.sh`
+  - Shebang rewriting: `#!/bin/sh` → `#!/bin/litebox-sh` during rootfs loading
+  - Shebang entrypoint detection: `./script.sh` → `litebox-sh ./script.sh`
+  - Multi-distro testing: BusyBox, Debian, Ubuntu — 68/85 pass (80%)
+  - litebox-sh rewritten in Rust with musl static linking (435KB)
 
 - **2026-02-07**: Shell and chdir support
   - Added `chdir()` syscall to shim (enables `cd` in shells)
@@ -334,7 +340,6 @@ command patterns work with LiteBox's fork-free process model.
   - Created litebox-sh: fork-free minimal shell for container entrypoints
   - Automatic shell rewriting: `sh -c` → `litebox-sh -c` with exec insertion
   - `--no-rewrite-shell` opt-out flag
-  - Alpine container compatibility: 14/15 test patterns pass
 
 - **2026-02-06**: TUN networking optimization
   - Reduced poll timeout from 5ms to 1ms with timeout capping
