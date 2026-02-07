@@ -345,6 +345,7 @@ See [TODO.md](TODO.md) for detailed performance analysis and virtual block devic
 - ✅ Virtual /proc filesystem (cpuinfo, meminfo, mounts, etc.)
 - ✅ `chdir()` syscall and `process.cwd` from OCI spec
 - ✅ Fork-free shell (litebox-sh) for container entrypoint scripts
+- ✅ Automatic shell rewriting for fork-free compatibility (`--no-rewrite-shell` to disable)
 
 ### Virtual /proc Filesystem
 
@@ -411,6 +412,24 @@ litebox-sh -c 'export PATH=/app/bin:$PATH && cd /app && exec ./server'
 ```
 
 See [litebox-sh README](tools/litebox-sh/README.md) for full feature list.
+
+### Automatic Shell Rewriting
+
+By default, LiteBox automatically rewrites shell entrypoints for fork-free compatibility:
+
+1. **Shell replacement**: `sh -c "..."` → `litebox-sh -c "..."` (litebox-sh is injected into `/bin/litebox-sh`)
+2. **Exec insertion**: `exec` is added before the final external command if not already present
+
+```bash
+# Original entrypoint:        sh -c "export FOO=bar && /app/server"
+# After rewriting:   litebox-sh -c "export FOO=bar && exec /app/server"
+```
+
+This is safe and conservative — commands are never reordered or removed. Disable with `--no-rewrite-shell`:
+
+```bash
+litebox-oci run -b /bundle --no-rewrite-shell my-container
+```
 
 ## Limitations
 

@@ -332,6 +332,8 @@ command patterns work with LiteBox's fork-free process model.
   - Added `chdir()` syscall to shim (enables `cd` in shells)
   - Added `process.cwd` support from OCI spec (initial working directory)
   - Created litebox-sh: fork-free minimal shell for container entrypoints
+  - Automatic shell rewriting: `sh -c` → `litebox-sh -c` with exec insertion
+  - `--no-rewrite-shell` opt-out flag
   - Alpine container compatibility: 14/15 test patterns pass
 
 - **2026-02-06**: TUN networking optimization

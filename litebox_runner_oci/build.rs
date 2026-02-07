@@ -61,5 +61,29 @@ fn main() {
 
     println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/rtld_audit.c");
     println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/Makefile");
+
+    // Build litebox-sh (fork-free shell for container entrypoints)
+    let litebox_sh_dir = PathBuf::from("tools/litebox-sh");
+    let mut sh_cmd = std::process::Command::new("make");
+    sh_cmd
+        .current_dir(&litebox_sh_dir)
+        .env("CFLAGS", "-Wall -Wextra -Werror -Os -static -s");
+    let sh_output = sh_cmd
+        .output()
+        .expect("Failed to execute make for litebox-sh");
+    assert!(
+        sh_output.status.success(),
+        "failed to build litebox-sh:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&sh_output.stdout),
+        String::from_utf8_lossy(&sh_output.stderr),
+    );
+    let sh_binary = litebox_sh_dir.join("litebox-sh");
+    assert!(sh_binary.exists(), "Build failed to create litebox-sh");
+    // Copy to OUT_DIR for include_bytes!
+    std::fs::copy(&sh_binary, out_dir.join("litebox-sh"))
+        .expect("Failed to copy litebox-sh to OUT_DIR");
+
+    println!("cargo:rerun-if-changed=tools/litebox-sh/litebox-sh.c");
+    println!("cargo:rerun-if-changed=tools/litebox-sh/Makefile");
     println!("cargo:rerun-if-changed=build.rs");
 }

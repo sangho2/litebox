@@ -23,6 +23,169 @@ use walkdir::WalkDir;
 /// Flag to indicate whether we need the rtld_audit library for rewriter backend
 static REQUIRE_RTLD_AUDIT: AtomicBool = AtomicBool::new(false);
 
+/// Embedded litebox-sh binary (built during compilation, statically linked)
+#[cfg(target_arch = "x86_64")]
+static LITEBOX_SH_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/litebox-sh"));
+
+/// Shell binaries that should be replaced with litebox-sh.
+const SHELL_NAMES: &[&str] = &[
+    "sh",
+    "/bin/sh",
+    "/usr/bin/sh",
+    "bash",
+    "/bin/bash",
+    "/usr/bin/bash",
+    "dash",
+    "/bin/dash",
+    "/usr/bin/dash",
+    "ash",
+    "/bin/ash",
+];
+
+/// Shell builtins that don't require fork.
+const SHELL_BUILTINS: &[&str] = &[
+    "echo", "cd", "pwd", "export", "unset", "exit", "test", "[", "true", "false", "set", "exec",
+    "source", ".", "read", ":", "type", "hash", "umask", "alias", "unalias", "readonly", "shift",
+    "wait", "trap", "return", "break", "continue", "eval", "local", "declare", "typeset", "printf",
+    "kill", "getopts", "let",
+];
+
+/// Rewrite shell entrypoint args for fork-free compatibility.
+///
+/// Layer 1: Replace `sh -c "..."` with `/bin/litebox-sh -c "..."`
+/// Layer 2: Add `exec` before final external command in `-c` string
+///
+/// Returns the (possibly modified) args and whether any rewriting occurred.
+fn rewrite_shell_args(args: Vec<String>) -> Vec<String> {
+    // Layer 1: Detect shell -c pattern
+    if args.len() < 3 || args[1] != "-c" {
+        return args;
+    }
+
+    if !SHELL_NAMES.contains(&args[0].as_str()) {
+        return args;
+    }
+
+    let original_shell = &args[0];
+    let mut new_args = args.clone();
+
+    // Replace shell with litebox-sh
+    new_args[0] = "/bin/litebox-sh".to_string();
+    tracing::info!(
+        original = %original_shell,
+        "rewriting shell entrypoint: {} -> /bin/litebox-sh",
+        original_shell
+    );
+
+    // Layer 2: Add exec before final external command in -c string
+    let script = &args[2];
+    if let Some(rewritten) = add_exec_to_final_command(script) {
+        tracing::info!(
+            original = %script,
+            rewritten = %rewritten,
+            "added exec before final external command"
+        );
+        new_args[2] = rewritten;
+    }
+
+    new_args
+}
+
+/// Parse a `-c` script string and add `exec` before the final external command.
+///
+/// Only applies if the final command is external (not a builtin) and doesn't
+/// already have an `exec` prefix. Returns None if no change is needed.
+fn add_exec_to_final_command(script: &str) -> Option<String> {
+    // Split by operators (&&, ||, ;) to find the last command segment
+    // We need to track positions to reconstruct the string
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let bytes = script.as_bytes();
+    let mut i = 0;
+    let mut seg_start = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'\\' if !in_single_quote => {
+                i += 1; // skip escaped char
+            }
+            b'&' if !in_single_quote && !in_double_quote => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                    segments.push((seg_start, i));
+                    i += 2;
+                    seg_start = i;
+                    continue;
+                }
+            }
+            b'|' if !in_single_quote && !in_double_quote => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+                    segments.push((seg_start, i));
+                    i += 2;
+                    seg_start = i;
+                    continue;
+                }
+            }
+            b';' if !in_single_quote && !in_double_quote => {
+                segments.push((seg_start, i));
+                i += 1;
+                seg_start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push((seg_start, bytes.len()));
+
+    // Get the last non-empty segment
+    let (last_start, last_end) = segments.last()?;
+    let last_cmd = script[*last_start..*last_end].trim();
+
+    if last_cmd.is_empty() {
+        return None;
+    }
+
+    // Extract the command name (first word, ignoring variable assignments)
+    let cmd_name = extract_command_name(last_cmd)?;
+
+    // Skip if it's already an exec or a builtin
+    if cmd_name == "exec" || SHELL_BUILTINS.contains(&cmd_name.as_str()) {
+        return None;
+    }
+
+    // Add exec before the final command
+    let prefix = &script[..*last_start];
+    let last_trimmed_start =
+        *last_start + (script[*last_start..].len() - script[*last_start..].trim_start().len());
+    let spacing = &script[*last_start..last_trimmed_start];
+    let last_content = script[last_trimmed_start..].trim_end();
+    let trailing = &script[last_trimmed_start + last_content.len()..];
+
+    Some(format!("{prefix}{spacing}exec {last_content}{trailing}"))
+}
+
+/// Extract the command name from a command string, skipping leading
+/// variable assignments (e.g., `FOO=bar cmd` → `cmd`).
+fn extract_command_name(cmd: &str) -> Option<String> {
+    for word in cmd.split_whitespace() {
+        // Skip variable assignments
+        if word.contains('=') && !word.starts_with('=') && !word.starts_with('-') {
+            continue;
+        }
+        // Strip path to get base command name
+        let base = if let Some(pos) = word.rfind('/') {
+            &word[pos + 1..]
+        } else {
+            word
+        };
+        return Some(base.to_string());
+    }
+    None
+}
+
 /// Cache directory for rewritten binaries (used in eager mode)
 fn cache_dir() -> PathBuf {
     // Use XDG cache dir or fallback to ~/.cache
@@ -380,6 +543,7 @@ pub fn run_container(bundle_path: &Path) -> Result<i32> {
         &StdioRedirect::default(),
         &NetworkConfig::default(),
         LazyMode::Eager,
+        true,
     )
 }
 
@@ -397,6 +561,7 @@ pub fn run_container_with_options(
         &StdioRedirect::default(),
         &NetworkConfig::default(),
         LazyMode::Eager,
+        true,
     )
 }
 
@@ -418,6 +583,7 @@ pub fn run_container_with_all_options(
         &StdioRedirect::default(),
         &NetworkConfig::default(),
         LazyMode::Eager,
+        true,
     )
 }
 
@@ -429,6 +595,7 @@ pub fn run_container_full(
     mounts: &[Mount],
     stdio: &StdioRedirect,
     network: &NetworkConfig,
+    rewrite_shell: bool,
 ) -> Result<i32> {
     if let Some(args) = override_args
         && args.is_empty()
@@ -443,6 +610,7 @@ pub fn run_container_full(
         stdio,
         network,
         LazyMode::Eager,
+        rewrite_shell,
     )
 }
 
@@ -469,6 +637,7 @@ pub fn run_container_lazy(
     mounts: &[Mount],
     stdio: &StdioRedirect,
     network: &NetworkConfig,
+    rewrite_shell: bool,
 ) -> Result<i32> {
     if let Some(args) = override_args
         && args.is_empty()
@@ -483,6 +652,7 @@ pub fn run_container_lazy(
         stdio,
         network,
         LazyMode::Squashfs,
+        rewrite_shell,
     )
 }
 
@@ -508,6 +678,7 @@ pub fn run_container_lazy_tar(
     mounts: &[Mount],
     stdio: &StdioRedirect,
     network: &NetworkConfig,
+    rewrite_shell: bool,
 ) -> Result<i32> {
     if let Some(args) = override_args
         && args.is_empty()
@@ -522,6 +693,7 @@ pub fn run_container_lazy_tar(
         stdio,
         network,
         LazyMode::TarLayered,
+        rewrite_shell,
     )
 }
 
@@ -540,6 +712,7 @@ pub fn run_container_lazy_rewrite(
     mounts: &[Mount],
     stdio: &StdioRedirect,
     network: &NetworkConfig,
+    rewrite_shell: bool,
 ) -> Result<i32> {
     if let Some(args) = override_args
         && args.is_empty()
@@ -554,6 +727,7 @@ pub fn run_container_lazy_rewrite(
         stdio,
         network,
         LazyMode::LazyRewrite,
+        rewrite_shell,
     )
 }
 
@@ -587,6 +761,7 @@ impl litebox::fs::layered::ExecutableTransform for SyscallRewriter {
 }
 
 /// Internal implementation that handles both regular run and exec.
+#[allow(clippy::too_many_arguments)]
 fn run_container_internal(
     bundle_path: &Path,
     override_args: Option<&[String]>,
@@ -595,6 +770,7 @@ fn run_container_internal(
     stdio: &StdioRedirect,
     network: &NetworkConfig,
     lazy_mode: LazyMode,
+    rewrite_shell: bool,
 ) -> Result<i32> {
     // Set up stdio redirection before running
     let _stdout_guard = if let Some(path) = &stdio.stdout {
@@ -655,6 +831,13 @@ fn run_container_internal(
             );
         }
         spec_args.clone()
+    };
+
+    // Rewrite shell entrypoints for fork-free compatibility
+    let args = if rewrite_shell {
+        rewrite_shell_args(args)
+    } else {
+        args
     };
 
     tracing::info!(
@@ -1195,6 +1378,26 @@ fn run_container_internal(
             });
         }
 
+        // Inject litebox-sh (fork-free shell) into rootfs when shell rewriting is enabled
+        #[cfg(target_arch = "x86_64")]
+        if rewrite_shell {
+            let rewritten = rewrite_with_cache(LITEBOX_SH_BINARY);
+            in_mem.with_root_privileges(|fs| {
+                let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+                let _ = fs.mkdir("/bin", rwxr_xr_x);
+                let fd = fs
+                    .open(
+                        "/bin/litebox-sh",
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        rwxr_xr_x,
+                    )
+                    .expect("Failed to create /bin/litebox-sh");
+                fs.initialize_primarily_read_heavy_file(&fd, rewritten.into());
+                fs.close(&fd).expect("Failed to close /bin/litebox-sh");
+            });
+            tracing::debug!("injected /bin/litebox-sh into rootfs");
+        }
+
         // Create read-only layer from tar data
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox_instance, tar_data);
 
@@ -1393,4 +1596,193 @@ fn redirect_stderr(path: &Path) -> Result<StderrGuard> {
     }
 
     Ok(StderrGuard { original_fd })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_shell_args_replaces_sh() {
+        let args = vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()];
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+        assert_eq!(result[1], "-c");
+    }
+
+    #[test]
+    fn test_rewrite_shell_args_replaces_bin_sh() {
+        let args = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo hello".to_string(),
+        ];
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+    }
+
+    #[test]
+    fn test_rewrite_shell_args_replaces_bash() {
+        let args = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            "echo hello".to_string(),
+        ];
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+    }
+
+    #[test]
+    fn test_rewrite_shell_args_ignores_non_shell() {
+        let args = vec![
+            "/usr/bin/python3".to_string(),
+            "-c".to_string(),
+            "print('hi')".to_string(),
+        ];
+        let result = rewrite_shell_args(args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_rewrite_shell_args_ignores_without_c_flag() {
+        let args = vec!["sh".to_string(), "/entrypoint.sh".to_string()];
+        let result = rewrite_shell_args(args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_rewrite_shell_args_ignores_direct_exec() {
+        let args = vec!["/bin/ls".to_string(), "/".to_string()];
+        let result = rewrite_shell_args(args.clone());
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn test_add_exec_to_final_external_command() {
+        let result = add_exec_to_final_command("export FOO=bar && /app/server");
+        assert_eq!(
+            result,
+            Some("export FOO=bar && exec /app/server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_exec_skips_builtin_final() {
+        let result = add_exec_to_final_command("cd /app && echo hello");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_add_exec_skips_already_exec() {
+        let result = add_exec_to_final_command("export FOO=bar && exec /app/server");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_add_exec_single_external() {
+        let result = add_exec_to_final_command("/app/server --port 8080");
+        assert_eq!(result, Some("exec /app/server --port 8080".to_string()));
+    }
+
+    #[test]
+    fn test_add_exec_single_builtin() {
+        let result = add_exec_to_final_command("echo hello");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_add_exec_with_or_operator() {
+        let result = add_exec_to_final_command("test -f /app/config || /app/setup");
+        assert_eq!(
+            result,
+            Some("test -f /app/config || exec /app/setup".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_exec_with_semicolon() {
+        let result = add_exec_to_final_command("export PATH=/app:$PATH; /app/server");
+        assert_eq!(
+            result,
+            Some("export PATH=/app:$PATH; exec /app/server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_exec_relative_command() {
+        let result = add_exec_to_final_command("cd /app && ./server");
+        assert_eq!(result, Some("cd /app && exec ./server".to_string()));
+    }
+
+    #[test]
+    fn test_add_exec_preserves_quotes() {
+        let result = add_exec_to_final_command(r#"export FOO="hello world" && /app/server"#);
+        assert_eq!(
+            result,
+            Some(r#"export FOO="hello world" && exec /app/server"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_exec_complex_chain() {
+        let result = add_exec_to_final_command("export A=1 && export B=2 && /app/server --flag");
+        assert_eq!(
+            result,
+            Some("export A=1 && export B=2 && exec /app/server --flag".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_command_name_absolute() {
+        assert_eq!(
+            extract_command_name("/usr/bin/python3 script.py"),
+            Some("python3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_command_name_relative() {
+        assert_eq!(
+            extract_command_name("./server --port 8080"),
+            Some("server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_command_name_with_env() {
+        assert_eq!(
+            extract_command_name("FOO=bar /app/server"),
+            Some("server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_command_name_simple() {
+        assert_eq!(extract_command_name("echo hello"), Some("echo".to_string()));
+    }
+
+    #[test]
+    fn test_full_rewrite_adds_exec() {
+        let args = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "export FOO=bar && /app/server".to_string(),
+        ];
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+        assert_eq!(result[2], "export FOO=bar && exec /app/server");
+    }
+
+    #[test]
+    fn test_full_rewrite_all_builtins_no_exec() {
+        let args = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "export FOO=bar && echo hello".to_string(),
+        ];
+        let result = rewrite_shell_args(args);
+        assert_eq!(result[0], "/bin/litebox-sh");
+        // No exec added since echo is a builtin
+        assert_eq!(result[2], "export FOO=bar && echo hello");
+    }
 }

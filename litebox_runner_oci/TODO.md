@@ -37,6 +37,7 @@
 - [x] Directory symlink handling for glibc-based distros (Debian, Ubuntu, Fedora)
 - [x] `chdir()` / `fchdir()` syscall support and `process.cwd` from OCI spec
 - [x] litebox-sh: fork-free minimal shell for container entrypoints
+- [x] Automatic shell rewriting: `sh -c` → `litebox-sh -c` with exec insertion
 
 ## TODO
 

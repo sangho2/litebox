@@ -182,6 +182,12 @@ enum Command {
         /// Other executables are lazily rewritten on first access. Fastest startup.
         #[clap(long)]
         lazy_rewrite: bool,
+
+        /// Disable automatic shell rewriting for fork-free compatibility.
+        /// By default, `sh -c "..."` entrypoints are rewritten to use litebox-sh
+        /// and `exec` is added before the final external command.
+        #[clap(long)]
+        no_rewrite_shell: bool,
     },
 
     /// Execute a command in a container's rootfs (simplified exec)
@@ -209,6 +215,10 @@ enum Command {
         /// Requires a pre-configured TUN device on the host.
         #[clap(long, value_name = "DEVICE")]
         tun_device: Option<String>,
+
+        /// Disable automatic shell rewriting for fork-free compatibility.
+        #[clap(long)]
+        no_rewrite_shell: bool,
 
         /// Command and arguments to execute
         #[clap(required = true, num_args = 1..)]
@@ -529,6 +539,7 @@ fn main() -> Result<()> {
             lazy,
             lazy_tar,
             lazy_rewrite,
+            no_rewrite_shell,
         } => {
             tracing::info!(
                 container_id = %container_id,
@@ -557,22 +568,47 @@ fn main() -> Result<()> {
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
             let mounts = parse_mounts(&mount)?;
+            let rewrite_shell = !no_rewrite_shell;
 
             let exit_code = if lazy_rewrite {
                 litebox_runner_oci::run_container_lazy_rewrite(
-                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                    &bundle,
+                    None,
+                    &extra_env,
+                    &mounts,
+                    &stdio,
+                    &network,
+                    rewrite_shell,
                 )?
             } else if lazy_tar {
                 litebox_runner_oci::run_container_lazy_tar(
-                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                    &bundle,
+                    None,
+                    &extra_env,
+                    &mounts,
+                    &stdio,
+                    &network,
+                    rewrite_shell,
                 )?
             } else if lazy {
                 litebox_runner_oci::run_container_lazy(
-                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                    &bundle,
+                    None,
+                    &extra_env,
+                    &mounts,
+                    &stdio,
+                    &network,
+                    rewrite_shell,
                 )?
             } else {
                 litebox_runner_oci::run_container_full(
-                    &bundle, None, &extra_env, &mounts, &stdio, &network,
+                    &bundle,
+                    None,
+                    &extra_env,
+                    &mounts,
+                    &stdio,
+                    &network,
+                    rewrite_shell,
                 )?
             };
             std::process::exit(exit_code);
@@ -584,6 +620,7 @@ fn main() -> Result<()> {
             env_file,
             mount,
             tun_device,
+            no_rewrite_shell,
             command,
         } => {
             tracing::info!(
@@ -614,6 +651,7 @@ fn main() -> Result<()> {
                 &mounts,
                 &litebox_runner_oci::StdioRedirect::default(),
                 &network,
+                !no_rewrite_shell,
             )?;
             std::process::exit(exit_code);
         }
