@@ -92,6 +92,7 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        _sigreturn_trampoline: Option<usize>,
     ) -> Result<(), DeliverFault> {
         if !action.flags.contains(SaFlags::RESTORER) {
             // No restorer was provided. This is optional on x86, but if one is

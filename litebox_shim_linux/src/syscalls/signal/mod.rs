@@ -28,7 +28,7 @@ use core::cell::{Cell, RefCell};
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 use litebox::shim::Exception;
 use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _},
     sync::Mutex,
     utils::ReinterpretUnsignedExt as _,
 };
@@ -353,6 +353,7 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        sigreturn_trampoline: Option<usize>,
     ) -> Result<(), DeliverFault> {
         let sp = arch::sp(ctx);
         let on_alt_stack = is_on_stack(&self.altstack.get(), sp);
@@ -372,7 +373,7 @@ impl SignalState {
             return Err(DeliverFault);
         }
 
-        self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
+        self.write_signal_frame(frame_addr, siginfo, action, ctx, sigreturn_trampoline)?;
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -592,9 +593,15 @@ impl Task {
                 }
                 SIG_IGN => {}
                 _ => {
-                    if let Err(DeliverFault) =
-                        self.signals.deliver_signal(signal, &siginfo, &action, ctx)
-                    {
+                    let sigreturn_trampoline =
+                        self.global.platform.get_sigreturn_trampoline_address();
+                    if let Err(DeliverFault) = self.signals.deliver_signal(
+                        signal,
+                        &siginfo,
+                        &action,
+                        ctx,
+                        sigreturn_trampoline,
+                    ) {
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).

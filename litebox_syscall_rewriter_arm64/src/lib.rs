@@ -589,6 +589,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // The trampoline scans this table to find the host TLS for the current thread.
     trampoline_data.extend_from_slice(&0u64.to_le_bytes());
 
+    // Sigreturn trampoline at offset 24.
+    // On ARM64, glibc does not set SA_RESTORER, so the shim needs a sigreturn
+    // trampoline address to use as the restorer when delivering signals to the guest.
+    // This trampoline sets x8 = __NR_rt_sigreturn (139) and then calls into the
+    // syscall handler via the same mechanism as the SVC trampolines.
+    assert_eq!(trampoline_data.len(), 24);
+    generate_sigreturn_trampoline(trampoline_base_addr, &mut trampoline_data);
+
     let mut syscall_insns_found = false;
     for s in &text_sections {
         let s = builder.sections.get_mut(*s);
@@ -891,6 +899,94 @@ fn hook_syscalls_in_section(
     }
 
     Ok(())
+}
+
+/// Generate sigreturn trampoline at a fixed offset (24) in the trampoline section.
+///
+/// On ARM64, glibc does not set `SA_RESTORER` when calling `sigaction()`.
+/// The kernel normally provides sigreturn via the vDSO, but since the guest runs
+/// inside the sandbox, we need our own sigreturn trampoline. This trampoline:
+///
+/// 1. Sets x8 = 139 (`__NR_rt_sigreturn`)
+/// 2. Saves x16, x17, x30 on the stack
+/// 3. Looks up host TLS from the per-thread table
+/// 4. Jumps to the syscall handler
+///
+/// The shim then handles `rt_sigreturn` by restoring the signal context.
+///
+/// When the signal handler returns (via `RET`), x30 (set by `write_signal_frame`)
+/// points here. SP at that point equals the signal frame address. After `SUB SP, #32`
+/// and the handler computing guest SP = (SP + 32), `sys_rt_sigreturn` reads the
+/// `Ucontext` from the correct frame address.
+fn generate_sigreturn_trampoline(trampoline_base_addr: u64, trampoline_data: &mut Vec<u8>) {
+    // 1. MOVZ X8, #139 - set syscall number to __NR_rt_sigreturn
+    trampoline_data.extend_from_slice(&encoder::encode_movz(8, 139, 0));
+
+    // 2. SUB SP, SP, #32
+    trampoline_data
+        .extend_from_slice(&encoder::encode_sub_imm(31, 31, 32).expect("SUB SP encoding"));
+
+    // 3. STR X16, [SP, #0]
+    trampoline_data
+        .extend_from_slice(&encoder::encode_str_imm(16, 31, 0).expect("STR X16 encoding"));
+
+    // 4. STR X17, [SP, #8]
+    trampoline_data
+        .extend_from_slice(&encoder::encode_str_imm(17, 31, 8).expect("STR X17 encoding"));
+
+    // 5. STR X30, [SP, #16]
+    trampoline_data
+        .extend_from_slice(&encoder::encode_str_imm(30, 31, 16).expect("STR X30 encoding"));
+
+    // 6. LDR X16, [PC, #offset] - load table pointer from header[16]
+    let table_ptr_location = trampoline_base_addr + 16;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let ldr_tls_offset = table_ptr_location as i64 - current_pc as i64;
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_literal(16, ldr_tls_offset as i32).expect("LDR table ptr encoding"),
+    );
+
+    // 7. MRS X17, TPIDR_EL0
+    trampoline_data.extend_from_slice(&encoder::encode_mrs_tpidr_el0(17));
+
+    // 8. LDR X18, [X16, #0] - loop start: load table[i].guest_tpidr
+    trampoline_data
+        .extend_from_slice(&encoder::encode_ldr_imm(18, 16, 0).expect("LDR X18 encoding"));
+
+    // 9. CMP X18, X17
+    trampoline_data.extend_from_slice(&encoder::encode_cmp_reg(18, 17));
+
+    // 10. B.EQ +12 (skip to step 13)
+    trampoline_data
+        .extend_from_slice(&encoder::encode_b_cond(encoder::COND_EQ, 12).expect("B.EQ encoding"));
+
+    // 11. ADD X16, X16, #16
+    trampoline_data
+        .extend_from_slice(&encoder::encode_add_imm(16, 16, 16).expect("ADD X16 encoding"));
+
+    // 12. B -16 (back to step 8)
+    let loop_start = trampoline_base_addr + trampoline_data.len() as u64 - 16;
+    let current_addr = trampoline_base_addr + trampoline_data.len() as u64;
+    trampoline_data
+        .extend_from_slice(&encoder::encode_b(current_addr, loop_start).expect("B loop encoding"));
+
+    // 13. LDR X18, [X16, #8] - load host_tls from matched entry
+    trampoline_data
+        .extend_from_slice(&encoder::encode_ldr_imm(18, 16, 8).expect("LDR host_tls encoding"));
+
+    // 14. MOV X30, XZR - clear return address (rt_sigreturn restores full context)
+    trampoline_data.extend_from_slice(&encoder::encode_mov_reg(30, 31));
+
+    // 15. LDR X16, [PC, #offset] - load handler address from header[8]
+    let handler_addr_location = trampoline_base_addr + 8;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let ldr_offset = handler_addr_location as i64 - current_pc as i64;
+    trampoline_data.extend_from_slice(
+        &encoder::encode_ldr_literal(16, ldr_offset as i32).expect("LDR handler encoding"),
+    );
+
+    // 16. BR X16
+    trampoline_data.extend_from_slice(&encoder::encode_br(16));
 }
 
 /// Generate trampoline using direct branch (B instruction)

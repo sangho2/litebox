@@ -51,6 +51,7 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        _sigreturn_trampoline: Option<usize>,
     ) -> Result<(), DeliverFault> {
         if !action.flags.contains(SaFlags::RESTORER) {
             return Err(DeliverFault);

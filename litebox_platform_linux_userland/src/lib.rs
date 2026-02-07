@@ -2264,6 +2264,18 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         }
         self.vdso_address
     }
+
+    fn get_sigreturn_trampoline_address(&self) -> Option<usize> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let base = GLOBAL_TRAMPOLINE_BASE.load(core::sync::atomic::Ordering::Acquire);
+            if base != 0 {
+                // Sigreturn trampoline is at offset 24 in the trampoline section header.
+                return Some(base + 24);
+            }
+        }
+        None
+    }
 }
 
 impl LinuxUserland {
@@ -2313,6 +2325,11 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     #[cfg(target_arch = "x86_64")]
     fn clear_guest_thread_local_storage() {
         set_guest_fsbase(0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn clear_guest_thread_local_storage() {
+        set_guest_tpidr(0);
     }
 
     #[cfg(target_arch = "x86")]

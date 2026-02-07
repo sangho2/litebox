@@ -582,6 +582,15 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// Get the address of a sigreturn trampoline for signal delivery.
+    ///
+    /// On ARM64, glibc does not set `SA_RESTORER` in `sigaction()`, so the shim
+    /// needs a trampoline that performs `rt_sigreturn` to use as the restorer.
+    /// Returns `None` if no sigreturn trampoline is available.
+    fn get_sigreturn_trampoline_address(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A provider for thread-local storage.

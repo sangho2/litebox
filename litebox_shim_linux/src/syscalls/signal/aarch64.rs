@@ -46,10 +46,17 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        sigreturn_trampoline: Option<usize>,
     ) -> Result<(), DeliverFault> {
-        if !action.flags.contains(SaFlags::RESTORER) {
+        // Determine the restorer address. On ARM64, glibc does not set
+        // SA_RESTORER, so we fall back to the platform's sigreturn trampoline.
+        let restorer = if action.flags.contains(SaFlags::RESTORER) {
+            action.restorer
+        } else if let Some(trampoline_addr) = sigreturn_trampoline {
+            trampoline_addr
+        } else {
             return Err(DeliverFault);
-        }
+        };
 
         // Build the sigcontext from the current register state
         let mut regs = [0u64; 31];
@@ -57,13 +64,16 @@ impl SignalState {
             regs[i] = *r as u64;
         }
 
+        // Set fault_address from last exception info
+        let last_exception = self.last_exception.get();
+
         let frame = SignalFrame {
             ucontext: Ucontext {
                 flags: 0,
                 link: 0,
                 stack: self.altstack.get(),
                 mcontext: Sigcontext {
-                    fault_address: 0, // TODO: set from exception info if applicable
+                    fault_address: last_exception.far as u64,
                     regs,
                     sp: ctx.sp as u64,
                     pc: ctx.pc as u64,
@@ -91,7 +101,7 @@ impl SignalState {
         // x2 = pointer to ucontext
         ctx.regs[2] = frame_addr.wrapping_add(offset_of!(SignalFrame, ucontext));
         // x30 (link register) = restorer
-        ctx.regs[30] = action.restorer;
+        ctx.regs[30] = restorer;
 
         Ok(())
     }
