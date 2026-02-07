@@ -30,7 +30,6 @@ struct Runner {
     cmd_path: PathBuf,
     cmd_args: Vec<OsString>,
     has_run: bool,
-    backend: Backend,
 }
 
 /// Get the output directory for test artifacts
@@ -154,7 +153,6 @@ impl Runner {
             cmd_args: Vec::new(),
             has_run: false,
             unique_name: unique_name.to_owned(),
-            backend,
         }
     }
 

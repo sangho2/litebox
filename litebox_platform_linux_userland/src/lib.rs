@@ -918,7 +918,6 @@ pub fn set_trampoline_base(addr: usize) {
         unsafe {
             core::ptr::write_volatile((addr + 16) as *mut u64, table_ptr as u64);
         }
-    } else {
     }
 
     // Also store in TLS for fast access in switch_to_guest
