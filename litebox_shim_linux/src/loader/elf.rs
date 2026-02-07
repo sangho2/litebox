@@ -10,12 +10,12 @@ use litebox::{
     platform::{RawConstPointer as _, SystemInfoProvider as _},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
-use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_common_linux::{errno::Errno, loader::ElfParsedFile, MapFlags};
 use thiserror::Error;
 
 use crate::{
-    MutPtr,
     loader::auxv::{AuxKey, AuxVec},
+    MutPtr,
 };
 
 use super::stack::UserStack;
@@ -64,7 +64,7 @@ impl litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_> {
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
+        Ok(self.task.sys_fstat(self.fd)?.st_size.cast_unsigned())
     }
 }
 
@@ -251,10 +251,21 @@ impl<'a> ElfLoader<'a> {
             .init(argv, envp, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
+        // Use the main binary's trampoline address if it has one, otherwise
+        // fall back to the interpreter's trampoline address. This is critical for
+        // dynamically linked binaries where the main binary may have no syscalls
+        // (and thus no trampoline), but the interpreter (ld-linux) has been rewritten
+        // and does have a trampoline. Without this, trampoline_base stays 0 in TLS
+        // and switch_to_guest won't write host TLS to the trampoline data section,
+        // causing a SIGSEGV when the rewritten code tries to use it.
+        let trampoline_addr = info
+            .trampoline_addr
+            .or(interp.as_ref().and_then(|i| i.trampoline_addr));
+
         Ok(ElfLoadInfo {
             entry_point: entry,
             user_stack_top: stack.get_cur_stack_top(),
-            trampoline_addr: info.trampoline_addr,
+            trampoline_addr,
         })
     }
 

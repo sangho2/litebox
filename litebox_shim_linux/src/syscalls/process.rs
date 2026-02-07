@@ -19,7 +19,7 @@ use litebox::platform::RawMutPointer as _;
 use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
+    RawConstPointer as _, RawMutex as _,
     ThreadLocalStorageProvider as _,
 };
 use litebox::sync::Mutex;
@@ -1510,7 +1510,6 @@ impl Task {
                         // Store in the Process for new threads to inherit
                         self.thread.process().set_trampoline_addr(trampoline_addr);
                         // Use the platform's function through the multiplex layer
-                        use litebox::platform::RawConstPointer as _;
                         litebox_platform_multiplex::platform()
                             .set_trampoline_base_addr(trampoline_addr);
                     }
@@ -1547,24 +1546,23 @@ impl Task {
                     // New threads need this set in their TLS for syscall interception to work.
                     #[cfg(feature = "platform_linux_userland")]
                     if let Some(trampoline_addr) = self.thread.process().get_trampoline_addr() {
-                        use litebox::platform::RawConstPointer as _;
                         litebox_platform_multiplex::platform()
                             .set_trampoline_base_addr(trampoline_addr);
                     }
                 }
 
                 // Set the TLS for the new thread.
-                if let Some(tls) = tls {
+                if let Some(_tls) = tls {
                     #[cfg(target_arch = "x86")]
                     {
-                        let mut tls = tls;
-                        self.set_thread_area(&mut tls).unwrap();
+                        let mut _tls = _tls;
+                        self.set_thread_area(&mut _tls).unwrap();
                     }
 
                     #[cfg(target_arch = "x86_64")]
                     {
                         use litebox::platform::RawConstPointer as _;
-                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
+                        self.sys_arch_prctl(ArchPrctlArg::SetFs(_tls.as_usize()))
                             .unwrap();
                     }
                 }

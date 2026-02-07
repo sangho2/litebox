@@ -777,6 +777,15 @@ impl Task {
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
+            SyscallRequest::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname
+                .to_cstring()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_faccessat(dirfd, path, mode))
+                }),
             SyscallRequest::Madvise {
                 addr,
                 length,
@@ -1007,19 +1016,21 @@ impl Task {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             SyscallRequest::Newfstatat {
                 dirfd,
                 pathname,
                 buf,
                 flags,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
-                    buf.write_at_offset(0, stat)
-                        .ok_or(Errno::EFAULT)
-                        .map(|()| 0)
+            } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                        buf.write_at_offset(0, stat)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
                 })
-            }),
+            }
             #[cfg(target_arch = "x86")]
             SyscallRequest::Fstatat64 {
                 dirfd,
@@ -1029,6 +1040,28 @@ impl Task {
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
                     buf.write_at_offset(0, stat.into())
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }),
+            SyscallRequest::Statfs { pathname, buf } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.sys_statfs(path).and_then(|statfs| {
+                        buf.write_at_offset(0, statfs)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                })
+            }
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                buf,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.sys_statx(dirfd, path, flags, mask).and_then(|statx| {
+                    buf.write_at_offset(0, statx)
                         .ok_or(Errno::EFAULT)
                         .map(|()| 0)
                 })

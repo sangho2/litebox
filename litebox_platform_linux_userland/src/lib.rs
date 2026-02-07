@@ -116,7 +116,7 @@ impl LinuxUserland {
                 #[cfg(target_arch = "aarch64")]
                 let open_sysno = syscalls::Sysno::openat;
                 #[cfg(target_arch = "aarch64")]
-                let at_fdcwd: usize = (-100isize) as usize;
+                let at_fdcwd: usize = (-100isize).cast_unsigned();
                 let tun_fd = unsafe {
                     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
                     {
@@ -231,7 +231,7 @@ impl LinuxUserland {
             }
             #[cfg(target_arch = "aarch64")]
             {
-                const AT_FDCWD: usize = (-100isize) as usize;
+                const AT_FDCWD: usize = (-100isize).cast_unsigned();
                 syscalls::syscall4(
                     syscalls::Sysno::openat,
                     AT_FDCWD,
@@ -828,7 +828,7 @@ fn guest_tpidr_offset() -> isize {
         static guest_tpidr: u8;
     }
     // Calculate TLS offset - this is a simplification
-    unsafe { (&raw const guest_tpidr as isize).wrapping_sub(0) }
+    (&raw const guest_tpidr as isize).wrapping_sub(0)
 }
 
 /// Global storage for trampoline base address (ARM64 only).
@@ -1497,7 +1497,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         Instant {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: Duration::new(
-                t.tv_sec.reinterpret_as_unsigned().into(),
+                t.tv_sec.reinterpret_as_unsigned(),
                 t.tv_nsec.reinterpret_as_unsigned().truncate(),
             ),
         }
@@ -1510,7 +1510,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         SystemTime {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: Duration::new(
-                t.tv_sec.reinterpret_as_unsigned().into(),
+                t.tv_sec.reinterpret_as_unsigned(),
                 t.tv_nsec.reinterpret_as_unsigned().truncate(),
             ),
         }
@@ -2072,7 +2072,9 @@ impl ThreadContext<'_> {
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::ResumeGuest => {
+                unsafe { switch_to_guest(self.ctx) }
+            }
             ContinueOperation::ExitThread => {}
         }
     }
@@ -2222,22 +2224,20 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     // Use raw syscalls with magic flags to bypass seccomp filter
     let stack_base = unsafe {
         let flags =
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | syscall_intercept::MMAP_FLAG_MAGIC as i32;
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | syscall_intercept::MMAP_FLAG_MAGIC.cast_signed();
         let r = syscalls::raw::syscall6(
             syscalls::Sysno::mmap,
             0, // addr
             guard_page_size + alt_stack_size,
             (libc::PROT_READ | libc::PROT_WRITE) as usize,
-            flags as usize,
+            flags.cast_unsigned() as usize,
             usize::MAX, // fd = -1
             0,          // offset
         );
-        if (r as isize) < 0 {
-            panic!(
-                "failed to allocate memory for alternate signal stack: {}",
-                syscalls::Errno::from_ret(r).unwrap_err()
-            );
-        }
+        assert!(r.cast_signed() >= 0, 
+            "failed to allocate memory for alternate signal stack: {}",
+            syscalls::Errno::from_ret(r).unwrap_err()
+        );
         r as *mut libc::c_void
     };
     let _unmap_guard = litebox::utils::defer(|| {
@@ -2251,7 +2251,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
             )
         };
         assert!(
-            (r as isize) >= 0,
+            r.cast_signed() >= 0,
             "failed to free memory for alternate signal stack"
         );
     });
@@ -2267,7 +2267,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
         )
     };
     assert!(
-        (r as isize) >= 0,
+        r.cast_signed() >= 0,
         "failed to set guard page for alternate signal stack"
     );
 
@@ -2633,12 +2633,13 @@ fn signal_handler_exit_guest(
 #[cfg(target_arch = "aarch64")]
 fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::ucontext_t) {
     // Copy general purpose registers x0-x30
+    // On aarch64, u64 and usize are the same width so these conversions never fail.
     for i in 0..31 {
-        regs.regs[i] = context.uc_mcontext.regs[i] as usize;
+        regs.regs[i] = usize::try_from(context.uc_mcontext.regs[i]).unwrap();
     }
-    regs.sp = context.uc_mcontext.sp as usize;
-    regs.pc = context.uc_mcontext.pc as usize;
-    regs.pstate = context.uc_mcontext.pstate as usize;
+    regs.sp = usize::try_from(context.uc_mcontext.sp).unwrap();
+    regs.pc = usize::try_from(context.uc_mcontext.pc).unwrap();
+    regs.pstate = usize::try_from(context.uc_mcontext.pstate).unwrap();
     regs.orig_x0 = regs.regs[0];
     regs.syscallno = regs.regs[8]; // x8 contains syscall number on ARM64
 }
@@ -2653,11 +2654,11 @@ fn set_signal_return(
     p2: isize,
     p3: isize,
 ) {
-    context.uc_mcontext.pc = f as u64;
-    context.uc_mcontext.regs[0] = p0 as u64;
-    context.uc_mcontext.regs[1] = p1 as u64;
-    context.uc_mcontext.regs[2] = p2 as u64;
-    context.uc_mcontext.regs[3] = p3 as u64;
+    context.uc_mcontext.pc = f as usize as u64;
+    context.uc_mcontext.regs[0] = p0.cast_unsigned() as u64;
+    context.uc_mcontext.regs[1] = p1.cast_unsigned() as u64;
+    context.uc_mcontext.regs[2] = p2.cast_unsigned() as u64;
+    context.uc_mcontext.regs[3] = p3.cast_unsigned() as u64;
 
     // Set x18 to host TLS so that exception_callback/interrupt_callback can access
     // host TLS correctly when the signal handler returns. signal_handler_exit_guest
@@ -2748,7 +2749,7 @@ unsafe extern "C" fn exception_signal_handler(
     let (trapno, err, cr2) = {
         // ARM64 doesn't have these x86-specific registers
         // Use fault_address from sigcontext
-        let fault_addr = context.uc_mcontext.fault_address as isize;
+        let fault_addr = usize::try_from(context.uc_mcontext.fault_address).unwrap().cast_signed();
         (0isize, 0isize, fault_addr)
     };
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
@@ -2774,7 +2775,7 @@ unsafe fn next_signal_handler(
             }
             #[cfg(target_arch = "aarch64")]
             {
-                context.uc_mcontext.pc as usize
+                usize::try_from(context.uc_mcontext.pc).unwrap()
             }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
@@ -2856,7 +2857,7 @@ unsafe fn interrupt_signal_handler(
     #[cfg(target_arch = "x86")]
     let ip = context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize;
     #[cfg(target_arch = "aarch64")]
-    let ip = context.uc_mcontext.pc as usize;
+    let ip = usize::try_from(context.uc_mcontext.pc).unwrap();
 
     // Case 1: at the beginning of the syscall handler.
     //

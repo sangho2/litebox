@@ -8,9 +8,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::LiteBox;
 use crate::path::Arg;
 use crate::sync;
+use crate::LiteBox;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
@@ -188,6 +188,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::EXCL
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
+            | OFlags::NDELAY
+            | OFlags::DIRECT
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
             | OFlags::APPEND;

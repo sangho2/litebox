@@ -285,8 +285,9 @@ impl From<litebox::fs::FileType> for DirentType {
     }
 }
 
-/// Linux's `stat` struct
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// Linux's `stat` struct for x86_64
+/// Note: ARM64 has a different layout - see the aarch64-specific definition below.
+#[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
 #[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
@@ -312,6 +313,39 @@ pub struct FileStat {
     pub __unused: [i64; 3],
 }
 
+/// Linux's `stat` struct for ARM64 (aarch64)
+/// This layout matches the kernel's asm-generic/stat.h for 64-bit architectures
+/// but with ARM64-specific field ordering and sizes.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
+pub struct FileStat {
+    pub st_dev: u64,   // 0-7
+    pub st_ino: u64,   // 8-15
+    pub st_mode: u32,  // 16-19 (note: before st_nlink on ARM64)
+    pub st_nlink: u32, // 20-23 (u32, not u64 like x86_64)
+    pub st_uid: u32,   // 24-27
+    pub st_gid: u32,   // 28-31
+    pub st_rdev: u64,  // 32-39
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad1: u64, // 40-47
+    pub st_size: i64,  // 48-55
+    pub st_blksize: i32, // 56-59 (i32, not usize)
+    #[expect(clippy::pub_underscore_fields)]
+    pub __pad2: i32, // 60-63
+    pub st_blocks: i64, // 64-71
+    pub st_atime: i64, // 72-79
+    pub st_atime_nsec: u64, // 80-87
+    pub st_mtime: i64, // 88-95
+    pub st_mtime_nsec: u64, // 96-103
+    pub st_ctime: i64, // 104-111
+    pub st_ctime_nsec: u64, // 112-119
+    #[expect(clippy::pub_underscore_fields)]
+    pub __unused4: u32, // 120-123
+    #[expect(clippy::pub_underscore_fields)]
+    pub __unused5: u32, // 124-127
+} // Total: 128 bytes
+
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86")]
 #[repr(C)]
@@ -336,6 +370,14 @@ pub struct FileStat {
     #[expect(clippy::pub_underscore_fields)]
     pub __unused: [u32; 2],
 }
+
+// Compile-time size assertions for FileStat to catch layout mismatches
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::size_of::<FileStat>() == 144);
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::size_of::<FileStat>() == 128);
+#[cfg(target_arch = "x86")]
+const _: () = assert!(core::mem::size_of::<FileStat>() == 64);
 
 /// Linux's `stat64` struct
 #[cfg(target_arch = "x86")]
@@ -391,6 +433,112 @@ impl From<FileStat> for FileStat64 {
             st_ino: u64::from(stat.st_ino),
         }
     }
+}
+
+/// Linux's `statfs` struct (for 64-bit architectures: x86_64, aarch64)
+/// Matches kernel's asm-generic/statfs.h with __kernel_long_t = i64 on 64-bit.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct StatFs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: i64,
+    pub f_bfree: i64,
+    pub f_bavail: i64,
+    pub f_files: i64,
+    pub f_ffree: i64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const _: () = assert!(core::mem::size_of::<StatFs>() == 120);
+
+/// Linux's `statfs` struct for x86 (32-bit)
+#[cfg(target_arch = "x86")]
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct StatFs {
+    pub f_type: i32,
+    pub f_bsize: i32,
+    pub f_blocks: i32,
+    pub f_bfree: i32,
+    pub f_bavail: i32,
+    pub f_files: i32,
+    pub f_ffree: i32,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i32,
+    pub f_frsize: i32,
+    pub f_flags: i32,
+    pub f_spare: [i32; 4],
+}
+
+#[cfg(target_arch = "x86")]
+const _: () = assert!(core::mem::size_of::<StatFs>() == 64);
+
+/// Linux's `statx_timestamp` struct
+#[repr(C)]
+#[derive(Clone, Default, Debug, FromBytes, IntoBytes)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __reserved: i32,
+}
+
+/// Linux's `statx` struct (from linux/stat.h)
+#[repr(C)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare0: [u16; 1],
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare3: [u64; 12],
+}
+
+const _: () = assert!(core::mem::size_of::<Statx>() == 256);
+
+/// `statx` mask bits
+pub mod statx_mask {
+    pub const STATX_TYPE: u32 = 0x0001;
+    pub const STATX_MODE: u32 = 0x0002;
+    pub const STATX_NLINK: u32 = 0x0004;
+    pub const STATX_UID: u32 = 0x0008;
+    pub const STATX_GID: u32 = 0x0010;
+    pub const STATX_ATIME: u32 = 0x0020;
+    pub const STATX_MTIME: u32 = 0x0040;
+    pub const STATX_CTIME: u32 = 0x0080;
+    pub const STATX_INO: u32 = 0x0100;
+    pub const STATX_SIZE: u32 = 0x0200;
+    pub const STATX_BLOCKS: u32 = 0x0400;
+    pub const STATX_BASIC_STATS: u32 = 0x07ff;
+    pub const STATX_BTIME: u32 = 0x0800;
 }
 
 /// Linux's `iovec` struct for `writev`
@@ -455,8 +603,8 @@ impl From<litebox::fs::FileStatus> for FileStat {
                 .map(|r| <_>::try_from(r.get()).unwrap())
                 .unwrap_or_default(),
             #[allow(clippy::cast_possible_wrap)]
-            st_size: size,
-            st_blksize: blksize,
+            st_size: size as _,
+            st_blksize: <_>::try_from(blksize).unwrap(),
             st_blocks: 0,
             ..Default::default()
         }
@@ -1968,6 +2116,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<CChar>,
         mode: AccessFlags,
     },
+    Faccessat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<CChar>,
+        mode: AccessFlags,
+    },
     Madvise {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
@@ -2145,6 +2298,17 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<CChar>,
         buf: Platform::RawMutPointer<FileStat64>,
         flags: AtFlags,
+    },
+    Statfs {
+        pathname: Platform::RawConstPointer<CChar>,
+        buf: Platform::RawMutPointer<StatFs>,
+    },
+    Statx {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<CChar>,
+        flags: AtFlags,
+        mask: u32,
+        buf: Platform::RawMutPointer<Statx>,
     },
     Eventfd2 {
         initval: u32,
@@ -2470,6 +2634,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::access => sys_req!(Access { pathname:*, mode }),
+            Sysno::faccessat => sys_req!(Faccessat { dirfd, pathname:*, mode }),
             #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
@@ -2847,13 +3012,15 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::statx => sys_req!(Statx { dirfd, pathname:*, flags, mask, buf:* }),
             // Noisy unsupported syscalls.
             #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             #[cfg(target_arch = "aarch64")]
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
@@ -3315,6 +3482,10 @@ impl<T: FromBytes, P: RawConstPointer<T>>
     ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
-        if v == 0 { None } else { Some(P::from_usize(v)) }
+        if v == 0 {
+            None
+        } else {
+            Some(P::from_usize(v))
+        }
     }
 }

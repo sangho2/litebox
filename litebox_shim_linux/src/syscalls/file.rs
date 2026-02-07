@@ -9,7 +9,7 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{wait::WaitError, Events},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{FileSystem as _, Mode, OFlags, SeekWhence},
     path,
@@ -17,8 +17,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    errno::Errno, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
+    IoReadVec, IoWriteVec, IoctlArg, TimeParam,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -637,6 +637,167 @@ impl Task {
             return Err(Errno::EACCES);
         }
         Ok(())
+    }
+
+    /// Handle syscall `faccessat`
+    pub fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: litebox_common_linux::AccessFlags,
+    ) -> Result<(), Errno> {
+        let fs_path = FsPath::new(dirfd, pathname)?;
+        match fs_path {
+            FsPath::Absolute { path } | FsPath::CwdRelative { path } => self.sys_access(path, mode),
+            FsPath::Cwd => {
+                if mode == litebox_common_linux::AccessFlags::F_OK {
+                    Ok(())
+                } else {
+                    self.sys_access("/", mode)
+                }
+            }
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => {
+                log_unsupported!("faccessat with FsPath::Fd/FdRelative");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
+    /// Handle syscall `statfs`
+    ///
+    /// Returns filesystem statistics. Since litebox uses in-memory filesystems,
+    /// we return values resembling a tmpfs filesystem.
+    pub fn sys_statfs(
+        &self,
+        pathname: impl path::Arg,
+    ) -> Result<litebox_common_linux::StatFs, Errno> {
+        const TMPFS_MAGIC: i64 = 0x01021994;
+        // Verify the path exists
+        let _ = self.global.fs.file_status(pathname)?;
+        // Return tmpfs-like statfs
+        Ok(litebox_common_linux::StatFs {
+            f_type: TMPFS_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 1024 * 1024, // ~4GB total
+            f_bfree: 1024 * 1024,  // all free
+            f_bavail: 1024 * 1024, // all available
+            f_files: 1024 * 1024,  // max inodes
+            f_ffree: 1024 * 1024,  // all free
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+            f_spare: [0; 4],
+        })
+    }
+
+    /// Handle syscall `statx`
+    ///
+    /// Returns extended file status information.
+    pub fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        _flags: litebox_common_linux::AtFlags,
+        mask: u32,
+    ) -> Result<litebox_common_linux::Statx, Errno> {
+        use litebox_common_linux::statx_mask;
+
+        let _ = mask; // We fill in all basic fields regardless of mask
+        let fs_path = FsPath::new(dirfd, pathname)?;
+        let status = match fs_path {
+            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+                self.global.fs.file_status(path)?
+            }
+            FsPath::Cwd => self.global.fs.file_status("")?,
+            FsPath::Fd(fd) => {
+                let files = self.files.borrow();
+                let fstat = files
+                    .file_descriptors
+                    .read()
+                    .get_fd(fd)
+                    .ok_or(Errno::EBADF)?
+                    .stat(self)?;
+                // Convert FileStat back to minimal FileStatus for statx
+                // This is a simplified path; we construct statx directly from fstat
+                let mode_bits = fstat.st_mode;
+                return Ok(litebox_common_linux::Statx {
+                    stx_mask: statx_mask::STATX_BASIC_STATS,
+                    stx_blksize: fstat.st_blksize.cast_unsigned(),
+                    stx_attributes: 0,
+                    stx_nlink: fstat.st_nlink,
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                    stx_uid: fstat.st_uid,
+                    #[cfg(target_arch = "x86")]
+                    stx_uid: u32::from(fstat.st_uid),
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                    stx_gid: fstat.st_gid,
+                    #[cfg(target_arch = "x86")]
+                    stx_gid: u32::from(fstat.st_gid),
+                    stx_mode: u16::try_from(mode_bits).unwrap(),
+                    __spare0: [0],
+                    stx_ino: fstat.st_ino,
+                    stx_size: fstat.st_size.cast_unsigned(),
+                    stx_blocks: fstat.st_blocks.cast_unsigned(),
+                    stx_attributes_mask: 0,
+                    stx_atime: litebox_common_linux::StatxTimestamp::default(),
+                    stx_btime: litebox_common_linux::StatxTimestamp::default(),
+                    stx_ctime: litebox_common_linux::StatxTimestamp::default(),
+                    stx_mtime: litebox_common_linux::StatxTimestamp::default(),
+                    stx_rdev_major: 0,
+                    stx_rdev_minor: 0,
+                    stx_dev_major: 0,
+                    stx_dev_minor: 0,
+                    stx_mnt_id: 0,
+                    stx_dio_mem_align: 0,
+                    stx_dio_offset_align: 0,
+                    __spare3: [0; 12],
+                });
+            }
+            FsPath::FdRelative { .. } => {
+                log_unsupported!("statx with FsPath::FdRelative");
+                return Err(Errno::EINVAL);
+            }
+        };
+
+        let litebox::fs::FileStatus {
+            file_type,
+            mode,
+            size,
+            owner: litebox::fs::UserInfo { user, group },
+            node_info: litebox::fs::NodeInfo { dev, ino, rdev },
+            blksize,
+            ..
+        } = status;
+
+        let inode_type = litebox_common_linux::InodeType::from(file_type);
+
+        Ok(litebox_common_linux::Statx {
+            stx_mask: statx_mask::STATX_BASIC_STATS,
+            stx_blksize: u32::try_from(blksize).unwrap(),
+            stx_attributes: 0,
+            stx_nlink: 1,
+            stx_uid: u32::from(user),
+            stx_gid: u32::from(group),
+            stx_mode: u16::try_from(mode.bits() | inode_type as u32).unwrap(),
+            __spare0: [0],
+            stx_ino: ino as u64,
+            stx_size: size as u64,
+            stx_blocks: 0,
+            stx_attributes_mask: 0,
+            stx_atime: litebox_common_linux::StatxTimestamp::default(),
+            stx_btime: litebox_common_linux::StatxTimestamp::default(),
+            stx_ctime: litebox_common_linux::StatxTimestamp::default(),
+            stx_mtime: litebox_common_linux::StatxTimestamp::default(),
+            stx_rdev_major: rdev.map_or(0, |r| u32::try_from(r.get() >> 8).unwrap()),
+            stx_rdev_minor: rdev.map_or(0, |r| u32::try_from(r.get() & 0xff).unwrap()),
+            stx_dev_major: u32::try_from(dev >> 8).unwrap(),
+            stx_dev_minor: u32::try_from(dev & 0xff).unwrap(),
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+            __spare3: [0; 12],
+        })
     }
 
     /// Read the target of a symbolic link

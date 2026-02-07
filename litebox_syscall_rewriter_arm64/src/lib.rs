@@ -58,15 +58,6 @@ pub const TRAMPOLINE_SECTION_NAME_PREFIX: &str = ".trampolineLB";
 /// The name of the section for the trampoline.
 pub const TRAMPOLINE_SECTION_NAME: &str = ".trampolineLB0";
 
-/// Size of the data section (magic + handler + host TLS).
-/// This is kept small to fit in one page.
-pub const TRAMPOLINE_DATA_SIZE: usize = 24;
-
-/// Offset from the start of the code section to the data section.
-/// The data section is placed one page (4KB) before the code section.
-/// Trampoline code uses this offset with PC-relative addressing to load from data section.
-pub const TRAMPOLINE_DATA_OFFSET: i64 = -0x1000;
-
 /// ARM64 instruction size (fixed 4 bytes)
 const ARM64_INSN_SIZE: usize = 4;
 
@@ -220,6 +211,25 @@ mod encoder {
         let immhi = ((offset >> 2) & 0x7FFFF) as u32;
         // ADR: 0 immlo 10000 immhi Rd
         let insn = (immlo << 29) | 0x1000_0000 | (immhi << 5) | (rd as u32);
+        Some(insn.to_le_bytes())
+    }
+
+    /// Encode ADRP Xd, label (PC-relative page address)
+    /// ADRP Xd, #imm21 -> Xd = (PC & ~0xFFF) + (imm21 << 12)
+    /// Range: ±4GB (page-aligned)
+    pub fn encode_adrp(rd: u8, page_offset: i64) -> Option<[u8; 4]> {
+        assert!(rd < 32);
+        // page_offset must be page-aligned (multiple of 4096)
+        // imm21 = page_offset >> 12, range: +/- 2^20 pages = +/- 4GB
+        let imm21 = page_offset >> 12;
+        if imm21 < -(1i64 << 20) || imm21 >= (1i64 << 20) {
+            return None;
+        }
+        let imm21 = imm21 as u32;
+        let immlo = imm21 & 0x3;
+        let immhi = (imm21 >> 2) & 0x7FFFF;
+        // ADRP: 1 immlo 10000 immhi Rd
+        let insn = (1u32 << 31) | (immlo << 29) | 0x1000_0000 | (immhi << 5) | (rd as u32);
         Some(insn.to_le_bytes())
     }
 
@@ -461,32 +471,29 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Get control transfer targets
     let control_transfer_targets = get_control_transfer_targets(&builder, &text_sections);
 
-    // W^X Trampoline Layout (two sections for security):
-    //
-    // DATA SECTION (RW, not executable) - at trampoline_data_addr:
-    //   Offset 0-7:   "LITEBOX0" magic/version
-    //   Offset 8-15:  Handler address (written by loader)
-    //   Offset 16-23: Host TLS pointer (written by switch_to_guest every entry)
-    //
-    // CODE SECTION (R-X, not writable) - at trampoline_code_addr (data + 0x1000):
-    //   Offset 0+:    Per-SVC trampoline entries
-    //
-    // The code section is exactly one page (0x1000) after the data section.
-    // Trampoline code uses PC-relative LDR with negative offset to load from data section.
-    // This achieves W^X by separating writable data from executable code.
+    let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
+    let mut trampoline_data = vec![];
 
-    let trampoline_data_addr = find_addr_for_trampoline_code(&builder);
-    let trampoline_code_addr = trampoline_data_addr + 0x1000; // Code starts one page after data
+    // Trampoline section layout:
+    // Offset 0-7:   "LITEBOX0" magic/version
+    // Offset 8-15:  Handler address (written by loader)
+    // Offset 16-23: Host TLS pointer (written by switch_to_guest)
+    // Offset 24+:   Per-SVC trampoline entries
+    //
+    // The trampoline code loads host TLS from offset 16 using PC-relative addressing.
+    // This slot is written by switch_to_guest before entering guest code.
+    // Note: This has a race condition for multi-threading, but is necessary.
 
-    // Build data section (24 bytes)
-    let mut data_section = vec![];
-    data_section.extend_from_slice("LITEBOX0".as_bytes()); // offset 0-7: magic
+    // The magic prefix for the trampoline section
+    trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
+
+    // The placeholder for the address of the new syscall entry point (offset 8)
     let trampoline = trampoline.unwrap_or(0);
-    data_section.extend_from_slice(&trampoline.to_le_bytes()); // offset 8-15: handler
-    data_section.extend_from_slice(&0u64.to_le_bytes()); // offset 16-23: host TLS
+    trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
 
-    // Build code section
-    let mut code_section = vec![];
+    // Placeholder for host TLS pointer (offset 16)
+    // Written by switch_to_guest, read by trampoline code via PC-relative LDR
+    trampoline_data.extend_from_slice(&0u64.to_le_bytes());
 
     let mut syscall_insns_found = false;
     for s in &text_sections {
@@ -498,9 +505,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             &control_transfer_targets,
             s.sh_addr,
             data.to_mut(),
-            trampoline_data_addr,
-            trampoline_code_addr,
-            &mut code_section,
+            trampoline_base_addr,
+            &mut trampoline_data,
         ) {
             Ok(()) => {
                 syscall_insns_found = true;
@@ -514,16 +520,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    // Total size = 1 page for data + code section size
-    let total_trampoline_size = 0x1000 + code_section.len();
-
     // Repurpose the section header fields to store trampoline info
-    // sh_addr: magic "LTBX" to identify this as a trampoline section
-    // sh_offset: virtual address where data section should be mapped
-    // sh_entsize: total size of both sections (data page + code)
     builder.sections.get_mut(trampoline_section).sh_addr = u32::from_le_bytes(*b"LTBX").into();
-    builder.sections.get_mut(trampoline_section).sh_offset = trampoline_data_addr;
-    builder.sections.get_mut(trampoline_section).sh_entsize = total_trampoline_size as u64;
+    builder.sections.get_mut(trampoline_section).sh_offset = trampoline_base_addr;
+    builder.sections.get_mut(trampoline_section).sh_entsize = trampoline_data.len() as u64;
 
     let mut out = vec![];
     builder
@@ -533,6 +533,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Pad so that the trampoline starts at a page-aligned file offset.
     // The loader calculates: file_offset = file.size() - tramp_size
     // For mmap to work, file_offset must be page-aligned (0x1000).
+    // So we need: (out.len() + padding + tramp_size) - tramp_size = out.len() + padding
+    // to be page-aligned, i.e., out.len() + padding ≡ 0 (mod 0x1000)
     let padding_needed = {
         let remainder = out.len() % 0x1000;
         if remainder == 0 {
@@ -542,13 +544,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         }
     };
     out.extend(core::iter::repeat_n(0u8, padding_needed));
-
-    // Write data section (padded to one page)
-    out.extend_from_slice(&data_section);
-    out.extend(core::iter::repeat_n(0u8, 0x1000 - data_section.len()));
-
-    // Write code section
-    out.extend_from_slice(&code_section);
+    out.extend_from_slice(&trampoline_data);
 
     Ok(out)
 }
@@ -644,9 +640,8 @@ fn hook_syscalls_in_section(
     control_transfer_targets: &HashSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
-    trampoline_data_addr: u64,
-    trampoline_code_addr: u64,
-    code_section: &mut Vec<u8>,
+    trampoline_base_addr: u64,
+    trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
     let instructions = decode_section(section_base_addr, section_data);
 
@@ -690,7 +685,7 @@ fn hook_syscalls_in_section(
 
         // ARM64 B instruction can only reach +/- 128MB
         // Check if trampoline is in range
-        let trampoline_target = trampoline_code_addr + code_section.len() as u64;
+        let trampoline_target = trampoline_base_addr + trampoline_data.len() as u64;
         let offset = trampoline_target as i64 - insn.addr as i64;
 
         if offset.abs() >= (1 << 27) {
@@ -744,9 +739,8 @@ fn hook_syscalls_in_section(
                     insn,
                     &instructions_to_copy,
                     &after_insns,
-                    trampoline_data_addr,
-                    trampoline_code_addr,
-                    code_section,
+                    trampoline_base_addr,
+                    trampoline_data,
                 )?;
                 continue;
             }
@@ -759,9 +753,8 @@ fn hook_syscalls_in_section(
                 insn,
                 &instructions_to_copy,
                 &[],
-                trampoline_data_addr,
-                trampoline_code_addr,
-                code_section,
+                trampoline_base_addr,
+                trampoline_data,
             )?;
         } else {
             // Trampoline in range - can use direct branch
@@ -769,9 +762,8 @@ fn hook_syscalls_in_section(
                 section_base_addr,
                 section_data,
                 insn,
-                trampoline_data_addr,
-                trampoline_code_addr,
-                code_section,
+                trampoline_base_addr,
+                trampoline_data,
             )?;
         }
     }
@@ -789,19 +781,14 @@ fn generate_trampoline_direct(
     section_base_addr: u64,
     section_data: &mut [u8],
     svc_insn: &DecodedInsn,
-    trampoline_data_addr: u64,
-    trampoline_code_addr: u64,
-    code_section: &mut Vec<u8>,
+    trampoline_base_addr: u64,
+    trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
-    let trampoline_entry = trampoline_code_addr + code_section.len() as u64;
+    let trampoline_entry = trampoline_base_addr + trampoline_data.len() as u64;
     let return_addr = svc_insn.next_ip();
 
-    // W^X Trampoline sequence:
-    // Data section (RW) is at trampoline_data_addr (one page before code section)
-    // Code section (R-X) is at trampoline_code_addr
-    //
-    // The trampoline loads host TLS and handler from the data section using
-    // PC-relative addressing. Data section is at a fixed offset from code.
+    // Trampoline sequence that reserves stack space itself.
+    // The trampoline loads host TLS from the trampoline header (offset 16).
     //
     // Stack layout after SUB:
     //   [SP+0]:  saved x16
@@ -814,75 +801,90 @@ fn generate_trampoline_direct(
     // 2. STR X16, [SP, #0]  - save guest x16
     // 3. STR X17, [SP, #8]  - save guest x17
     // 4. STR X30, [SP, #16] - save guest x30
-    // 5. LDR X18, [PC, #offset] - load host TLS from data section offset 16
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
     // 6. ADR X30, return_addr - set return address
-    // 7. LDR X16, [PC, #offset] - load handler address from data section offset 8
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
     // 8. BR X16             - jump to handler
     //
     // syscall_callback knows: original guest SP = current SP + 32
 
     // 1. SUB SP, SP, #32
     if let Some(sub_insn) = encoder::encode_sub_imm(31, 31, 32) {
-        code_section.extend_from_slice(&sub_insn);
+        trampoline_data.extend_from_slice(&sub_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 2. STR X16, [SP, #0]
     if let Some(str_insn) = encoder::encode_str_imm(16, 31, 0) {
-        code_section.extend_from_slice(&str_insn);
+        trampoline_data.extend_from_slice(&str_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 3. STR X17, [SP, #8]
     if let Some(str_insn) = encoder::encode_str_imm(17, 31, 8) {
-        code_section.extend_from_slice(&str_insn);
+        trampoline_data.extend_from_slice(&str_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 4. STR X30, [SP, #16]
     if let Some(str_insn) = encoder::encode_str_imm(30, 31, 16) {
-        code_section.extend_from_slice(&str_insn);
+        trampoline_data.extend_from_slice(&str_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 5. LDR X18, [PC, #offset] - load host TLS from data section offset 16
-    // Data section is at trampoline_data_addr, host TLS is at offset 16
-    let host_tls_location = trampoline_data_addr + 16;
-    let current_pc = trampoline_code_addr + code_section.len() as u64;
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
+    let host_tls_location = trampoline_base_addr + 16;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_tls_offset = host_tls_location as i64 - current_pc as i64;
     if let Some(ldr) = encoder::encode_ldr_literal(18, ldr_tls_offset as i32) {
-        code_section.extend_from_slice(&ldr);
+        trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 6. ADR X30, return_addr
-    let adr_offset = return_addr as i64 - (trampoline_code_addr + code_section.len() as u64) as i64;
+    // 6. Set X30 to return_addr using PC-relative addressing.
+    // Must use PC-relative (not absolute MOV) so it works with ET_DYN binaries
+    // that are loaded at an arbitrary base address.
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let adr_offset = return_addr as i64 - current_pc as i64;
     if let Some(adr) = encoder::encode_adr(30, adr_offset as i32) {
-        code_section.extend_from_slice(&adr);
+        // ADR has ±1MB range
+        trampoline_data.extend_from_slice(&adr);
     } else {
-        // Fall back to MOV sequence for far addresses
-        for insn in encoder::encode_mov_imm64(30, return_addr) {
-            code_section.extend_from_slice(&insn);
+        // Fall back to ADRP+ADD for ±4GB range (still PC-relative)
+        let target_page = return_addr & !0xFFF;
+        let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+        let pc_page = current_pc & !0xFFF;
+        let page_offset = target_page as i64 - pc_page as i64;
+        if let Some(adrp) = encoder::encode_adrp(30, page_offset) {
+            trampoline_data.extend_from_slice(&adrp);
+            let within_page = (return_addr & 0xFFF) as u16;
+            if let Some(add) = encoder::encode_add_imm(30, 30, within_page) {
+                trampoline_data.extend_from_slice(&add);
+            } else {
+                return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+            }
+        } else {
+            return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
         }
     }
 
-    // 7. LDR X16, [PC, #offset] - load handler address from data section offset 8
-    let handler_addr_location = trampoline_data_addr + 8;
-    let current_pc = trampoline_code_addr + code_section.len() as u64;
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    let handler_addr_location = trampoline_base_addr + 8;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_offset = handler_addr_location as i64 - current_pc as i64;
     if let Some(ldr) = encoder::encode_ldr_literal(16, ldr_offset as i32) {
-        code_section.extend_from_slice(&ldr);
+        trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 8. BR X16
-    code_section.extend_from_slice(&encoder::encode_br(16));
+    trampoline_data.extend_from_slice(&encoder::encode_br(16));
 
     // Replace SVC with B to trampoline
     let b = encoder::encode_b(svc_insn.addr, trampoline_entry)
@@ -903,20 +905,18 @@ fn generate_trampoline_indirect(
     svc_insn: &DecodedInsn,
     before_insns: &[DecodedInsn],
     after_insns: &[DecodedInsn],
-    trampoline_data_addr: u64,
-    trampoline_code_addr: u64,
-    code_section: &mut Vec<u8>,
+    trampoline_base_addr: u64,
+    trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
-    let trampoline_entry = trampoline_code_addr + code_section.len() as u64;
+    let trampoline_entry = trampoline_base_addr + trampoline_data.len() as u64;
 
     // Copy instructions before SVC to trampoline
     for insn in before_insns {
-        code_section.extend_from_slice(&insn.bytes);
+        trampoline_data.extend_from_slice(&insn.bytes);
     }
 
-    // W^X Trampoline sequence:
-    // Data section (RW) is at trampoline_data_addr (one page before code section)
-    // Code section (R-X) is at trampoline_code_addr
+    // Trampoline sequence that reserves stack space itself.
+    // The trampoline loads host TLS from the trampoline header (offset 16).
     //
     // Stack layout after SUB:
     //   [SP+0]:  saved x16
@@ -929,47 +929,47 @@ fn generate_trampoline_indirect(
     // 2. STR X16, [SP, #0]  - save guest x16
     // 3. STR X17, [SP, #8]  - save guest x17
     // 4. STR X30, [SP, #16] - save guest x30
-    // 5. LDR X18, [PC, #offset] - load host TLS from data section offset 16
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
     // 6. ADR X30, return_addr - set return address
-    // 7. LDR X16, [PC, #offset] - load handler address from data section offset 8
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
     // 8. BR X16             - jump to handler
     //
     // syscall_callback knows: original guest SP = current SP + 32
 
     // 1. SUB SP, SP, #32
     if let Some(sub_insn) = encoder::encode_sub_imm(31, 31, 32) {
-        code_section.extend_from_slice(&sub_insn);
+        trampoline_data.extend_from_slice(&sub_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 2. STR X16, [SP, #0]
     if let Some(str_insn) = encoder::encode_str_imm(16, 31, 0) {
-        code_section.extend_from_slice(&str_insn);
+        trampoline_data.extend_from_slice(&str_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 3. STR X17, [SP, #8]
     if let Some(str_insn) = encoder::encode_str_imm(17, 31, 8) {
-        code_section.extend_from_slice(&str_insn);
+        trampoline_data.extend_from_slice(&str_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 4. STR X30, [SP, #16]
     if let Some(str_insn) = encoder::encode_str_imm(30, 31, 16) {
-        code_section.extend_from_slice(&str_insn);
+        trampoline_data.extend_from_slice(&str_insn);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
-    // 5. LDR X18, [PC, #offset] - load host TLS from data section offset 16
-    let host_tls_location = trampoline_data_addr + 16;
-    let current_pc = trampoline_code_addr + code_section.len() as u64;
+    // 5. LDR X18, [PC, #offset] - load host TLS from trampoline header offset 16
+    let host_tls_location = trampoline_base_addr + 16;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_tls_offset = host_tls_location as i64 - current_pc as i64;
     if let Some(ldr) = encoder::encode_ldr_literal(18, ldr_tls_offset as i32) {
-        code_section.extend_from_slice(&ldr);
+        trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
@@ -977,7 +977,7 @@ fn generate_trampoline_indirect(
     // Calculate where after_insns will be (after the syscall call sequence)
     // Current position + ADR/MOV + LDR + BR = variable depending on ADR success
     // We'll compute it more precisely after knowing return_addr encoding size
-    let tentative_after_insns_start = trampoline_code_addr + code_section.len() as u64 + 12;
+    let tentative_after_insns_start = trampoline_base_addr + trampoline_data.len() as u64 + 12;
 
     // Put return address in X30 (LR) - matching systrap handler convention
     let return_addr = if after_insns.is_empty() {
@@ -987,66 +987,103 @@ fn generate_trampoline_indirect(
         tentative_after_insns_start
     };
 
-    // 6. ADR X30, return_addr
-    let adr_offset = return_addr as i64 - (trampoline_code_addr + code_section.len() as u64) as i64;
+    // 6. Set X30 to return_addr using PC-relative addressing.
+    // Must use PC-relative (not absolute MOV) so it works with ET_DYN binaries
+    // that are loaded at an arbitrary base address.
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+    let adr_offset = return_addr as i64 - current_pc as i64;
     if let Some(adr) = encoder::encode_adr(30, adr_offset as i32) {
-        code_section.extend_from_slice(&adr);
+        // ADR has ±1MB range
+        trampoline_data.extend_from_slice(&adr);
     } else {
-        // Use MOV sequence for far addresses
-        for insn in encoder::encode_mov_imm64(30, return_addr) {
-            code_section.extend_from_slice(&insn);
+        // Fall back to ADRP+ADD for ±4GB range (still PC-relative)
+        let target_page = return_addr & !0xFFF;
+        let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+        let pc_page = current_pc & !0xFFF;
+        let page_offset = target_page as i64 - pc_page as i64;
+        if let Some(adrp) = encoder::encode_adrp(30, page_offset) {
+            trampoline_data.extend_from_slice(&adrp);
+            let within_page = (return_addr & 0xFFF) as u16;
+            if let Some(add) = encoder::encode_add_imm(30, 30, within_page) {
+                trampoline_data.extend_from_slice(&add);
+            } else {
+                return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+            }
+        } else {
+            return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
         }
     }
 
-    // 7. LDR X16, [PC, #offset] - load handler address from data section offset 8
-    let handler_addr_location = trampoline_data_addr + 8;
-    let current_pc = trampoline_code_addr + code_section.len() as u64;
+    // 7. LDR X16, [PC, #offset] - load handler address from trampoline header offset 8
+    let handler_addr_location = trampoline_base_addr + 8;
+    let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
     let ldr_offset = handler_addr_location as i64 - current_pc as i64;
     if let Some(ldr) = encoder::encode_ldr_literal(16, ldr_offset as i32) {
-        code_section.extend_from_slice(&ldr);
+        trampoline_data.extend_from_slice(&ldr);
     } else {
         return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
     }
 
     // 8. BR X16
-    code_section.extend_from_slice(&encoder::encode_br(16));
+    trampoline_data.extend_from_slice(&encoder::encode_br(16));
 
     // Copy instructions after SVC (if any)
     for insn in after_insns {
-        code_section.extend_from_slice(&insn.bytes);
+        trampoline_data.extend_from_slice(&insn.bytes);
     }
 
     // Jump back to original code
     if !after_insns.is_empty() {
         let jump_back_target = after_insns.last().unwrap().next_ip();
 
-        let current_addr = trampoline_code_addr + code_section.len() as u64;
+        let current_addr = trampoline_base_addr + trampoline_data.len() as u64;
         if let Some(b) = encoder::encode_b(current_addr, jump_back_target) {
-            code_section.extend_from_slice(&b);
+            trampoline_data.extend_from_slice(&b);
         } else {
-            // Need indirect jump for far target
-            let ldr = encoder::encode_ldr_literal(16, 8).unwrap();
-            code_section.extend_from_slice(&ldr);
-            code_section.extend_from_slice(&encoder::encode_br(16));
-            code_section.extend_from_slice(&jump_back_target.to_le_bytes());
+            // B instruction range exceeded. Use ADRP+ADD+BR for PC-relative far jump.
+            // This works correctly with ET_DYN binaries loaded at arbitrary base addresses.
+            let target_page = jump_back_target & !0xFFF;
+            let current_pc = trampoline_base_addr + trampoline_data.len() as u64;
+            let pc_page = current_pc & !0xFFF;
+            let page_offset = target_page as i64 - pc_page as i64;
+            if let Some(adrp) = encoder::encode_adrp(16, page_offset) {
+                trampoline_data.extend_from_slice(&adrp);
+                let within_page = (jump_back_target & 0xFFF) as u16;
+                if let Some(add) = encoder::encode_add_imm(16, 16, within_page) {
+                    trampoline_data.extend_from_slice(&add);
+                    trampoline_data.extend_from_slice(&encoder::encode_br(16));
+                } else {
+                    return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+                }
+            } else {
+                return Err(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr));
+            }
         }
     }
 
-    // Replace original code with jump to trampoline
+    // Replace original code with jump to trampoline using PC-relative addressing.
+    // Must use PC-relative (not absolute literal) so it works with ET_DYN binaries
+    // that are loaded at an arbitrary base address.
     let replace_len = (replace_end - replace_start) as usize;
     let replace_offset = (replace_start - section_base_addr) as usize;
 
-    // First 16 bytes: LDR X16, [PC, #8]; BR X16; .quad trampoline_entry
-    if replace_len >= 16 {
-        let ldr = encoder::encode_ldr_literal(16, 8).unwrap();
-        section_data[replace_offset..replace_offset + 4].copy_from_slice(&ldr);
-        section_data[replace_offset + 4..replace_offset + 8]
+    if replace_len >= 12 {
+        // Use ADRP+ADD+BR (12 bytes, PC-relative, works with ET_DYN)
+        let target_page = trampoline_entry & !0xFFF;
+        let pc_page = replace_start & !0xFFF;
+        let page_offset = target_page as i64 - pc_page as i64;
+        let adrp = encoder::encode_adrp(16, page_offset)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr))?;
+        let within_page = (trampoline_entry & 0xFFF) as u16;
+        let add = encoder::encode_add_imm(16, 16, within_page)
+            .ok_or(Error::InsufficientBytesBeforeOrAfter(svc_insn.addr))?;
+        section_data[replace_offset..replace_offset + 4].copy_from_slice(&adrp);
+        section_data[replace_offset + 4..replace_offset + 8].copy_from_slice(&add);
+        section_data[replace_offset + 8..replace_offset + 12]
             .copy_from_slice(&encoder::encode_br(16));
-        section_data[replace_offset + 8..replace_offset + 16]
-            .copy_from_slice(&trampoline_entry.to_le_bytes());
 
         // Fill remaining with NOPs
-        for i in (16..replace_len).step_by(4) {
+        for i in (12..replace_len).step_by(4) {
             section_data[replace_offset + i..replace_offset + i + 4]
                 .copy_from_slice(&encoder::encode_nop());
         }

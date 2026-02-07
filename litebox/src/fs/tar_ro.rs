@@ -30,18 +30,17 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use crate::{
-    LiteBox,
     fs::{DirEntry, FileType},
     path::Arg as _,
-    sync,
+    sync, LiteBox,
 };
 
 use super::{
-    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
         ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
+    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
 };
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
@@ -163,6 +162,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::NOCTTY
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
+            | OFlags::NDELAY
+            | OFlags::DIRECT
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
             | OFlags::APPEND;

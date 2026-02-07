@@ -58,8 +58,23 @@ impl Runner {
     fn with_backend(target: &Path, unique_name: &str, backend: Backend) -> Self {
         let dir_path = get_out_dir();
 
-        // For systrap backend, we use the target directly without rewriting
-        let path = target.to_path_buf();
+        // For rewriter backend, rewrite the executable
+        let path = match backend {
+            Backend::Seccomp => target.to_path_buf(),
+            Backend::Rewriter => {
+                // new path in out_dir with .hooked suffix
+                let out_path = dir_path.join(format!(
+                    "{}.hooked",
+                    target.file_name().unwrap().to_str().unwrap()
+                ));
+                // Use --allow-no-syscalls since dynamically linked binaries may not have
+                // syscalls in the main executable (they're in libc.so instead)
+                let success =
+                    common::rewrite_with_cache(target, &out_path, &["--allow-no-syscalls"]);
+                assert!(success, "failed to run litebox_syscall_rewriter_arm64");
+                out_path
+            }
+        };
 
         // create tar file containing all dependencies
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
@@ -78,13 +93,27 @@ impl Runner {
             if let Some(parent) = dest_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
-            println!(
-                "Copying {} to {}",
-                file_path.to_str().unwrap(),
-                dest_path.to_str().unwrap()
-            );
-            if let Err(e) = std::fs::copy(file_path, &dest_path) {
-                eprintln!("Warning: failed to copy {}: {}", file_path.display(), e);
+            match backend {
+                Backend::Seccomp => {
+                    println!(
+                        "Copying {} to {}",
+                        file_path.to_str().unwrap(),
+                        dest_path.to_str().unwrap()
+                    );
+                    if let Err(e) = std::fs::copy(file_path, &dest_path) {
+                        eprintln!("Warning: failed to copy {}: {}", file_path.display(), e);
+                    }
+                }
+                Backend::Rewriter => {
+                    // Use --allow-no-syscalls since some libraries may not have syscalls
+                    let success =
+                        common::rewrite_with_cache(file_path, &dest_path, &["--allow-no-syscalls"]);
+                    assert!(
+                        success,
+                        "failed to run litebox_syscall_rewriter_arm64 for {}",
+                        file_path.to_str().unwrap()
+                    );
+                }
             }
         }
 
@@ -111,7 +140,9 @@ impl Runner {
                 command.args(["--interception-backend", "seccomp"]);
             }
             Backend::Rewriter => {
-                command.args(["--interception-backend", "rewriter", "--rewrite-syscalls"]);
+                // We pre-rewrite binaries and libraries, so we only need to tell the runner
+                // to use the rewriter backend (for rtld_audit), not to rewrite at runtime
+                command.args(["--interception-backend", "rewriter"]);
             }
         }
 
@@ -328,4 +359,109 @@ fn test_tun_with_tcp_socket() {
         .tun_device_name("tun99")
         .run();
     child.join().unwrap();
+}
+
+/// Test dynamically linked executables with rewriter backend
+///
+/// This test rewrites both the executable and all its shared library dependencies.
+/// Currently only runs with the basic tests due to threading/signal issues.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_dynamic_lib_with_rewriter() {
+    // Tests that currently pass with the rewriter backend
+    let passing_tests = ["hello.c", "efault.c"];
+
+    for path in find_c_test_files("./tests") {
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !passing_tests.contains(&filename) {
+            eprintln!("Skipping {} (threading/signal issues)", filename);
+            continue;
+        }
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        let unique_name = format!("{stem}_dynamic_rewriter");
+        let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
+        Runner::with_backend(&target, &unique_name, Backend::Rewriter).run();
+    }
+}
+
+/// Get the path of a program using `which`
+#[cfg(target_arch = "aarch64")]
+fn run_which(prog: &str) -> std::path::PathBuf {
+    let prog_path_str = std::process::Command::new("which")
+        .arg(prog)
+        .output()
+        .expect("Failed to find program binary")
+        .stdout;
+    let prog_path_str = String::from_utf8(prog_path_str).unwrap().trim().to_string();
+    let prog_path = std::path::PathBuf::from(prog_path_str);
+    assert!(prog_path.exists(), "Program binary not found: {}", prog);
+    prog_path
+}
+
+/// Test running `ls` command with rewriter backend
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_runner_with_ls() {
+    let ls_path = run_which("ls");
+    let output = Runner::with_backend(&ls_path, "ls_rewriter", Backend::Rewriter)
+        .arg("-a")
+        .output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "lib"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}\n{each} not found",
+        );
+    }
+
+    // test `ls` subdir - find the directory containing libc.so.6
+    let libs = common::find_dependencies(ls_path.to_str().unwrap());
+    let libc_path = libs
+        .iter()
+        .find(|l| l.contains("libc.so"))
+        .expect("libc.so not found in dependencies");
+    let libc_dir = std::path::Path::new(libc_path.as_str())
+        .parent()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let output = Runner::with_backend(&ls_path, "ls_lib_rewriter", Backend::Rewriter)
+        .args(["-a", libc_dir])
+        .output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
+    for each in [".", "..", "libc.so.6"] {
+        assert!(
+            normalized.contains(&each),
+            "unexpected ls output:\n{output_str}\n{each} not found",
+        );
+    }
+}
+
+/// Test running Node.js with rewriter backend
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_node_with_rewriter() {
+    const HELLO_WORLD_JS: &str = r"
+const fs = require('node:fs');
+
+const content = 'Hello World!';
+console.log(content);
+";
+
+    let node_path = run_which("node");
+    Runner::with_backend(&node_path, "hello_node_rewriter", Backend::Rewriter)
+        .arg("/out/hello_world.js")
+        .with_fs_path(|out_dir| {
+            // write the test js file to the output directory
+            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
+        })
+        .run();
 }

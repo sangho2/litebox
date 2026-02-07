@@ -15,6 +15,9 @@ struct Args {
     /// Trampoline address (optional, default 0 for runtime patching)
     #[arg(long)]
     trampoline: Option<String>,
+    /// Allow rewriting files with no syscall instructions (copy unchanged)
+    #[arg(long)]
+    allow_no_syscalls: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -26,18 +29,31 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).expect("Invalid hex address"));
 
-    let output_data =
-        litebox_syscall_rewriter_arm64::hook_syscalls_in_elf(&input_data, trampoline)?;
-
-    fs::write(&args.output, &output_data)?;
-
-    println!(
-        "Rewrote {} -> {} ({} bytes -> {} bytes)",
-        args.input.display(),
-        args.output.display(),
-        input_data.len(),
-        output_data.len()
-    );
+    match litebox_syscall_rewriter_arm64::hook_syscalls_in_elf(&input_data, trampoline) {
+        Ok(output_data) => {
+            fs::write(&args.output, &output_data)?;
+            println!(
+                "Rewrote {} -> {} ({} bytes -> {} bytes)",
+                args.input.display(),
+                args.output.display(),
+                input_data.len(),
+                output_data.len()
+            );
+        }
+        Err(litebox_syscall_rewriter_arm64::Error::NoSyscallInstructionsFound)
+            if args.allow_no_syscalls =>
+        {
+            // No syscalls found but --allow-no-syscalls was set, just copy the file
+            fs::write(&args.output, &input_data)?;
+            println!(
+                "Copied {} -> {} (no syscalls found, {} bytes)",
+                args.input.display(),
+                args.output.display(),
+                input_data.len()
+            );
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     Ok(())
 }

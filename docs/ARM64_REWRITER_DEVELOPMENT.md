@@ -50,6 +50,15 @@ Add ARM64 (aarch64) support to LiteBox using a syscall rewriter backend that:
 - Fixed stack corruption bug on initial guest entry
 - All basic tests now passing
 
+### Phase 4: Dynamic Linking and Syscall Support (Completed)
+- Fixed ARM64 `FileStat` struct layout (128 bytes vs x86's 144 bytes)
+- Added trampoline propagation from interpreter to main binary for dynamically linked ELFs
+- Replaced absolute address encoding with PC-relative `ADRP+ADD` (±4GB) for ET_DYN binaries
+- Created `litebox_rtld_audit_arm64` for LD_AUDIT-based trampoline discovery
+- Implemented `faccessat`, `statfs`, `statx` syscalls
+- Fixed `O_DIRECT`/`O_NDELAY` support in filesystem backends
+- `ls` now works inside the sandbox (dynamically linked)
+
 ---
 
 ## Technical Architecture
@@ -345,6 +354,137 @@ Changed the design so the **trampoline** reserves stack space, not `switch_to_gu
 
 ---
 
+### Bug 9: ARM64 FileStat Struct Layout Mismatch (FIXED)
+
+**Symptoms**: `newfstatat` syscall corrupted the guest stack, causing crashes after stat-related calls.
+
+**Root Cause**: The `FileStat` struct used the x86_64 layout (144 bytes) instead of the ARM64 layout (128 bytes). The ARM64 kernel writes 128 bytes but our struct had 144-byte size, causing incorrect field alignment and stack corruption when the struct was stack-allocated.
+
+**Solution**: Added a separate ARM64 `FileStat` definition with the correct field layout matching `struct stat` from `arch/arm64/include/asm/stat.h`.
+
+**File**: `litebox_common_linux/src/lib.rs`
+
+---
+
+### Bug 10: Trampoline Address Not Propagated for Dynamically Linked Binaries (FIXED)
+
+**Symptoms**: Dynamically linked binaries crashed immediately — the main binary had no trampoline section and no fallback to the interpreter's trampoline.
+
+**Root Cause**: For dynamically linked ELFs, `SVC #0` instructions exist in the interpreter (ld.so) and shared libraries, not the main binary. The main binary is loaded with `--allow-no-syscalls` (no trampoline), but its `trampoline_addr` was never set from the interpreter's trampoline.
+
+**Solution**: After loading the interpreter, propagate its `trampoline_addr` back to the main binary's load result so the runner has a valid trampoline base for `switch_to_guest`.
+
+**File**: `litebox_shim_linux/src/loader/elf.rs` (~line 268-282)
+
+---
+
+### Bug 11: Absolute Address Encoding in Trampoline for ET_DYN Binaries (FIXED)
+
+**Symptoms**: Shared libraries (ET_DYN) loaded at runtime addresses far from the trampoline caused incorrect branch targets — the trampoline used unrelocated absolute addresses.
+
+**Root Cause**: When the trampoline is >1MB from the code being rewritten, `ADR` (±1MB range) fails. The fallback used `encode_mov_imm64()` which loads absolute (link-time) addresses. For position-independent code (ET_DYN), these addresses are wrong at runtime since the binary is loaded at a dynamic base.
+
+**Solution**: Replaced `encode_mov_imm64()` with PC-relative `ADRP+ADD` sequences (±4GB range) in all 4 locations where return addresses are encoded. Added `encode_adrp()` function to the encoder module.
+
+**File**: `litebox_syscall_rewriter_arm64/src/lib.rs`
+
+---
+
+### Bug 12: `ls` Crashes with SIGABRT on `O_DIRECT | O_NDELAY` (FIXED)
+
+**Symptoms**: Running `ls` inside the sandbox caused `SIGABRT` (via `unimplemented!()` panic).
+
+**Root Cause**: `ls` opens files with `O_DIRECT | O_NDELAY` flags. These flags were not included in the supported `OFlags` set in any of the three filesystem implementations, hitting the `unimplemented!()` fallback.
+
+**Solution**: Added `O_DIRECT` and `O_NDELAY` to the supported OFlags in all three filesystem backends. These flags are accepted and silently ignored (appropriate for an in-memory/tar filesystem).
+
+**Files**:
+- `litebox/src/fs/layered.rs`
+- `litebox/src/fs/in_mem.rs`
+- `litebox/src/fs/tar_ro.rs`
+
+---
+
+### Bug 13: Missing `faccessat` Syscall (FIXED)
+
+**Symptoms**: `ls` and other dynamically linked programs call `faccessat` (syscall 48 on ARM64) during startup. Without a handler, the syscall returned `-ENOSYS`, causing runtime failures.
+
+**Root Cause**: `faccessat` was not implemented. On ARM64, there is no `access` syscall — everything goes through `faccessat`.
+
+**Solution**: Implemented full `faccessat` support:
+1. Added `Faccessat` variant to `SyscallRequest` enum with dirfd, path, mode parsing
+2. Added dispatch in the shim
+3. Handler uses `FsPath::new()` for dirfd resolution, then delegates to existing `sys_access()` logic
+
+**Files**:
+- `litebox_common_linux/src/lib.rs` — enum variant + parsing
+- `litebox_shim_linux/src/lib.rs` — dispatch
+- `litebox_shim_linux/src/syscalls/file.rs` — `sys_faccessat()` handler
+
+---
+
+### Bug 14: Missing `statfs` Syscall (FIXED)
+
+**Symptoms**: Programs calling `statfs` (e.g., to check filesystem type) received `-ENOSYS`.
+
+**Root Cause**: `statfs` was listed in the silenced syscall list (returning `-ENOSYS` silently) but never actually implemented.
+
+**Solution**: Implemented `statfs` returning tmpfs-like values:
+- `f_type = 0x01021994` (TMPFS_MAGIC)
+- `f_bsize = 4096`
+- `f_blocks/f_bfree/f_bavail` = large values (1M blocks)
+- Added `StatFs` struct with compile-time size assertions (120 bytes on 64-bit, 64 bytes on 32-bit)
+
+**Files**:
+- `litebox_common_linux/src/lib.rs` — `StatFs` struct + parsing
+- `litebox_shim_linux/src/lib.rs` — dispatch
+- `litebox_shim_linux/src/syscalls/file.rs` — `sys_statfs()` handler
+
+---
+
+### Bug 15: Missing `statx` Syscall (FIXED)
+
+**Symptoms**: Modern glibc uses `statx` instead of `fstatat`/`newfstatat`. Programs calling `statx` received `-ENOSYS`, breaking file metadata queries.
+
+**Root Cause**: `statx` was listed in the silenced syscall list but never implemented.
+
+**Solution**: Full `statx` implementation:
+- Added `Statx` struct (256 bytes) and `StatxTimestamp` struct matching kernel layout
+- Added `statx_mask` module with constants (`STATX_TYPE`, `STATX_MODE`, `STATX_SIZE`, etc.)
+- Handler converts existing `FileStatus` to `Statx`, populating fields based on the requested mask
+- Handles `FsPath::Absolute`, `CwdRelative`, `Cwd`, and `Fd` path variants
+
+**Files**:
+- `litebox_common_linux/src/lib.rs` — structs, constants, parsing
+- `litebox_shim_linux/src/lib.rs` — dispatch
+- `litebox_shim_linux/src/syscalls/file.rs` — `sys_statx()` handler
+
+---
+
+### Bug 16: Test Hardcoded Debian libc Path (FIXED)
+
+**Symptoms**: `test_runner_with_ls` failed on non-Debian systems (e.g., Arch Linux) because it hardcoded `/lib/aarch64-linux-gnu` as the libc directory.
+
+**Root Cause**: The test assumed Debian's multiarch directory layout. On Arch-based systems, libc lives at `/usr/lib/libc.so.6`.
+
+**Solution**: Changed the test to dynamically discover the libc directory from the dependency resolution results instead of hardcoding a path.
+
+**File**: `litebox_runner_linux_arm64_userland/tests/run.rs`
+
+---
+
+### Bug 17: Missing `TASK_ADDR_MAX` for aarch64 in Tests (FIXED)
+
+**Symptoms**: `cargo test -p litebox` failed to compile on aarch64 — the `TASK_ADDR_MAX` constant was only defined for x86 and x86_64.
+
+**Root Cause**: The memory management test mock defined `TASK_ADDR_MAX` for x86 and x86_64 but not aarch64.
+
+**Solution**: Added `#[cfg(all(target_arch = "aarch64", target_os = "linux"))] const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000;`
+
+**File**: `litebox/src/mm/tests.rs`
+
+---
+
 ## Code Artifacts
 
 ### New Crates Created
@@ -358,6 +498,12 @@ litebox_syscall_rewriter_arm64/
     ├── hello-arm64      # Test binary
     ├── snapshots/       # Insta snapshots
     └── snapshot_tests.rs
+
+litebox_rtld_audit_arm64/
+├── Cargo.toml
+└── src/
+    └── lib.rs           # LD_AUDIT shared library for runtime trampoline loading
+                         # la_objopen() finds .trampolineLB0 section in shared libs
 ```
 
 ### Key Functions in litebox_syscall_rewriter_arm64
@@ -368,7 +514,8 @@ litebox_syscall_rewriter_arm64/
 | `decode_section()` | Finds all SVC instructions |
 | `generate_trampoline_direct()` | Creates trampoline for near branches |
 | `generate_trampoline_indirect()` | Creates trampoline for far branches |
-| `encoder::encode_adr()` | Encodes ADR instruction |
+| `encoder::encode_adr()` | Encodes ADR instruction (±1MB) |
+| `encoder::encode_adrp()` | Encodes ADRP instruction (±4GB, page-aligned) |
 | `encoder::encode_b()` | Encodes B (branch) instruction |
 | `encoder::encode_ldr_imm()` | Encodes LDR with immediate offset |
 | `encoder::encode_ldr_literal()` | Encodes LDR with PC-relative offset |
@@ -422,18 +569,18 @@ litebox_syscall_rewriter_arm64/
 ## Future Work
 
 ### Short-term
-1. Fix threading/signal issues in rewriter mode
-2. Enable more runner tests
+1. Fix threading/signal issues in rewriter mode (trampoline stores host TLS at fixed offset `trampoline_base+16` — race condition for multi-threaded programs)
+2. Implement `faccessat2` (syscall 439) — only `faccessat` (syscall 48) is currently supported
+3. Respect `statx` flags parameter (currently `_flags` is ignored — could honor `AT_SYMLINK_NOFOLLOW`)
 
 ### Medium-term
 1. Fix seccomp backend timing issues
-2. Add support for position-independent executables (PIE)
-3. Handle SVE/NEON context in signals
+2. Handle SVE/NEON context in signals
+3. Implement remaining silenced syscalls as needed
 
 ### Long-term
 1. Performance optimization
-2. Support for dynamic libraries with rewriter
-3. Consider hotpatching approach (like x86)
+2. Consider hotpatching approach (like x86)
 
 ---
 
@@ -469,4 +616,4 @@ dd if=/tmp/rewritten_binary bs=1 skip=$((0x911000)) count=64 | od -A x -t x4
 
 ---
 
-*Last updated: 2026-02-05*
+*Last updated: 2026-02-07*

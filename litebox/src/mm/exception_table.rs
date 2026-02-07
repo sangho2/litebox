@@ -16,6 +16,7 @@
 //!
 //! New fallible functions should follow the pattern established by [`memcpy_fallible`].
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 use crate::utils::TruncateExt as _;
 
 #[cfg(any(target_os = "linux", target_os = "none"))]
@@ -141,6 +142,7 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
     Ok(())
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 macro_rules! read_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
         /// Reads a value from the given `src` pointer in a fallible manner.
@@ -188,53 +190,152 @@ read_fn!(read_u32_fallible, u32, "mov {dest:e}, dword ptr [{src}]");
 read_fn!(read_u64_fallible, u64, "mov {dest:r}, qword ptr [{src}]");
 
 /// ARM64 fallible read functions
+///
+/// Reads a u8 from the given `src` pointer in a fallible manner.
+///
+/// # Safety
+/// `src` must be valid for reads or a pointer that's guaranteed to be
+/// in non-Rust memory.
+///
+/// # Panics
+/// Never panics in practice — `ldrb` zero-extends to 32 bits, so the value
+/// always fits in `u8`.
 #[cfg(target_arch = "aarch64")]
-macro_rules! read_fn_aarch64 {
-    ($name:ident, $ty:ty, $ldr_instr:expr) => {
-        /// Reads a value from the given `src` pointer in a fallible manner.
-        ///
-        /// # Safety
-        /// `src` must be valid for reads or a pointer that's guaranteed to be
-        /// in non-Rust memory.
-        pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
-            let value: u64;
-            let result: u64;
-            unsafe {
-                core::arch::asm! {
-                    "2:",
-                    $ldr_instr,
-                    "mov {result}, #0",  // success
-                    "3:",
-                    ex_table_entry!("2b", "3b", "4f"),
-                    "b 5f",
-                    "4:",
-                    "mov {result}, #1",  // fault
-                    "mov {value}, #0",
-                    "5:",
-                    src = in(reg) src,
-                    value = out(reg) value,
-                    result = out(reg) result,
-                    options(nostack),
-                }
-            }
-            if result == 0 {
-                Ok(value as $ty)
-            } else {
-                Err(Fault)
-            }
+pub unsafe fn read_u8_fallible(src: *const u8) -> Result<u8, Fault> {
+    let value: u32;
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "ldrb {value:w}, [{src}]",
+            "mov {result}, #0",
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",
+            "mov {value:w}, #0",
+            "5:",
+            src = in(reg) src,
+            value = out(reg) value,
+            result = out(reg) result,
+            options(nostack),
         }
-    };
+    }
+    if result == 0 {
+        Ok(u8::try_from(value).unwrap())
+    } else {
+        Err(Fault)
+    }
 }
 
+/// Reads a u16 from the given `src` pointer in a fallible manner.
+///
+/// # Safety
+/// `src` must be valid for reads or a pointer that's guaranteed to be
+/// in non-Rust memory.
+///
+/// # Panics
+/// Never panics in practice — `ldrh` zero-extends to 32 bits, so the value
+/// always fits in `u16`.
 #[cfg(target_arch = "aarch64")]
-read_fn_aarch64!(read_u8_fallible, u8, "ldrb {value:w}, [{src}]");
-#[cfg(target_arch = "aarch64")]
-read_fn_aarch64!(read_u16_fallible, u16, "ldrh {value:w}, [{src}]");
-#[cfg(target_arch = "aarch64")]
-read_fn_aarch64!(read_u32_fallible, u32, "ldr {value:w}, [{src}]");
-#[cfg(target_arch = "aarch64")]
-read_fn_aarch64!(read_u64_fallible, u64, "ldr {value:x}, [{src}]");
+pub unsafe fn read_u16_fallible(src: *const u16) -> Result<u16, Fault> {
+    let value: u32;
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "ldrh {value:w}, [{src}]",
+            "mov {result}, #0",
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",
+            "mov {value:w}, #0",
+            "5:",
+            src = in(reg) src,
+            value = out(reg) value,
+            result = out(reg) result,
+            options(nostack),
+        }
+    }
+    if result == 0 {
+        Ok(u16::try_from(value).unwrap())
+    } else {
+        Err(Fault)
+    }
+}
 
+/// Reads a u32 from the given `src` pointer in a fallible manner.
+///
+/// # Safety
+/// `src` must be valid for reads or a pointer that's guaranteed to be
+/// in non-Rust memory.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn read_u32_fallible(src: *const u32) -> Result<u32, Fault> {
+    let value: u32;
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "ldr {value:w}, [{src}]",
+            "mov {result}, #0",
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",
+            "mov {value:w}, #0",
+            "5:",
+            src = in(reg) src,
+            value = out(reg) value,
+            result = out(reg) result,
+            options(nostack),
+        }
+    }
+    if result == 0 {
+        Ok(value)
+    } else {
+        Err(Fault)
+    }
+}
+
+/// Reads a u64 from the given `src` pointer in a fallible manner.
+///
+/// # Safety
+/// `src` must be valid for reads or a pointer that's guaranteed to be
+/// in non-Rust memory.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn read_u64_fallible(src: *const u64) -> Result<u64, Fault> {
+    let value: u64;
+    let result: u64;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "ldr {value:x}, [{src}]",
+            "mov {result}, #0",
+            "3:",
+            ex_table_entry!("2b", "3b", "4f"),
+            "b 5f",
+            "4:",
+            "mov {result}, #1",
+            "mov {value}, #0",
+            "5:",
+            src = in(reg) src,
+            value = out(reg) value,
+            result = out(reg) result,
+            options(nostack),
+        }
+    }
+    if result == 0 {
+        Ok(value)
+    } else {
+        Err(Fault)
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 macro_rules! write_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
         /// Writes a value to the given `dest` pointer in a fallible manner.
@@ -298,6 +399,10 @@ pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
 }
 
 /// ARM64 fallible write functions with exception table support
+///
+/// # Safety
+/// `dest` must be valid for writes or a pointer that's guaranteed to be
+/// in non-Rust memory.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
     let result: u64;
@@ -313,14 +418,23 @@ pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
             "mov {result}, #1",  // fault
             "5:",
             dest = in(reg) dest,
-            value = in(reg) value as u64,
+            value = in(reg) u64::from(value),
             result = out(reg) result,
             options(nostack),
         }
     }
-    if result == 0 { Ok(()) } else { Err(Fault) }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Fault)
+    }
 }
 
+/// Writes a 16-bit value to the given `dest` pointer in a fallible manner.
+///
+/// # Safety
+/// `dest` must be valid for writes or a pointer that's guaranteed to be
+/// in non-Rust memory.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u16_fallible(dest: *mut u16, value: u16) -> Result<(), Fault> {
     let result: u64;
@@ -336,14 +450,23 @@ pub unsafe fn write_u16_fallible(dest: *mut u16, value: u16) -> Result<(), Fault
             "mov {result}, #1",  // fault
             "5:",
             dest = in(reg) dest,
-            value = in(reg) value as u64,
+            value = in(reg) u64::from(value),
             result = out(reg) result,
             options(nostack),
         }
     }
-    if result == 0 { Ok(()) } else { Err(Fault) }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Fault)
+    }
 }
 
+/// Writes a 32-bit value to the given `dest` pointer in a fallible manner.
+///
+/// # Safety
+/// `dest` must be valid for writes or a pointer that's guaranteed to be
+/// in non-Rust memory.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u32_fallible(dest: *mut u32, value: u32) -> Result<(), Fault> {
     let result: u64;
@@ -359,14 +482,23 @@ pub unsafe fn write_u32_fallible(dest: *mut u32, value: u32) -> Result<(), Fault
             "mov {result}, #1",  // fault
             "5:",
             dest = in(reg) dest,
-            value = in(reg) value as u64,
+            value = in(reg) u64::from(value),
             result = out(reg) result,
             options(nostack),
         }
     }
-    if result == 0 { Ok(()) } else { Err(Fault) }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Fault)
+    }
 }
 
+/// Writes a 64-bit value to the given `dest` pointer in a fallible manner.
+///
+/// # Safety
+/// `dest` must be valid for writes or a pointer that's guaranteed to be
+/// in non-Rust memory.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn write_u64_fallible(dest: *mut u64, value: u64) -> Result<(), Fault> {
     let result: u64;
@@ -387,7 +519,11 @@ pub unsafe fn write_u64_fallible(dest: *mut u64, value: u64) -> Result<(), Fault
             options(nostack),
         }
     }
-    if result == 0 { Ok(()) } else { Err(Fault) }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Fault)
+    }
 }
 
 /// Exception table entry with relative offsets
