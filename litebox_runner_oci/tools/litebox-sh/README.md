@@ -126,11 +126,12 @@ litebox-sh -c 'export PORT=8080 && export HOST=0.0.0.0 && echo "Starting on $HOS
 ## Building
 
 ```sh
-# Default (static, optimized)
-make
+# Build with musl (statically linked, ~435KB)
+cargo build --release --target x86_64-unknown-linux-musl
 
-# Clean
-make clean
+# Binary at: target/x86_64-unknown-linux-musl/release/litebox-sh
 ```
 
-Requires `gcc` and static C library (`libc` with `-static` support).
+Requires the `x86_64-unknown-linux-musl` target: `rustup target add x86_64-unknown-linux-musl`
+
+The binary is automatically built and embedded into the OCI runner during `cargo build`.

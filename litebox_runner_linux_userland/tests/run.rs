@@ -637,9 +637,33 @@ fn test_tun_tcp_latency() {
 /// && / || operators, and that the shell exits correctly.
 #[test]
 fn test_litebox_sh() {
-    let shell_src = PathBuf::from("../litebox_runner_oci/tools/litebox-sh/litebox-sh.c");
+    // Build the Rust litebox-sh binary (statically linked via musl)
+    let shell_dir = PathBuf::from("../litebox_runner_oci/tools/litebox-sh");
+    let build_output = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "x86_64-unknown-linux-musl",
+        ])
+        .current_dir(&shell_dir)
+        .output()
+        .expect("Failed to build litebox-sh");
+    assert!(
+        build_output.status.success(),
+        "litebox-sh build failed: {}",
+        String::from_utf8_lossy(&build_output.stderr)
+    );
+
+    // Copy to OUT_DIR so the Runner can find and rewrite it
     let unique_name = "litebox_sh_test";
-    let shell_target = common::compile(shell_src.to_str().unwrap(), unique_name, true, false);
+    let dir_path = std::env::var("OUT_DIR").unwrap();
+    let shell_target = PathBuf::from(&dir_path).join(unique_name);
+    std::fs::copy(
+        shell_dir.join("target/x86_64-unknown-linux-musl/release/litebox-sh"),
+        &shell_target,
+    )
+    .expect("Failed to copy litebox-sh");
 
     // Test 1: echo
     let output = Runner::new(

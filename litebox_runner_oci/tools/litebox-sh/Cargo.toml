@@ -1,0 +1,22 @@
+[package]
+name = "litebox-sh"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Fork-free minimal shell for LiteBox sandboxes"
+
+[workspace]
+
+[[bin]]
+name = "litebox-sh"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+libc = { version = "0.2.180", features = ["default"] }
