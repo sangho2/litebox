@@ -203,56 +203,69 @@ host and container over TUN device. Release build, 3 runs each.
 
 ### TCP Throughput (4MB Transfer)
 
-| Metric | Old (`poll`) | New (adaptive spin + `futex`) | Improvement |
-|--------|-------------|-------------------------------|-------------|
+| Metric | Before (`poll`, 5ms) | After (`poll`, 1ms) | Improvement |
+|--------|---------------------|---------------------|-------------|
 | Run 1 | 2,723 Mbps | 4,519 Mbps | +66% |
-| Run 2 | 2,648 Mbps | 4,516 Mbps | +71% |
-| Run 3 | 2,656 Mbps | 4,836 Mbps | +82% |
-| **Mean** | **2,676 Mbps** | **4,624 Mbps** | **+73%** |
+| Run 2 | 2,648 Mbps | 4,506 Mbps | +71% |
+| Run 3 | 2,656 Mbps | 4,502 Mbps | +69% |
+| **Mean** | **2,676 Mbps** | **4,509 Mbps** | **+69%** |
 
 ### TCP Round-Trip Latency (64-byte Echo)
 
-| Metric | Old (`poll`, 5ms timeout) | New (spin + `futex`, 1ms timeout) | Improvement |
-|--------|--------------------------|-----------------------------------|-------------|
-| **avg** | 10,205 μs | 43 μs | **237x faster** |
-| **min** | 10,137 μs | 36 μs | **282x faster** |
-| **p50** | 10,200 μs | 42 μs | **243x faster** |
-| **p99** | 10,562 μs | 66 μs | **160x faster** |
-| **max** | 10,923 μs | 79 μs | **138x faster** |
+| Metric | Before (`poll`, 5ms) | After (`poll`, 1ms) | Improvement |
+|--------|---------------------|---------------------|-------------|
+| **avg** | 10,205 μs | 40 μs | **~250x** |
+| **min** | 10,137 μs | 34 μs | **~298x** |
+| **p50** | 10,200 μs | 39 μs | **~262x** |
+| **p99** | 10,562 μs | 66 μs | **~160x** |
 
-### How the Network Worker Waits
+### Why Reducing the Timeout Helps
 
-The network worker thread is pinned to CPU 0 and runs a loop:
+The network worker calls `poll(tun_fd, POLLIN, timeout)` to wait for inbound packets.
+`poll` wakes **instantly** when a packet arrives (kernel signals POLLIN), so the
+timeout only affects how long the worker sleeps when there is no inbound data. However,
+the worker also needs to wake periodically to:
 
-1. **Drain phase**: Calls `perform_network_interaction()` in a tight loop while
-   `CallAgainImmediately` is returned (active sockets have data to process).
-   Both old and new approaches burn 100% CPU here — this is expected and identical.
+1. **Process TX data** from container threads (written to ring buffers)
+2. **Run smoltcp timers** (TCP retransmits, keepalives, etc.)
 
-2. **Wait phase**: When no immediate work remains, the worker waits for new packets:
+With a 5ms timeout, the worker could sleep up to 5ms before noticing TX data, causing
+~10ms round-trip latency (5ms each direction). With 1ms, worst-case TX delay is 1ms,
+and inbound packets still wake the worker instantly via POLLIN.
 
-| Aspect | Old (`poll`) | New (spin + `futex`) |
-|--------|-------------|----------------------|
-| **Mechanism** | `poll(tun_fd, POLLIN, 5ms)` | 100× `read(tun_fd, 0)` spin, then `futex_wait(1ms)` |
-| **Idle CPU** | ~0% (kernel sleep) | ~0% (brief spin, then kernel sleep) |
-| **Wakeup on RX** | Immediate (kernel POLLIN) | <1μs if during spin, else up to 1ms on futex timeout |
-| **Wakeup on TX** | Not possible (waits for timeout) | Immediate via `futex_wake` from container thread |
-| **Spin cost** | None | ~100 failed `read` syscalls per cycle (~few μs) |
-| **Syscall type** | Requires `poll` in seccomp filter | Uses only `read` + `futex` (already allowed) |
+### `poll` vs `read`+`futex` (Seccomp Considerations)
 
-**Why latency improved 237x:** The old `poll()` blocked up to 5ms per wait. A
-round-trip required two waits (TX direction + RX direction), creating ~10ms minimum
-RTT. The new approach catches packets during the spin window (sub-microsecond), and
-falls back to a 1ms futex timeout instead of 5ms.
+We evaluated replacing `poll` with `read(tun_fd)` + `futex_wait` to remove `poll`
+from the seccomp allowlist. Results at the same 1ms budget:
 
-**Why throughput improved 73%:** The reduced timeout (5ms → 1ms) means the worker
-polls smoltcp more frequently during sustained transfers, reducing gaps between
-packet batches.
+| | `poll` (1ms) | `read`+`futex` (1ms) |
+|---|---|---|
+| **Throughput** | 4,509 Mbps | 4,019 Mbps |
+| **Latency avg** | 40 μs | 1,186 μs |
+| **Seccomp** | Needs `poll` | No `poll` needed |
+| **Idle CPU** | ~0% | ~0% |
 
-**CPU trade-off:** The new approach adds ~100 `read` syscalls per wait cycle during
-the spin phase. These are zero-length non-blocking reads that return `EAGAIN`
-immediately, costing a few microseconds of CPU per cycle. This is negligible compared
-to the kernel `futex_wait` sleep that follows, and the benefit is catching
-packets that arrive within the spin window without waiting for the full timeout.
+`poll` wins on both metrics because it wakes instantly on POLLIN. `futex_wait` has no
+connection to the TUN fd and can only wake on timeout, adding ~1ms per-direction
+latency. The `read`+`futex` approach trades 30x worse latency and 12% less throughput
+for removing one syscall from the seccomp filter.
+
+**Decision:** Keep `poll` for now. The latency advantage is significant, and `poll` is
+a well-audited, low-risk syscall.
+
+### `poll` vs `epoll`
+
+For a single TUN fd, `poll` and `epoll` are functionally equivalent:
+
+- **Both** wake instantly on POLLIN
+- **Both** support timeouts
+- `poll` uses one syscall per wait; `epoll` uses one `epoll_wait` per wait (after setup)
+- `epoll` overhead: 2 extra setup syscalls (`epoll_create1`, `epoll_ctl`) + 3 syscall
+  types in the seccomp filter instead of 1
+
+`epoll` is designed for monitoring **many** fds efficiently (O(1) vs O(n) for `poll`).
+With a single TUN fd, there is no scalability advantage. `epoll` would only become
+relevant if LiteBox adds per-container TUN devices or multiple network interfaces.
 
 ### Reproducing Network Benchmarks
 
@@ -275,11 +288,11 @@ cargo test --package litebox_runner_linux_userland --test run --release \
 ## Version History
 
 - **2026-02-06**: TUN networking optimization
-  - Replaced `poll()` with adaptive spin + `futex_wait` in network worker
-  - Eliminates `poll` syscall from seccomp allowlist
-  - TCP throughput: +73% (2.7 → 4.6 Gbps)
-  - TCP latency: 237x faster (10.2ms → 43μs avg RTT)
-  - Reduced default network poll timeout from 5ms to 1ms
+  - Reduced poll timeout from 5ms to 1ms with timeout capping
+  - TCP throughput: +69% (2.7 → 4.5 Gbps)
+  - TCP latency: ~250x faster (10.2ms → 40μs avg RTT)
+  - Evaluated `read`+`futex` alternative (eliminates `poll` from seccomp but 30x worse latency)
+  - Added TCP throughput and latency benchmarks
 
 - **2026-02-06**: Performance optimizations
   - Added parallel syscall rewriting with rayon (~10-20% improvement for multi-file rewrites)

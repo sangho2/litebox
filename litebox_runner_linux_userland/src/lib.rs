@@ -284,8 +284,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         }
                     }
                 };
-                litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT)));
+                // Cap timeout so we poll smoltcp frequently for timers and TX data.
+                // poll() wakes instantly on inbound packets regardless of timeout.
+                let capped = match timeout {
+                    Some(t) if t < DEFAULT_TIMEOUT => t,
+                    _ => DEFAULT_TIMEOUT,
+                };
+                litebox_platform_multiplex::platform().wait_on_tun(Some(capped));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
