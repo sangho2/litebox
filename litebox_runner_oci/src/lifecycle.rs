@@ -107,6 +107,22 @@ fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::Owned
     Ok(slave)
 }
 
+/// Check if the OCI spec requests a new network namespace (type=network, no path).
+/// When true, the child process should unshare into a new netns so that container
+/// managers can apply CNI plugins to the child's /proc/<pid>/ns/net.
+fn should_unshare_netns(spec: &oci_spec::runtime::Spec) -> bool {
+    use oci_spec::runtime::LinuxNamespaceType;
+    spec.linux()
+        .as_ref()
+        .and_then(|l| l.namespaces().as_ref())
+        .map(|namespaces| {
+            namespaces
+                .iter()
+                .any(|ns| ns.typ() == LinuxNamespaceType::Network && ns.path().is_none())
+        })
+        .unwrap_or(false)
+}
+
 /// OCI lifecycle manager.
 pub struct Lifecycle {
     state_manager: StateManager,
@@ -194,6 +210,25 @@ impl Lifecycle {
                 // Child process
                 drop(parent_sock); // Close parent's end
                 let mut child_sock = child_sock;
+
+                // If the OCI spec requests a new network namespace (no path), unshare
+                // into one so that container managers (e.g., ctr --cni) can apply CNI
+                // plugins to our netns via /proc/<pid>/ns/net.
+                if let Ok(spec_data) = fs::read(&config_path) {
+                    if let Ok(spec) = serde_json::from_slice::<oci_spec::runtime::Spec>(&spec_data)
+                    {
+                        if should_unshare_netns(&spec) {
+                            // SAFETY: unshare is a standard Linux syscall.
+                            let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+                            if ret == 0 {
+                                // Bring up loopback in the new netns
+                                let _ = std::process::Command::new("ip")
+                                    .args(["link", "set", "lo", "up"])
+                                    .status();
+                            }
+                        }
+                    }
+                }
 
                 // Create a listener socket that start() will connect to
                 let listener =

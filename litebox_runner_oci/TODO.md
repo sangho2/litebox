@@ -29,6 +29,7 @@
 - [x] `--stdout` and `--stderr` for stdio redirection
 - [x] Cache rewritten binaries for faster subsequent runs
 - [x] TUN-based networking via `--tun-device` flag (TCP/UDP/ICMP supported)
+- [x] Automatic CNI networking (Podman auto-detect + `ctr --cni`)
 - [x] statx syscall implementation
 - [x] statfs/fstatfs syscall implementation
 - [x] Virtual /proc filesystem emulation (cpuinfo, meminfo, mounts, stat, status, etc.)
@@ -110,11 +111,13 @@ Uses existing `io.containerd.runc.v2` shim - no custom shim needed. Critical fla
 
 ### Networking
 
-TUN-based networking uses LiteBox's smoltcp TCP/IP stack:
-- Container IP: `10.0.0.2/24` (hardcoded)
-- Gateway: `10.0.0.1` (host TUN interface)
-- Supports: TCP, UDP sockets
-- Not supported: Generic raw sockets (non-ICMP)
+Automatic CNI networking via Podman and `ctr --cni` (auto-detects netns, creates TUN, sets up NAT bridge).
+Manual TUN mode via `--tun-device` flag for environments without CNI.
+
+- Container IP (internal): `10.0.0.2/24` (smoltcp)
+- Gateway (internal): `10.0.0.1` (TUN interface)
+- Supports: TCP, UDP, ICMP (ping), setitimer (SIGALRM)
+- Not supported: Generic raw sockets (non-ICMP), DNS resolution
 
 ### Multi-threading and Process Model
 

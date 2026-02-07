@@ -127,6 +127,7 @@ pub struct LinuxShimBuilder {
     litebox: LiteBox<Platform>,
     fs: Option<LinuxFS>,
     load_filter: Option<LoadFilter>,
+    net_config: Option<litebox::net::NetworkInterfaceConfig>,
 }
 
 impl Default for LinuxShimBuilder {
@@ -144,6 +145,7 @@ impl LinuxShimBuilder {
             litebox: LiteBox::new(platform),
             fs: None,
             load_filter: None,
+            net_config: None,
         }
     }
 
@@ -187,13 +189,20 @@ impl LinuxShimBuilder {
         self.load_filter = Some(callback);
     }
 
+    /// Set the network interface configuration (IP, gateway, prefix length).
+    /// If not set, defaults to 10.0.0.2/24 with gateway 10.0.0.1.
+    pub fn set_network_config(&mut self, config: litebox::net::NetworkInterfaceConfig) {
+        self.net_config = Some(config);
+    }
+
     /// Build the shim.
     ///
     /// # Panics
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
     /// before calling this method.
     pub fn build(self) -> LinuxShim {
-        let mut net = Network::new(&self.litebox);
+        let net_config = self.net_config.unwrap_or_default();
+        let mut net = Network::new_with_config(&self.litebox, &net_config);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,

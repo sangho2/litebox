@@ -207,47 +207,67 @@ Output format matches `runc events --stats`:
 
 Stats are read from `/proc/<pid>/statm` (memory) and `/proc/<pid>/stat` (CPU time).
 
-### Networking (TUN Device)
+### Networking
 
-Enable container networking using a TUN device:
+Container networking works automatically with Podman (via CNI), `ctr --cni` (containerd), or manually with a TUN device.
+
+#### Automatic (Podman or ctr — recommended)
+
+The container manager sets up a CNI network namespace. litebox-oci auto-detects it and configures networking:
 
 ```bash
-# First, set up a TUN device on the host (requires root)
-sudo litebox_platform_linux_userland/scripts/tun-setup.sh -t tun99 -i 10.0.0.1
+# Podman — no flags needed
+sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
+  docker.io/library/alpine:latest /bin/ping -c 3 10.0.0.1
 
-# Run container with networking enabled
-litebox-oci run -b /bundle --tun-device tun99 my-container
-
-# Container will have IP 10.0.0.2/24, gateway 10.0.0.1
+# containerd (ctr) — use --cni flag
+sudo ctr run --rm --cni --runc-binary /usr/local/bin/litebox-oci \
+  docker.io/library/alpine:latest test /bin/ping -c 3 10.0.0.1
 ```
 
-**Requirements:**
-- TUN device must be pre-created on the host
-- Container gets IP `10.0.0.2/24` (hardcoded in LiteBox)
-- Gateway is `10.0.0.1` (host side of TUN)
+**Architecture:** litebox-oci is a single process with a three-phase lifecycle:
+
+1. **Setup** (privileged): create TUN device, configure kernel IP forwarding + NAT
+   (via `ip` and `iptables`), open all required file descriptors
+2. **Lock down**: install seccomp filter
+3. **Execute**: load and run the guest in the same process and address space
+
+```
+Guest app → shim → smoltcp → TUN fd → kernel NAT → veth/eth0 → CNI bridge → network
+```
+
+After lockdown, the process can only `read`/`write`/`poll`/`futex` on pre-opened file descriptors.
+Even if compromised, the attacker cannot open sockets or access network interfaces directly.
+
+#### Manual (TUN Device)
+
+For custom setups without CNI, create a TUN device on the host:
+
+```bash
+# Set up TUN device
+sudo ip tuntap add dev tun99 mode tun
+sudo ip addr add 10.0.0.1/24 dev tun99
+sudo ip link set tun99 up
+
+# Enable NAT for internet access
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 ! -o tun99 -j MASQUERADE
+
+# Run with Podman (overrides auto-CNI)
+sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
+  --runtime-flag='tun-device=tun99' alpine /bin/ping -c 3 10.0.0.1
+```
 
 **Supported:**
 - TCP sockets (`socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`)
 - UDP sockets (`socket`, `bind`, `sendto`/`recvfrom`)
+- ICMP ping (`SOCK_RAW`/`SOCK_DGRAM` + `IPPROTO_ICMP`)
 
-**Not supported:**
-- Raw sockets (ICMP ping)
-- `/proc/net/*` files
-- Some edge cases in socket state transitions
+**Not yet supported:**
+- DNS resolution (needs `/etc/resolv.conf` in rootfs)
+- Generic raw sockets (non-ICMP)
 
-**Setup host NAT for internet access:**
-
-```bash
-# Enable IP forwarding
-sudo sysctl -w net.ipv4.ip_forward=1
-
-# NAT container traffic
-sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
-sudo iptables -A FORWARD -i tun99 -o eth0 -j ACCEPT
-sudo iptables -A FORWARD -i eth0 -o tun99 -m state --state RELATED,ESTABLISHED -j ACCEPT
-```
-
-**Note:** All containers using the same TUN device share the IP `10.0.0.2`. There's no per-container network isolation.
+**Note:** All containers use smoltcp-internal IP `10.0.0.2`. With auto-CNI, kernel NAT translates this to the container's real CNI-assigned IP.
 
 ## How It Works
 

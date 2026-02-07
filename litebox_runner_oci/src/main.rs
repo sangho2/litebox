@@ -621,6 +621,7 @@ fn main() -> Result<()> {
             // Set up network configuration
             let network = litebox_runner_oci::NetworkConfig {
                 tun_device: tun_device.clone(),
+                cni: None,
             };
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
@@ -696,6 +697,7 @@ fn main() -> Result<()> {
             // Set up network configuration
             let network = litebox_runner_oci::NetworkConfig {
                 tun_device: tun_device.clone(),
+                cni: None,
             };
 
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;

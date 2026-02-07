@@ -180,39 +180,105 @@ LiteBox emulates a subset of `/proc` to enable common container tools:
 
 ## Networking
 
-### TUN-based Networking
+### Architecture
 
-Container networking is supported via TUN devices using the `--tun-device` flag:
+LiteBox is a single-process runtime with a three-phase lifecycle:
+
+1. **Setup** (privileged): create TUN device, configure kernel IP forwarding + NAT
+   (via `ip` and `iptables` commands), open all required file descriptors, prepare rootfs
+2. **Lock down**: install seccomp filter — after this point, only `read`/`write`/`poll`/`futex`
+   are permitted on pre-opened file descriptors
+3. **Execute**: load and run the guest binary in the same process and address space
+
+All network syscalls from the guest are intercepted by the shim and processed through a userspace
+TCP/IP stack (`smoltcp`), which sends/receives raw IP packets through a TUN device. The kernel
+handles IP forwarding and NAT from the TUN to the CNI network — no userspace packet bridge needed.
+
+```
+┌─────────────────────────────────────────────────┐
+│  litebox-oci (single process)                   │
+│                                                 │
+│  1. Setup: open TUN, configure NAT, open fds    │
+│  2. Lock down: install seccomp filter           │
+│  3. Execute: run guest in same address space    │
+│     Guest app → shim → smoltcp → TUN fd         │
+│     (only read/write/poll/futex on pre-opened   │
+│      file descriptors)                          │
+└──────────┬──────────────────────────────────────┘
+           │ TUN fd (litebox0)
+┌──────────▼──────────────────────────────────────┐
+│  Kernel                                         │
+│  IP forwarding + iptables MASQUERADE            │
+│  TUN (10.0.0.1) ←→ veth/eth0 (CNI network)     │
+└─────────────────────────────────────────────────┘
+```
+
+**Security**: Even if the sandbox is compromised, the attacker can only `read`/`write`/`poll`/`futex`
+on pre-opened file descriptors. No `socket()`, `ioctl()`, or `open()` calls are available — the
+attacker cannot access any network interface directly.
+
+### Automatic CNI Networking (Podman and ctr)
+
+When launched via Podman or `ctr --cni`, litebox-oci automatically detects the CNI-configured
+network namespace and sets up networking with zero configuration:
 
 ```bash
-# Set up TUN on host
-sudo litebox_platform_linux_userland/scripts/tun-setup.sh -t tun99 -i 10.0.0.1
+# Podman — just works, no flags needed
+sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
+  docker.io/library/alpine:latest /bin/ping -c 3 10.0.0.1
 
-# Run with networking
-litebox-oci run -b /bundle --tun-device tun99 my-container
+# containerd (ctr) — use --cni flag
+sudo ctr run --rm --cni --runc-binary /usr/local/bin/litebox-oci \
+  docker.io/library/alpine:latest test /bin/ping -c 3 10.0.0.1
 ```
 
 **How it works:**
-- LiteBox implements a TCP/IP stack using `smoltcp`
-- Socket syscalls (`socket`, `connect`, `bind`, `listen`, `accept`, etc.) are intercepted
-- IP packets are sent/received through the TUN device
-- Container IP: `10.0.0.2/24` (hardcoded)
-- Gateway: `10.0.0.1` (host TUN interface)
+1. The container manager creates a network namespace with a veth pair (via CNI plugins)
+   - Podman: creates the netns before calling the runtime, passes the path in the OCI spec
+   - containerd (`ctr --cni`): the runtime creates a new netns via `unshare(CLONE_NEWNET)`,
+     then `ctr` applies CNI plugins to `/proc/<pid>/ns/net`
+2. litebox-oci detects the netns — either from the OCI spec path (Podman) or by detecting
+   a non-loopback interface in the current namespace (`ctr --cni`)
+3. Reads the veth config (IP, gateway, MTU)
+4. Creates a TUN device (`litebox0`) inside the netns
+5. Configures kernel IP forwarding + NAT (MASQUERADE) so TUN traffic routes through the veth
+6. smoltcp uses `10.0.0.2/24` (internal), kernel NATs to the container's CNI IP
 
-**Supported socket operations:**
-- TCP: `socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`, `close`
-- UDP: `socket`, `bind`, `sendto`/`recvfrom`, `close`
-- ICMP: `socket(SOCK_RAW, IPPROTO_ICMP)`, `connect`, `bind`, `sendto`/`recvfrom`
+### Manual TUN Device
 
-**Not yet supported:**
+For environments without CNI, use the `--tun-device` flag:
+
+```bash
+# Set up TUN on host
+sudo ip tuntap add dev tun99 mode tun
+sudo ip addr add 10.0.0.1/24 dev tun99
+sudo ip link set tun99 up
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 ! -o tun99 -j MASQUERADE
+
+# Run with Podman (overrides auto-CNI)
+sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
+  --runtime-flag='tun-device=tun99' alpine /bin/ping -c 3 10.0.0.1
+```
+
+### Supported Socket Operations
+
+- **TCP**: `socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`, `close`
+- **UDP**: `socket`, `bind`, `sendto`/`recvfrom`, `close`
+- **ICMP**: `socket(SOCK_RAW/SOCK_DGRAM, IPPROTO_ICMP)`, `sendto`/`recvfrom` (ping works)
+- **Timer**: `setitimer(ITIMER_REAL)` for SIGALRM delivery (required by ping)
+
+### Not Yet Supported
+
 - Generic raw sockets (`SOCK_RAW` with non-ICMP protocols)
-- Some socket state edge cases
+- DNS resolution (needs `/etc/resolv.conf` in rootfs)
 - `/proc/net/*` files
 
-**Limitations:**
-- No per-container IP isolation
+### Limitations
+
+- No per-container IP isolation (all containers use smoltcp IP `10.0.0.2`)
 - No port mapping (requires host-side iptables)
-- No DNS resolution (needs `/etc/resolv.conf` in rootfs)
+- Pinging external IPs beyond the TUN gateway requires DNS + routing (not yet supported)
 
 ## Architectural Limitations
 
@@ -223,7 +289,7 @@ The `rtld_audit.so` library for dynamic library syscall interception is x86_64-s
 Symlinks in the rootfs are resolved and flattened to regular files during loading. This is because LiteBox's in-memory filesystem doesn't support symlinks.
 
 ### No Network Isolation
-All containers using the same TUN device share the IP address `10.0.0.2`. There is no per-container network namespace isolation.
+All containers use the smoltcp-internal IP address `10.0.0.2`. With auto-CNI, the kernel NATs this to the container's real CNI-assigned IP, but there is no per-container isolation within smoltcp itself.
 
 ### No Resource Limits
 cgroups are not used, so CPU, memory, and I/O limits are not enforced.

@@ -79,25 +79,53 @@ where
     closing_in_background: Vec<smoltcp::iface::SocketHandle>,
 }
 
+/// Configuration for the network interface.
+pub struct NetworkInterfaceConfig {
+    /// IP address for the interface.
+    pub ip_addr: Ipv4Addr,
+    /// Network prefix length (e.g., 24 for /24).
+    pub prefix_len: u8,
+    /// Gateway IP address.
+    pub gateway: Ipv4Addr,
+}
+
+impl Default for NetworkInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            ip_addr: INTERFACE_IP_ADDR,
+            prefix_len: 24,
+            gateway: GATEWAY_IP_ADDR,
+        }
+    }
+}
+
 impl<Platform> Network<Platform>
 where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
-    /// Construct a new `Network` instance
+    /// Construct a new `Network` instance with default IP configuration (10.0.0.2/24, gw 10.0.0.1).
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self::new_with_config(litebox, &NetworkInterfaceConfig::default())
+    }
+
+    /// Construct a new `Network` instance with the given IP configuration.
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+    pub fn new_with_config(
+        litebox: &LiteBox<Platform>,
+        net_config: &NetworkInterfaceConfig,
+    ) -> Self {
         let mut device = phy::Device::new(litebox.x.platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         interface.update_ip_addrs(|ip_addrs| {
             match ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
-                24,
+                smoltcp::wire::IpAddress::Ipv4(net_config.ip_addr),
+                net_config.prefix_len,
             )) {
                 Ok(()) => {}
                 Err(_) => unreachable!(),
@@ -105,7 +133,7 @@ where
         });
         match interface
             .routes_mut()
-            .add_default_ipv4_route(GATEWAY_IP_ADDR)
+            .add_default_ipv4_route(net_config.gateway)
         {
             Ok(None) => {}
             _ => unreachable!(),

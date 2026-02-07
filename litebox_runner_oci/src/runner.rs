@@ -672,11 +672,245 @@ pub struct StdioRedirect {
 #[derive(Debug, Clone, Default)]
 pub struct NetworkConfig {
     /// TUN device name to use for networking (e.g., "tun99").
-    /// If None, networking syscalls will fail.
+    /// If None and no CNI config is detected, networking syscalls will fail.
     pub tun_device: Option<String>,
+    /// CNI-detected network configuration from the container's network namespace.
+    /// Auto-populated when a network namespace path is found in the OCI spec.
+    pub cni: Option<CniNetworkConfig>,
 }
 
-/// Run an OCI container using LiteBox sandbox.
+/// Network configuration detected from the container's CNI-configured network namespace.
+#[derive(Debug, Clone)]
+pub struct CniNetworkConfig {
+    /// Path to the network namespace (e.g., "/run/netns/netns-xxx").
+    /// None when the runtime is already inside the container's netns (e.g., `ctr --cni`).
+    pub netns_path: Option<PathBuf>,
+    /// Container interface IP address (e.g., "10.88.0.30").
+    pub ip_addr: std::net::Ipv4Addr,
+    /// Network prefix length (e.g., 16 for /16).
+    pub prefix_len: u8,
+    /// Gateway IP address (e.g., "10.88.0.1").
+    pub gateway: std::net::Ipv4Addr,
+    /// Interface MTU.
+    pub mtu: u16,
+}
+
+/// Detect CNI network configuration from the OCI spec's network namespace.
+///
+/// Two detection strategies:
+/// 1. If the spec defines a network namespace with a path (Podman), enters that namespace
+///    and reads the interface configuration.
+/// 2. If no netns path is available (e.g., `ctr --cni`), checks whether we're already
+///    inside a netns with a non-loopback interface and reads config directly.
+pub fn detect_cni_network(spec: &Spec) -> Option<CniNetworkConfig> {
+    use oci_spec::runtime::LinuxNamespaceType;
+
+    let linux = spec.linux().as_ref()?;
+    let namespaces = linux.namespaces().as_ref()?;
+
+    // Find network namespace entry
+    let net_ns = namespaces
+        .iter()
+        .find(|ns| ns.typ() == LinuxNamespaceType::Network)?;
+
+    if let Some(netns_path) = net_ns.path().as_ref() {
+        // Strategy 1: explicit netns path (Podman) — enter it and read config
+        let netns_file = std::fs::File::open(netns_path).ok()?;
+        let orig_netns = std::fs::File::open("/proc/self/ns/net").ok()?;
+
+        use std::os::unix::io::AsRawFd;
+        let clone_newnet: libc::c_int = 0x40000000; // CLONE_NEWNET
+        // SAFETY: setns is a standard Linux syscall. We pass a valid fd and flag.
+        let ret = unsafe { libc::setns(netns_file.as_raw_fd(), clone_newnet) };
+        if ret != 0 {
+            return None;
+        }
+
+        let result = read_netns_config(Some(netns_path));
+
+        // Restore original netns
+        // SAFETY: restoring the original network namespace with a valid fd.
+        unsafe {
+            libc::setns(orig_netns.as_raw_fd(), clone_newnet);
+        }
+
+        result
+    } else {
+        // Strategy 2: no netns path (ctr --cni) — we may already be inside the netns.
+        // Verify we're in a different netns from init (PID 1) to avoid false positives
+        // when containerd includes a network namespace entry but hasn't set up CNI.
+        if !is_in_non_default_netns() {
+            return None;
+        }
+        read_netns_config(None)
+    }
+}
+
+/// Check if the current process is in a different network namespace than PID 1.
+fn is_in_non_default_netns() -> bool {
+    let self_ns = std::fs::read_link("/proc/self/ns/net").ok();
+    let init_ns = std::fs::read_link("/proc/1/ns/net").ok();
+    match (self_ns, init_ns) {
+        (Some(s), Some(i)) => s != i,
+        _ => false,
+    }
+}
+
+/// Read network configuration from inside a network namespace.
+/// Must be called while the process is in the target netns (via setns or already inside).
+/// `netns_path` is None when we're already in the netns (e.g., `ctr --cni`).
+fn read_netns_config(netns_path: Option<&PathBuf>) -> Option<CniNetworkConfig> {
+    // Use `ip` command to find interfaces (respects network namespace, unlike /sys/class/net/)
+    let link_output = std::process::Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .ok()?;
+    let link_text = String::from_utf8_lossy(&link_output.stdout);
+
+    // Find the first non-loopback interface (typically "eth0")
+    let mut iface_name = None;
+    for line in link_text.lines() {
+        // Format: "2: eth0@if47: <BROADCAST,..."
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() >= 2 {
+            let name = parts[1]
+                .trim_end_matches(':')
+                .split('@')
+                .next()
+                .unwrap_or("");
+            if !name.is_empty() && name != "lo" {
+                iface_name = Some(name.to_string());
+                break;
+            }
+        }
+    }
+    let iface_name = iface_name?;
+
+    // Read MTU from ip link output
+    let mtu: u16 = link_text
+        .lines()
+        .find(|l| l.contains(&iface_name))
+        .and_then(|l| {
+            let mtu_pos = l.find("mtu ")?;
+            let after_mtu = &l[mtu_pos + 4..];
+            let end = after_mtu.find(' ').unwrap_or(after_mtu.len());
+            after_mtu[..end].parse().ok()
+        })
+        .unwrap_or(1500);
+
+    // Read IP address and prefix
+    let ip_output = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", &iface_name])
+        .output()
+        .ok()?;
+    let ip_line = String::from_utf8_lossy(&ip_output.stdout);
+    let (ip_addr, prefix_len) = parse_ip_addr_line(&ip_line)?;
+
+    // Read default gateway
+    let route_output = std::process::Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .ok()?;
+    let route_line = String::from_utf8_lossy(&route_output.stdout);
+    let gateway = parse_default_gateway(&route_line)?;
+
+    Some(CniNetworkConfig {
+        netns_path: netns_path.cloned(),
+        ip_addr,
+        prefix_len,
+        gateway,
+        mtu,
+    })
+}
+
+/// Parse IP address and prefix length from `ip -4 -o addr show` output.
+fn parse_ip_addr_line(line: &str) -> Option<(std::net::Ipv4Addr, u8)> {
+    // "2: eth0    inet 10.88.0.30/16 brd ..."
+    let inet_pos = line.find("inet ")?;
+    let after_inet = &line[inet_pos + 5..];
+    let cidr_end = after_inet.find(' ').unwrap_or(after_inet.len());
+    let cidr = &after_inet[..cidr_end];
+    let mut parts = cidr.split('/');
+    let ip: std::net::Ipv4Addr = parts.next()?.parse().ok()?;
+    let prefix: u8 = parts.next()?.parse().ok()?;
+    Some((ip, prefix))
+}
+
+/// Parse default gateway from `ip -4 route show default` output.
+fn parse_default_gateway(line: &str) -> Option<std::net::Ipv4Addr> {
+    // "default via 10.88.0.1 dev eth0"
+    let via_pos = line.find("via ")?;
+    let after_via = &line[via_pos + 4..];
+    let gw_end = after_via.find(' ').unwrap_or(after_via.len());
+    let gw = &after_via[..gw_end];
+    gw.parse().ok()
+}
+
+/// Set up a TUN device inside the container's CNI network namespace.
+///
+/// If `cni.netns_path` is Some, enters that netns first.
+/// If None, assumes we're already in the correct netns (e.g., `ctr --cni`).
+/// Creates a TUN device, configures IP forwarding and NAT so that smoltcp traffic
+/// is routed through the container's veth to the host network.
+fn setup_cni_tun(cni: &CniNetworkConfig) -> Result<String> {
+    let tun_name = "litebox0";
+    let tun_ip = "10.0.0.1";
+    let tun_subnet = "10.0.0.0/24";
+
+    // Enter the container's network namespace if a path is provided
+    if let Some(netns_path) = &cni.netns_path {
+        use std::os::unix::io::AsRawFd;
+        let netns_file = std::fs::File::open(netns_path)
+            .with_context(|| format!("failed to open netns {}", netns_path.display()))?;
+
+        let clone_newnet: libc::c_int = 0x40000000;
+        // SAFETY: setns is a standard Linux syscall with a valid fd.
+        let ret = unsafe { libc::setns(netns_file.as_raw_fd(), clone_newnet) };
+        if ret != 0 {
+            anyhow::bail!("setns failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    // Create TUN device inside the netns
+    let status = Command::new("ip")
+        .args(["tuntap", "add", "dev", tun_name, "mode", "tun"])
+        .status()
+        .context("failed to create TUN device")?;
+    if !status.success() {
+        anyhow::bail!("ip tuntap add failed with {status}");
+    }
+
+    // Configure TUN device
+    let _ = Command::new("ip")
+        .args(["addr", "add", &format!("{tun_ip}/24"), "dev", tun_name])
+        .status();
+    let _ = Command::new("ip")
+        .args(["link", "set", tun_name, "up"])
+        .status();
+
+    // Enable IP forwarding inside the netns
+    let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+
+    // Set up NAT: masquerade TUN subnet traffic going out via the real interface
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            tun_subnet,
+            "!",
+            "-o",
+            tun_name,
+            "-j",
+            "MASQUERADE",
+        ])
+        .status();
+
+    Ok(tun_name.to_string())
+}
+
 ///
 /// This function:
 /// 1. Loads all files from the OCI rootfs into LiteBox's in-memory filesystem
@@ -1179,8 +1413,31 @@ fn run_container_internal(
         rootfs_path.clone()
     };
 
+    // Detect CNI network configuration from OCI spec, if available
+    let effective_network = if network.tun_device.is_some() {
+        // Explicit --tun-device takes precedence
+        network.clone()
+    } else {
+        match detect_cni_network(&spec) {
+            Some(cni) => {
+                // Auto-setup TUN inside the container's netns
+                match setup_cni_tun(&cni) {
+                    Ok(tun_name) => NetworkConfig {
+                        tun_device: Some(tun_name),
+                        cni: Some(cni),
+                    },
+                    Err(e) => {
+                        eprintln!("litebox-oci: CNI TUN setup failed: {e}");
+                        network.clone()
+                    }
+                }
+            }
+            None => network.clone(),
+        }
+    };
+
     // Initialize LiteBox platform with optional TUN networking
-    let platform = Platform::new(network.tun_device.as_deref());
+    let platform = Platform::new(effective_network.tun_device.as_deref());
     litebox_platform_multiplex::set_platform(platform);
 
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
