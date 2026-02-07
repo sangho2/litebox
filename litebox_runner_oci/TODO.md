@@ -58,7 +58,7 @@
 - [x] Optimize rootfs loading for large images (lazy loading implemented)
 - [x] Lazy file loading (`--lazy-tar`, `--lazy` flags)
 - [x] Kubernetes/CRI-O integration testing (crictl ✓, containerd ✓)
-- [ ] Podman integration testing
+- [x] Podman integration testing (rootless, Alpine/Debian/Ubuntu — 21/21 pass)
 - [x] Tar indexing for O(1) lookups (56% faster for complex images)
 - [x] Lazy executable rewriting (`--lazy-rewrite` flag)
   - Cold cache: 31-72% faster than Eager

@@ -239,3 +239,24 @@ litebox-oci is compatible with containerd's `io.containerd.runc.v2` shim:
 | `--no-pivot` | ✅ Accepted | Ignored (never pivots) |
 | `--no-new-keyring` | ✅ Accepted | Ignored |
 | `--console-socket` | ⚠️ Accepted | Not implemented |
+
+## Podman Compatibility
+
+litebox-oci works with Podman (rootless and rootful) via the `--runtime` flag:
+
+```bash
+podman run --rm --runtime /usr/local/bin/litebox-oci alpine:latest /bin/echo "Hello"
+```
+
+| Flag | Status | Notes |
+|------|--------|-------|
+| `--systemd-cgroup` | ✅ Accepted | Ignored (no cgroup integration) |
+| `--root` | ✅ Supported | Auto-detects rootless path via `XDG_RUNTIME_DIR` |
+| `-b` / `--bundle` | ✅ Supported | Absolute `root.path` from overlay storage works |
+| `--pid-file` | ✅ Supported | Writes container PID |
+
+**Rootless support:** When `XDG_RUNTIME_DIR` is set (default in user sessions and
+Podman user namespaces), state is stored in `$XDG_RUNTIME_DIR/litebox-oci/` instead
+of `/run/litebox-oci/`. No root or `sudo` required.
+
+**Tested:** Podman 4.9 with Alpine, Debian, Ubuntu — 21/21 tests pass.

@@ -80,7 +80,22 @@ sudo ctr run --runc-binary /usr/local/bin/litebox-oci \
 **Tested configurations:**
 - containerd 1.7+ with CRI plugin
 - crictl v1.28+
+- Podman 4.9+ (rootless)
 - Alpine, Debian, Ubuntu, Fedora images
+
+### Use with Podman
+
+```bash
+# Run with litebox-oci as the runtime
+podman run --rm --runtime /usr/local/bin/litebox-oci \
+    alpine:latest /bin/echo "Hello via Podman"
+
+# Shell commands and pipes work
+podman run --rm --runtime /usr/local/bin/litebox-oci \
+    debian:bookworm-slim sh -c "ls / | grep bin"
+```
+
+Podman rootless mode is fully supported — no root or `sudo` required.
 
 ### Rootless Operation
 

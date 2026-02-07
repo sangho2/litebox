@@ -33,8 +33,8 @@ fn version_string() -> &'static str {
 #[command(version = version_string())]
 struct Cli {
     /// Root directory for container state
-    #[clap(long, default_value = "/run/litebox-oci")]
-    root: PathBuf,
+    #[clap(long)]
+    root: Option<PathBuf>,
 
     /// Log file path (accepted for compatibility, logs to stderr)
     #[clap(long)]
@@ -43,6 +43,10 @@ struct Cli {
     /// Log format (accepted for compatibility)
     #[clap(long, default_value = "text")]
     log_format: String,
+
+    /// Systemd cgroup mode (accepted for Podman compatibility, ignored)
+    #[clap(long)]
+    systemd_cgroup: bool,
 
     #[clap(subcommand)]
     command: Command,
@@ -348,7 +352,18 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let state_manager = StateManager::new(cli.root.clone());
+    let root = cli.root.unwrap_or_else(|| {
+        // Try XDG_RUNTIME_DIR first (works in rootless Podman and user sessions),
+        // then /run for real root, then /tmp as last resort
+        if let Ok(xrd) = std::env::var("XDG_RUNTIME_DIR") {
+            PathBuf::from(xrd).join("litebox-oci")
+        } else if unsafe { libc::geteuid() } == 0 {
+            PathBuf::from("/run/litebox-oci")
+        } else {
+            PathBuf::from("/tmp/litebox-oci")
+        }
+    });
+    let state_manager = StateManager::new(root);
     let lifecycle = Lifecycle::new(state_manager);
 
     match cli.command {

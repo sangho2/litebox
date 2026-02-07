@@ -343,6 +343,11 @@ The single remaining failure is a missing file in the BusyBox image, not a LiteB
 
 ## Version History
 
+- **2026-02-07**: Podman integration
+  - Added `--systemd-cgroup` flag (accepted, ignored) for Podman/conmon compatibility
+  - Rootless state directory auto-detection via `XDG_RUNTIME_DIR`
+  - Tested: Podman 4.9 rootless with Alpine, Debian, Ubuntu — 21/21 pass
+
 - **2026-02-07**: Shell rewriting Layer 3+4, symlink fix — near-universal compatibility
   - Layer 3: Shebang and script file rewriting
   - Layer 4: Pipeline orchestration (pipes via sequential re-exec)

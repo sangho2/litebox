@@ -297,6 +297,31 @@ Key compatibility requirements:
 - Accept `--no-pivot` and `--no-new-keyring` (ignored)
 - Output state as JSON to stdout for `state` command
 
+## Podman Integration
+
+LiteBox OCI works with Podman's rootless mode:
+
+```
+podman run --runtime litebox-oci ...
+    │
+    ▼
+conmon (container monitor)
+    │
+    │  (spawns runtime with --systemd-cgroup)
+    │
+    ▼
+litebox-oci --systemd-cgroup create -b /bundle --pid-file /pid <id>
+litebox-oci state <id>
+litebox-oci start <id>
+litebox-oci kill <id> SIGTERM
+litebox-oci delete <id>
+```
+
+Key compatibility requirements:
+- Accept `--systemd-cgroup` flag (ignored, no cgroup integration)
+- Auto-detect rootless state directory via `XDG_RUNTIME_DIR`
+- Handle absolute `root.path` in config.json (Podman uses overlay storage paths)
+
 ## Comparison with gVisor
 
 | Aspect | gVisor (runsc) | LiteBox OCI |

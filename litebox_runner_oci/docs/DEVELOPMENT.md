@@ -152,6 +152,7 @@ sudo ctr run --rm --runc-binary /usr/local/bin/litebox-oci \
 
 ## Recent Additions
 
+- **Podman integration**: `--systemd-cgroup` flag, rootless state dir via `XDG_RUNTIME_DIR` (21/21 pass)
 - **Automatic shell rewriting**: 4-layer system rewrites shell entrypoints for fork-free compatibility
   - Layer 1: `sh/bash/dash` → `litebox-sh` substitution
   - Layer 2: `exec` insertion before final external command
