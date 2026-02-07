@@ -7,7 +7,11 @@ use zerocopy::{FromBytes, IntoBytes};
 
 /// ARM64 signal context structure.
 /// See: https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/uapi/asm/sigcontext.h
-#[repr(C)]
+///
+/// The kernel's `__reserved` field has `__attribute__((aligned(16)))`, which
+/// inserts 8 bytes of padding after `pstate` (offset 272, ends at 280) so
+/// that `__reserved` starts at offset 288 (16-byte aligned). Total: 4384 bytes.
+#[repr(C, align(16))]
 #[derive(Clone, FromBytes, IntoBytes)]
 pub struct Sigcontext {
     pub fault_address: u64,
@@ -19,11 +23,17 @@ pub struct Sigcontext {
     pub pc: u64,
     /// Processor state (PSTATE)
     pub pstate: u64,
+    /// Padding to align `__reserved` to 16 bytes (matching kernel's
+    /// `__attribute__((aligned(16)))` on `__reserved`).
+    #[doc(hidden)]
+    pub _align_pad: [u8; 8],
     // Space for extension records (FPSIMD, SVE, etc.)
     // The kernel writes variable-length data here; we reserve space.
     #[doc(hidden)]
     pub __reserved: [u8; 4096],
 }
+
+const _: () = assert!(core::mem::size_of::<Sigcontext>() == 4384);
 
 /// ARM64 FPSIMD context (floating point / SIMD state).
 #[repr(C)]

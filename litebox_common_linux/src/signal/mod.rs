@@ -288,15 +288,42 @@ pub const SI_TKILL: i32 = -6;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
+/// Linux `ucontext` structure.
+///
+/// The field order differs between architectures:
+/// - **x86_64**: `flags, link, stack, mcontext, sigmask`
+/// - **aarch64**: `flags, link, stack, sigmask, [padding], mcontext`
+///
+/// On ARM64, the kernel's `sigset_t` is 128 bytes (our `SigSet` is 8), and
+/// `__reserved` inside `Sigcontext` has `__attribute__((aligned(16)))` which
+/// gives `Sigcontext` 16-byte alignment (and `repr(C)` inserts 8 bytes of
+/// padding before it). Total on ARM64: 4560 bytes.
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
 pub struct Ucontext {
     pub flags: usize,
     pub link: usize, // *mut Ucontext,
     pub stack: SigAltStack,
+    // On ARM64, sigmask comes BEFORE mcontext, and kernel sigset_t is 128 bytes.
+    #[cfg(target_arch = "aarch64")]
+    pub sigmask: SigSet,
+    #[cfg(target_arch = "aarch64")]
+    #[doc(hidden)]
+    pub _sigmask_reserved: [u8; 120],
+    // On ARM64, Sigcontext has align(16) (from __reserved's alignment), so
+    // repr(C) inserts 8 bytes of padding here (offset 168 → 176). We make
+    // it explicit so zerocopy's IntoBytes is satisfied.
+    #[cfg(target_arch = "aarch64")]
+    #[doc(hidden)]
+    pub _mcontext_align_pad: [u8; 8],
     pub mcontext: Sigcontext,
+    // On x86/x86_64, sigmask comes AFTER mcontext.
+    #[cfg(not(target_arch = "aarch64"))]
     pub sigmask: SigSet,
 }
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::size_of::<Ucontext>() == 4560);
 
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
