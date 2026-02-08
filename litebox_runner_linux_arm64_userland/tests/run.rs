@@ -452,3 +452,162 @@ console.log(content);
         })
         .run();
 }
+
+#[cfg(target_arch = "aarch64")]
+fn run_python(args: &[&str]) -> String {
+    let output = std::process::Command::new("python3")
+        .args(args)
+        .output()
+        .expect("Failed to run Python");
+    assert!(output.status.success(), "Python script failed");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn has_origin_in_libs(binary_path: &Path) -> bool {
+    let output = std::process::Command::new("readelf")
+        .args(["-d", binary_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run readelf");
+
+    if !output.status.success() {
+        eprintln!("Warning: readelf failed for {}", binary_path.display());
+        return false;
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    for line in output_str.lines() {
+        // Check for $ORIGIN in NEEDED (shared library) entries
+        if line.contains("(NEEDED)") && line.contains("$ORIGIN") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Test running Python3 with rewriter backend
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_runner_with_python() {
+    const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
+    let python_path = run_which("python3");
+
+    if has_origin_in_libs(&python_path) {
+        println!(
+            "Skipping test: Python executable at {} uses $ORIGIN in library paths",
+            python_path.display()
+        );
+        return;
+    }
+
+    let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
+    println!("Detected PYTHONHOME: {python_home}");
+    let python_sys_path = run_python(&["-c", "import sys; print(':'.join(sys.path))"]);
+    println!("Detected PYTHONPATH: {python_sys_path}");
+    Runner::with_backend(&python_path, "python_rewriter", Backend::Rewriter)
+        .args(["-c", HELLO_WORLD_PY])
+        .envs([
+            &format!("PYTHONHOME={}", python_home.trim()),
+            &format!("PYTHONPATH={}", python_sys_path.trim()),
+            // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
+            // Avoid creating .pyc files as tar filesystem is read-only.
+            "PYTHONDONTWRITEBYTECODE=1",
+        ])
+        .with_fs_path(|out_dir| {
+            for each in python_sys_path.split(':') {
+                if each.is_empty() || !each.starts_with("/usr") {
+                    continue;
+                }
+                let python_lib_src = Path::new(each);
+                if python_lib_src.is_dir() {
+                    let python_lib_dst = out_dir.join(&each[1..]); // remove leading '/'
+                    if !python_lib_dst.exists() {
+                        std::fs::create_dir_all(&python_lib_dst).unwrap();
+                        println!(
+                            "Copying python3 lib from {} to {}",
+                            python_lib_src.to_str().unwrap(),
+                            python_lib_dst.to_str().unwrap()
+                        );
+                        let output = std::process::Command::new("cp")
+                            .args([
+                                "-rpL", // -r for recursive, -p to preserve attributes, -L to dereference symbolic links
+                                python_lib_src.to_str().unwrap(),
+                                python_lib_dst.parent().unwrap().to_str().unwrap(),
+                            ])
+                            .output()
+                            .expect("Failed to copy python3 lib");
+                        assert!(
+                            output.status.success(),
+                            "failed to copy python3 lib {:?}",
+                            std::str::from_utf8(output.stderr.as_slice()).unwrap()
+                        );
+                    }
+                    let known_exts = ["py", "pyc", "txt", "css", "ps1", "rst"];
+                    // rewrite all files under the python lib directory except those with known extensions
+                    for entry in walkdir::WalkDir::new(python_lib_src)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .is_some_and(|ext| !known_exts.contains(&ext.to_str().unwrap()))
+                        })
+                    {
+                        let so_file = entry.path();
+                        let so_file_dest = out_dir.join(so_file.strip_prefix("/").unwrap());
+                        println!(
+                            "Rewrite {} to {}",
+                            so_file.display(),
+                            so_file_dest.display()
+                        );
+                        let success =
+                            common::rewrite_with_cache(so_file, &so_file_dest, &["--allow-no-syscalls"]);
+                        if entry.path().extension().is_some_and(|ext| ext == "so") {
+                            assert!(success, "failed to rewrite {} file", so_file.display());
+                        }
+                    }
+                }
+            }
+        })
+        .run();
+}
+
+/// Test network performance with iperf3
+///
+/// To run it with release build and see output, use:
+/// ```
+/// cargo test --package litebox_runner_linux_arm64_userland --test run --release -- test_tun_and_runner_with_iperf3 --exact --nocapture
+/// ```
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_tun_and_runner_with_iperf3() {
+    const NUM_CLIENTS: usize = 1;
+    let iperf3_path = run_which("iperf3");
+    let cloned_path = iperf3_path.clone();
+    let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let has_started_clone = has_started.clone();
+    std::thread::spawn(move || {
+        // Rewrite iperf3 and its dependencies may take some time, wait until it's done.
+        while !has_started_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5)); // wait a bit more to ensure server is ready
+        println!("Starting iperf3 client...");
+        let mut client = std::process::Command::new(&cloned_path)
+            .args(["-c", "10.0.0.2", "-P", NUM_CLIENTS.to_string().as_str()])
+            .spawn()
+            .expect("Failed to start iperf3 client");
+        client.wait().expect("Failed to wait on iperf3 client");
+    });
+    let mut runner =
+        Runner::with_backend(&iperf3_path, "iperf3_server_rewriter", Backend::Rewriter);
+    runner
+        .args([
+            "-s", // run in server mode
+            "-1", // handle one client then exit
+            "-B", "10.0.0.2", // bind to this address
+        ])
+        .tun_device_name("tun99");
+    has_started.store(true, std::sync::atomic::Ordering::Relaxed);
+    runner.run();
+}

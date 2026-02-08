@@ -934,6 +934,8 @@ cargo build -p litebox_runner_linux_arm64_userland
 cargo test -p litebox_runner_linux_arm64_userland test_static_exec_with_rewriter -- --nocapture
 cargo test -p litebox_runner_linux_arm64_userland test_dynamic_lib_with_rewriter -- --nocapture
 cargo test -p litebox_runner_linux_arm64_userland test_node_with_rewriter -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland test_runner_with_python -- --nocapture
+sudo -E env "PATH=$PATH" cargo test -p litebox_runner_linux_arm64_userland test_tun_and_runner_with_iperf3 -- --nocapture
 
 # Run systrap tests
 cargo test -p litebox_runner_linux_arm64_userland test_static_exec_with_systrap -- --nocapture
@@ -996,15 +998,13 @@ coredumpctl debug -1 -A "-batch -ex 'bt' -ex 'info registers'"
 |------|--------|-------|
 | `test_runner_with_ls` | PASS | `ls` runs successfully with rewriter (static, dynamically linked binary) |
 | `test_node_with_rewriter` | PASS | Node.js (12+ shared libraries) runs successfully |
+| `test_runner_with_python` | PASS | Python 3.12.9 `print("Hello, World from litebox!")` — rewrites python3 + stdlib .so files |
+| `test_tun_and_runner_with_iperf3` | PASS | iperf3 server starts inside sandbox via TUN device (requires root for TUN creation) |
 
-### Uncommitted Changes (6 files)
+### Uncommitted Changes (2 files)
 All unstaged:
-- `litebox_common_linux/src/signal/aarch64.rs` — `Sigcontext` padding fix (`_align_pad`, `repr(C, align(16))`)
-- `litebox_common_linux/src/signal/mod.rs` — `Ucontext` field reordering + padding for ARM64
-- `litebox_platform_linux_userland/src/lib.rs` — Bug 26 fix: block interrupt signal during alt-stack teardown
-- `litebox_runner_linux_arm64_userland/tests/run.rs` — `thread_exit` removed from `SKIP_TESTS` (both static and dynamic)
-- `litebox_shim_linux/src/syscalls/signal/aarch64.rs` — Updated `Ucontext`/`Sigcontext` construction
-- `docs/ARM64_REWRITER_DEVELOPMENT.md` — Updated Bug 24/25/26, test results
+- `litebox_runner_linux_arm64_userland/tests/run.rs` — Added `test_runner_with_python` and `test_tun_and_runner_with_iperf3` tests; removed `thread_exit` from `SKIP_TESTS`
+- `docs/ARM64_REWRITER_DEVELOPMENT.md` — Added Python and iperf3 test entries
 
 ### Clippy: Zero warnings across all 6 packages
 
@@ -1021,4 +1021,4 @@ All unstaged:
 
 ---
 
-*Last updated: 2026-02-08 (Session 15)*
+*Last updated: 2026-02-08 (Session 16)*
