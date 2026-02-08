@@ -883,29 +883,34 @@ The shim's `write_signal_frame()` checked `if !action.flags.contains(SaFlags::RE
 
 ---
 
-### Bug 26: thread_exit.c SIGSEGV During Process Teardown (KNOWN ISSUE)
+### Bug 26: thread_exit.c SIGSEGV During Process Teardown (FIXED)
 
-**Symptoms**: The `thread_exit.c` test spawns multiple threads doing `sched_yield()`, spinning with `yield` instruction, and `futex()` wait. One thread calls `exit(0)` after 500ms while other threads are still running. The process crashes with SIGSEGV during teardown.
+**Symptoms**: The `thread_exit.c` test spawns multiple threads doing `sched_yield()`, spinning with `yield` instruction, and `futex()` wait. One thread calls `exit(0)` after 500ms while other threads are still running. The host process crashes with SIGSEGV ~60% of the time (race condition).
 
-**Root Cause (suspected)**: When `exit()` is called, the kernel terminates all threads in the thread group. If a thread is currently executing inside the rewriter trampoline or is mid-syscall when it is killed, the TLS table state may be inconsistent. When the signal handler for SIGSEGV fires on the dying thread, it may not be able to recover host TLS because:
-1. The thread's alt-stack may have been deallocated
-2. The TLS table entry may reference a dead thread's TPIDR_EL0
-3. The `exit_group` syscall path may not properly clean up per-thread state
+**Root Cause**: Race condition in `with_signal_alt_stack` teardown. The defers run in reverse declaration order: `_restore_guard` (restores `sigaltstack` to the old configuration) runs BEFORE `_unmap_guard` (munmaps the alt-stack memory). Between these two operations, if the interrupt signal (used by `exit_group` to kill peer threads) arrives during `_unmap_guard`'s `munmap`, the signal handler runs on the *main* stack (since `sigaltstack` was already restored), but `signal_handler_exit_guest` computes the alt-stack base from SP via bitmask (`SP & !(0x10000 - 1)`), yielding a bogus address. Reading `host_tls` from `bogus_base + 0xFFF8` causes SIGSEGV.
 
-**Status**: KNOWN ISSUE — test is skipped in the test runner. This is a race condition during abnormal process termination, not a bug in normal signal delivery.
+**Crash sequence** (confirmed via coredump):
+1. Guest calls `exit(0)` -> `exit_group` -> shim sends interrupt signal (RT signal 34) to all peer threads
+2. A host thread is in `with_signal_alt_stack` cleanup, specifically in `_unmap_guard`'s `munmap`
+3. `_restore_guard` already ran (restored `sigaltstack`), so the interrupt signal runs on the main stack
+4. `signal_handler_exit_guest` reads `SP`, masks to compute alt-stack base -> bogus address -> SIGSEGV
+5. Exception handler (SIGSEGV) fires recursively, also crashes at the same bogus address read
 
-**File**: `litebox_runner_linux_arm64_userland/tests/run.rs` — `thread_exit` added to `SKIP_TESTS`
+**Fix**: Block the interrupt signal (`sigprocmask(SIG_BLOCK, ...)`) before the teardown defers run in `with_signal_alt_stack`. Explicitly `drop()` the guards while the signal is masked. This prevents the interrupt signal from being delivered during the vulnerable window. The signal will be delivered later (the thread is exiting guest mode anyway).
+
+**Files changed**:
+- `litebox_platform_linux_userland/src/lib.rs` — Added `sigprocmask(SIG_BLOCK)` before explicit `drop(restore_guard); drop(unmap_guard);` in `with_signal_alt_stack`; renamed guards from `_restore_guard`/`_unmap_guard` to `restore_guard`/`unmap_guard` (clippy: used underscore-prefixed binding)
+- `litebox_runner_linux_arm64_userland/tests/run.rs` — Removed `thread_exit` from `SKIP_TESTS` in both static and dynamic test suites
 
 ---
 
 ## Future Work
 
 ### Short-term
-1. **Investigate Bug 26** — `thread_exit.c` SIGSEGV during process teardown (race with TLS cleanup)
-2. Implement `accept` syscall — `unix.c`'s server/client test shows "unsupported syscall accept"
-3. Implement shared futex support — currently warns "unsupported: shared futex"
-4. Implement `faccessat2` (syscall 439) — only `faccessat` (syscall 48) is currently supported
-5. Respect `statx` flags parameter (currently `_flags` is ignored)
+1. Implement `accept` syscall — `unix.c`'s server/client test shows "unsupported syscall accept"
+2. Implement shared futex support — currently warns "unsupported: shared futex"
+3. Implement `faccessat2` (syscall 439) — only `faccessat` (syscall 48) is currently supported
+4. Respect `statx` flags parameter (currently `_flags` is ignored)
 
 ### Medium-term
 1. Fix seccomp backend timing issues
@@ -970,7 +975,7 @@ coredumpctl debug -1 -A "-batch -ex 'bt' -ex 'info registers'"
 | `hello.c` | PASS | Basic hello world, argv/envp |
 | `signal.c` | PASS | SIGSEGV handler fires, modifies uc_mcontext.pc, resumes correctly |
 | `thread.c` | PASS | 50 threads created and joined |
-| `thread_exit.c` | SKIP | SIGSEGV during process teardown (Bug 26, skipped in test runner) |
+| `thread_exit.c` | PASS | 20 threads + exit(0) from non-primary thread; Bug 26 fixed |
 | `unix.c` | PASS | Socketpair works; accept syscall not yet implemented |
 
 ### C Test Results (Dynamic Rewriter)
@@ -982,7 +987,7 @@ coredumpctl debug -1 -A "-batch -ex 'bt' -ex 'info registers'"
 | `hello.c` | PASS | Basic hello world, argv/envp |
 | `signal.c` | PASS | SIGSEGV handler fires, modifies uc_mcontext.pc, resumes correctly |
 | `thread.c` | PASS | 50 threads created and joined |
-| `thread_exit.c` | SKIP | SIGSEGV during process teardown (Bug 26, skipped in test runner) |
+| `thread_exit.c` | PASS | 20 threads + exit(0) from non-primary thread; Bug 26 fixed |
 | `unix.c` | PASS | Socketpair works; accept syscall not yet implemented |
 
 ### Other Tests
@@ -992,11 +997,12 @@ coredumpctl debug -1 -A "-batch -ex 'bt' -ex 'info registers'"
 | `test_runner_with_ls` | PASS | `ls` runs successfully with rewriter (static, dynamically linked binary) |
 | `test_node_with_rewriter` | PASS | Node.js (12+ shared libraries) runs successfully |
 
-### Uncommitted Changes (5 files)
+### Uncommitted Changes (6 files)
 All unstaged:
 - `litebox_common_linux/src/signal/aarch64.rs` — `Sigcontext` padding fix (`_align_pad`, `repr(C, align(16))`)
 - `litebox_common_linux/src/signal/mod.rs` — `Ucontext` field reordering + padding for ARM64
-- `litebox_runner_linux_arm64_userland/tests/run.rs` — `SKIP_TESTS` for `thread_exit`
+- `litebox_platform_linux_userland/src/lib.rs` — Bug 26 fix: block interrupt signal during alt-stack teardown
+- `litebox_runner_linux_arm64_userland/tests/run.rs` — `thread_exit` removed from `SKIP_TESTS` (both static and dynamic)
 - `litebox_shim_linux/src/syscalls/signal/aarch64.rs` — Updated `Ucontext`/`Sigcontext` construction
 - `docs/ARM64_REWRITER_DEVELOPMENT.md` — Updated Bug 24/25/26, test results
 
@@ -1015,4 +1021,4 @@ All unstaged:
 
 ---
 
-*Last updated: 2026-02-07 (Session 14)*
+*Last updated: 2026-02-08 (Session 15)*

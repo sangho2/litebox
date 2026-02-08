@@ -2492,7 +2492,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     }
 
     let stack_base = aligned_base as *mut libc::c_void;
-    let _unmap_guard = litebox::utils::defer(|| {
+    let unmap_guard = litebox::utils::defer(|| {
         // Use raw munmap with backdoor
         let r = unsafe {
             syscalls::raw::syscall3(
@@ -2569,7 +2569,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
             std::io::Error::last_os_error(),
         );
     }
-    let _restore_guard = litebox::utils::defer(|| unsafe {
+    let restore_guard = litebox::utils::defer(|| unsafe {
         let r = libc::sigaltstack(&raw const oss, std::ptr::null_mut());
         assert!(
             r >= 0,
@@ -2577,7 +2577,40 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
             std::io::Error::last_os_error()
         );
     });
-    f()
+    let result = f();
+
+    // Block the interrupt signal before teardown begins.
+    //
+    // The defers run in reverse declaration order: `_restore_guard` (restores
+    // sigaltstack to the old configuration) then `_unmap_guard` (munmaps the
+    // alt-stack memory).  Between these two operations there is a window where
+    // the alt-stack is no longer active but its memory is still mapped.  If the
+    // interrupt signal (used by exit_group to kill peer threads) arrives during
+    // `_unmap_guard`'s munmap, the signal handler runs on the *main* stack
+    // (since sigaltstack was already restored), but
+    // `signal_handler_exit_guest` computes the alt-stack base from SP via
+    // bitmask — yielding a bogus address and causing SIGSEGV.
+    //
+    // By masking the interrupt signal here, we prevent it from being delivered
+    // during the teardown window.  The signal will be delivered later (e.g.
+    // after the thread finishes cleanup), which is fine — the thread is exiting
+    // guest mode anyway.
+    let interrupt_sig = INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed);
+    if interrupt_sig != 0 {
+        unsafe {
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, interrupt_sig);
+            libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+        }
+    }
+
+    // Now the defers (_restore_guard, _unmap_guard) run safely with the
+    // interrupt signal blocked.
+    drop(restore_guard);
+    drop(unmap_guard);
+
+    result
 }
 
 /// Called from signal handlers to fix up thread state after potentially running
