@@ -70,6 +70,25 @@
   - Best results: Debian 72%, Ubuntu 70%, Python 66%
 - [x] Performance optimizations (rayon parallel rewriting, xxhash, mmap tar cache)
 
+### Container / Kubernetes Compatibility
+
+#### Critical (Basic K8s)
+- [ ] OCI lifecycle hooks (`prestart`, `poststart`, `poststop` execution)
+- [ ] Exit code in OCI `state` output (`StatusCode` field for kubelet)
+- [ ] Capabilities (`process.capabilities` from OCI spec — parse and allowlist/warn)
+- [ ] User/UID mapping (`process.user.uid`/`gid` from OCI spec, affects file ownership and `/proc/self/status`)
+
+#### Important (Production)
+- [ ] `/proc` completeness (`/proc/self/cgroup`, `/proc/net/*`, `/proc/sys/*`, `/proc/meminfo` improvements)
+- [ ] Interactive shell / TTY stdin fix (`pselect`/`select` on raw stdin fd doesn't wake — breaks `kubectl exec -it`)
+- [ ] Resource limits reporting (report limits via `/proc/cgroup` and `events --stats` even without cgroup enforcement)
+- [ ] Virtual device nodes (`/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random`)
+- [ ] Annotation-driven config (OCI annotations to toggle features, e.g. `litebox.io/lazy-mode`, `litebox.io/rewrite-shell`)
+
+#### Nice-to-have (Polish)
+- [ ] Symlink support in memfs (currently flattened to regular files)
+- [ ] `emptyDir`-style tmpfs mounts (in-memory writable scratch directories)
+
 ### Long-term
 - [ ] ARM64 support (requires rtld_audit.so port)
 - [ ] Per-container network isolation (multiple TUN devices or veth pairs)
@@ -77,7 +96,6 @@
 - [ ] fork() support (see notes below)
 - [ ] seccomp backend improvements
 - [ ] Audit syscall emulation for security gaps
-- [ ] Support for capabilities
 - [ ] Checkpoint/restore support
 
 ## Known Issues
