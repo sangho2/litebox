@@ -14,7 +14,8 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-extern crate alloc;
+/// Default UID used for non-root file ownership
+const DEFAULT_UID: u16 = 1000;
 
 /// Flag to indicate whether LD_AUDIT should be set for dynamic library interception
 static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
@@ -107,14 +108,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
+    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+    let ancestors: Vec<_> = prog.ancestors().collect();
+
     let (ancestor_modes_and_users, prog_data): (
         Vec<(litebox::fs::Mode, u32)>,
-        alloc::borrow::Cow<'static, [u8]>,
+        std::borrow::Cow<'static, [u8]>,
     ) = {
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
-        let ancestors: Vec<_> = prog.ancestors().collect();
         let modes: Vec<_> = ancestors
-            .into_iter()
+            .iter()
             .rev()
             .skip(1)
             .map(|path| {
@@ -125,7 +127,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 )
             })
             .collect();
-        let data = mmapped_file_data(prog)?;
+        let data = mmapped_file_data(&prog)?;
         let data = if cli_args.rewrite_syscalls {
             let rewritten = litebox_syscall_rewriter_arm64::hook_syscalls_in_elf(data, None)
                 .map_err(|e| anyhow!("Failed to rewrite syscalls: {e}"))?;
@@ -150,11 +152,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let litebox = shim_builder.litebox();
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
-        let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
         for (path, &mode_and_user) in ancestors
-            .into_iter()
+            .iter()
             .skip(1)
             .rev()
             .skip(1)
@@ -164,7 +164,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 in_mem.with_root_privileges(|fs| {
                     fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
                     if mode_and_user.1 != 0 {
-                        fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
+                        fs.chown(path.to_str().unwrap(), Some(DEFAULT_UID), Some(DEFAULT_UID))
                             .unwrap();
                     }
                 });
@@ -195,7 +195,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             in_mem.with_root_privileges(|fs| {
                 open_file(fs, prog.to_str().unwrap(), last.0);
                 if last.1 != 0 {
-                    fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
+                    fs.chown(prog.to_str().unwrap(), Some(DEFAULT_UID), Some(DEFAULT_UID))
                         .unwrap();
                 }
             });
@@ -239,16 +239,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 });
                 REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
             }
-            InterceptionBackend::Seccomp => {
-                // No need to include rtld_audit.so for seccomp backend
-            }
+            InterceptionBackend::Seccomp => {}
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim_builder.default_fs(in_mem, tar_ro)
     };
 
-    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
     let prog_path = prog.to_str().ok_or_else(|| {
         anyhow!(
             "Could not convert program path {:?} to a string",
@@ -325,10 +322,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             // Enable AFTER all host syscalls are done
             platform.enable_seccomp_based_syscall_interception();
         }
-        InterceptionBackend::Rewriter => {
-            // Rewriter backend: syscalls are hooked via binary rewriting
-            // No runtime interception needed - the rewritten binary jumps to our handler
-        }
+        InterceptionBackend::Rewriter => {}
     }
 
     #[cfg(feature = "lock_tracing")]
@@ -377,7 +371,7 @@ fn pin_thread_to_cpu(cpu: usize) {
 
 /// Fixup environment variables before program execution.
 /// Adds LD_AUDIT for rtld_audit when using the rewriter backend.
-fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
+fn fixup_env(envp: &mut Vec<std::ffi::CString>) {
     // Enable the audit library to load trampoline code for rewritten binaries.
     if REQUIRE_RTLD_AUDIT.load(core::sync::atomic::Ordering::SeqCst) {
         let p = c"LD_AUDIT=/lib/litebox_rtld_audit_arm64.so";

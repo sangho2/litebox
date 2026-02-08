@@ -61,12 +61,7 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
 
 pub(crate) type FileFd = litebox::fd::TypedFd<LinuxFS>;
 
-/// Type alias for C character type, which differs between architectures.
-/// ARM64 uses unsigned char (u8), while x86/x86_64 use signed char (i8).
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) type CChar = i8;
-#[cfg(target_arch = "aarch64")]
-pub(crate) type CChar = u8;
+pub(crate) use litebox_common_linux::CChar;
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {

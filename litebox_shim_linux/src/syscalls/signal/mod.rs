@@ -49,9 +49,6 @@ pub(crate) struct SignalState {
     /// Alternate signal stack.
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    last_exception: Cell<litebox::shim::ExceptionInfo>,
-    #[cfg(target_arch = "aarch64")]
     last_exception: Cell<litebox::shim::ExceptionInfo>,
 }
 

@@ -560,14 +560,9 @@ impl Task {
 
 /// A descriptor for thread-local storage (TLS).
 ///
-/// On `x86_64`, this is represented as a `*mut u8`. The TLS pointer can point to
-/// an arbitrary-sized memory region.
-#[cfg(target_arch = "x86_64")]
-type ThreadLocalDescriptor = MutPtr<u8>;
-
-/// On `aarch64`, this is represented as a `*mut u8`. The TLS pointer can point to
-/// an arbitrary-sized memory region (similar to x86_64).
-#[cfg(target_arch = "aarch64")]
+/// On `x86_64` and `aarch64`, this is represented as a `*mut u8`.
+/// The TLS pointer can point to an arbitrary-sized memory region.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 type ThreadLocalDescriptor = MutPtr<u8>;
 
 /// A descriptor for thread-local storage (TLS).
@@ -695,9 +690,7 @@ impl Task {
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.truncate();
-            #[cfg(target_arch = "x86_64")]
-            let desc = MutPtr::from_usize(addr);
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             let desc = MutPtr::from_usize(addr);
             #[cfg(target_arch = "x86")]
             let desc = {

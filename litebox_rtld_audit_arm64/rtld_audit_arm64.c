@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// ARM64 version of the rtld_audit library for dynamic library interception.
-// This library is loaded via LD_AUDIT and intercepts shared library loading
-// to patch trampolines in rewritten binaries.
+// ARM64 rtld_audit library for dynamic library interception.
+// Loaded via LD_AUDIT to intercept shared library loading and patch
+// trampolines in rewritten binaries.
 
 #define _GNU_SOURCE
 #include <assert.h>
@@ -19,7 +19,6 @@
 # error "rtld_audit_arm64.c: build target must be aarch64"
 #endif
 
-// Linux syscall numbers (arm64)
 #define SYS_openat 56
 #define SYS_close 57
 #define SYS_read 63
@@ -31,7 +30,6 @@
 #define SYS_munmap 215
 #define AT_FDCWD -100
 
-// Linux flags
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
 
@@ -41,9 +39,8 @@
 
 typedef long (*syscall_stub_t)(void);
 static syscall_stub_t syscall_entry = 0;
-// Address of the trampoline data section where the host TLS table pointer is stored at offset 16
 static void *trampoline_data = 0;
-static char interp[256] = {0}; // Buffer for interpreter path
+static char interp[256] = {0};
 
 #ifdef DEBUG
 #define syscall_print(str, len)                                                \
@@ -52,9 +49,7 @@ static char interp[256] = {0}; // Buffer for interpreter path
 #define syscall_print(str, len)
 #endif
 
-// Direct syscall without going through trampoline - for early debug output
-// before syscall_entry is set
-__attribute__((unused))
+#ifdef DEBUG
 static long direct_syscall(long num, long a0, long a1, long a2, long a3, long a4,
                            long a5) {
   register long x8 __asm__("x8") = num;
@@ -73,42 +68,56 @@ static long direct_syscall(long num, long a0, long a1, long a2, long a3, long a4
   return x0;
 }
 
-// Early debug print that works before syscall_entry is set
-// This uses direct syscalls which will be intercepted by the shim
-#ifdef DEBUG
 #define early_print(str, len) direct_syscall(SYS_write, 1, (long)(str), len, 0, 0, 0)
 #else
 #define early_print(str, len)
 #endif
 
-static void early_print_hex(uint64_t data) {
-#ifdef DEBUG
-  for (int i = 15; i >= 0; i--) {
-    unsigned char byte = (data >> (i * 4)) & 0xF;
-    if (byte < 10) {
-      early_print((&"0123456789"[byte]), 1);
-    } else {
-      early_print((&"abcdef"[byte - 10]), 1);
-    }
+// Print a uint64_t value as hex digits using the given output macro
+#define DEFINE_PRINT_HEX(name, print_fn)                      \
+  static void name(uint64_t data) {                           \
+    for (int i = 15; i >= 0; i--) {                           \
+      unsigned char nibble = (data >> (i * 4)) & 0xF;         \
+      if (nibble < 10) {                                      \
+        print_fn((&"0123456789"[nibble]), 1);                 \
+      } else {                                                \
+        print_fn((&"abcdef"[nibble - 10]), 1);                \
+      }                                                       \
+    }                                                         \
+    print_fn("\n", 1);                                        \
   }
-  early_print("\n", 1);
-#endif
-}
 
-// ARM64 syscall: arguments in x0-x5, syscall number in x8, return in x0
-// The syscall_callback expects:
-// - x18 = host TLS (looked up from the per-thread host TLS table)
-// - Stack frame set up like the trampoline does:
-//   [SP+0]: saved x16, [SP+8]: saved x17, [SP+16]: saved x30
-// - x30 (LR) = return address after syscall
+#ifdef DEBUG
+DEFINE_PRINT_HEX(early_print_hex, early_print)
+#else
+static inline void early_print_hex(uint64_t data __attribute__((unused))) {}
+#endif
+
+#ifdef DEBUG
+// Forward declaration needed for print_hex (uses do_syscall via syscall_print)
+static long do_syscall(long num, long a0, long a1, long a2, long a3, long a4,
+                       long a5);
+DEFINE_PRINT_HEX(print_hex, syscall_print)
+#else
+static inline void print_hex(uint64_t data __attribute__((unused))) {}
+#endif
+
+// Print a label followed by a hex value (debug only)
+#define DEBUG_EARLY_VAL(label, val) \
+  do { early_print(label, sizeof(label) - 1); early_print_hex(val); } while (0)
+#define DEBUG_PRINT_VAL(label, val) \
+  do { syscall_print(label, sizeof(label) - 1); print_hex(val); } while (0)
+
+// ARM64 syscall convention: args in x0-x5, number in x8, return in x0.
+// The syscall_callback expects x18 = host TLS and a trampoline-style
+// stack frame: [SP+0]: x16, [SP+8]: x17, [SP+16]: x30 (return addr).
 static long do_syscall(long num, long a0, long a1, long a2, long a3, long a4,
                        long a5) {
   if (!syscall_entry || !trampoline_data)
     return -1;
 
-  // trampoline_data+16 now contains a pointer to the per-thread host TLS table.
-  // Each table entry is 16 bytes: [guest_tpidr (8 bytes), host_tls (8 bytes)].
-  // Scan the table for an entry matching our current TPIDR_EL0 to find host_tls.
+  // Look up host TLS from the per-thread table at trampoline_data+16.
+  // Each entry is 16 bytes: [guest_tpidr (8), host_tls (8)].
   uint64_t table_ptr;
   __builtin_memcpy(&table_ptr, (char *)trampoline_data + 16, sizeof(table_ptr));
 
@@ -117,13 +126,10 @@ static long do_syscall(long num, long a0, long a1, long a2, long a3, long a4,
 
   uint64_t host_tls = 0;
   uint64_t *table = (uint64_t *)table_ptr;
-  // Table has up to 256 entries, sentinel 0xFFFFFFFFFFFFFFFF marks empty slots
   for (int i = 0; i < 256; i++) {
     uint64_t entry_tpidr = table[i * 2];
-    if (entry_tpidr == 0xFFFFFFFFFFFFFFFFULL) {
-      // Hit sentinel - entry not found, use 0 (will likely crash but shouldn't happen)
+    if (entry_tpidr == 0xFFFFFFFFFFFFFFFFULL)
       break;
-    }
     if (entry_tpidr == guest_tpidr) {
       host_tls = table[i * 2 + 1];
       break;
@@ -139,27 +145,16 @@ static long do_syscall(long num, long a0, long a1, long a2, long a3, long a4,
   register long x5 __asm__("x5") = a5;
   register uint64_t x18 __asm__("x18") = host_tls;
 
-  // Set up the stack frame like the trampoline does:
-  // [SP+0]: x16, [SP+8]: x17, [SP+16]: x30 (return address)
-  // Then call syscall_callback. After it processes the syscall,
-  // it will call switch_to_guest which:
-  // 1. Restores SP to the original guest SP (current SP + 32)
-  // 2. Jumps to the saved return address
-  // So we DON'T need to restore SP manually - switch_to_guest does it.
+  // Set up the stack frame like the trampoline does, then call
+  // syscall_callback. switch_to_guest restores SP and jumps back.
   __asm__ volatile(
-      // Set up stack frame like trampoline
       "sub sp, sp, #32\n"
       "str x16, [sp, #0]\n"
       "str x17, [sp, #8]\n"
-      // Save return address at [SP+16]
-      "adr x16, 1f\n"           // x16 = address of label 1 (return point)
-      "str x16, [sp, #16]\n"    // Save return address at [SP+16]
-      "blr %[entry]\n"          // Call syscall_callback
-      // switch_to_guest will jump back here after processing the syscall.
-      // At this point, SP has already been restored to original_sp by switch_to_guest.
-      // All registers have been restored from ctx (x0 contains syscall return value).
+      "adr x16, 1f\n"
+      "str x16, [sp, #16]\n"
+      "blr %[entry]\n"
       "1:\n"
-      // No stack cleanup needed - switch_to_guest already restored SP
       : "+r"(x0)
       : [entry] "r"(syscall_entry), "r"(x8), "r"(x1), "r"(x2), "r"(x3),
         "r"(x4), "r"(x5), "r"(x18)
@@ -167,9 +162,8 @@ static long do_syscall(long num, long a0, long a1, long a2, long a3, long a4,
   return x0;
 }
 
-/* Re-implement some utility functions to avoid dependency on libc. */
+/* Minimal libc replacements (no libc dependency). */
 
-// Define the FileStat structure for ARM64
 struct FileStat {
   unsigned long st_dev;
   unsigned long st_ino;
@@ -236,23 +230,28 @@ static size_t align_up(size_t val, size_t align) {
   return (val + align - 1) & ~(align - 1);
 }
 
-unsigned int la_version(unsigned int version __attribute__((unused))) {
-  return LAV_CURRENT;
+static int is_elf(const void *base) {
+  return memcmp(((const Elf64_Ehdr *)base)->e_ident, "\x7f" "ELF", 4) == 0;
 }
 
-/// print value in hex
-void print_hex(uint64_t data) {
-#ifdef DEBUG
-  for (int i = 15; i >= 0; i--) {
-    unsigned char byte = (data >> (i * 4)) & 0xF;
-    if (byte < 10) {
-      syscall_print((&"0123456789"[byte]), 1);
-    } else {
-      syscall_print((&"abcdef"[byte - 10]), 1);
+// Extract PT_INTERP path from an ELF loaded at `base` into the global
+// `interp` buffer. Returns 1 if found, 0 otherwise.
+static int extract_interp(Elf64_Addr base) {
+  Elf64_Ehdr *eh = (Elf64_Ehdr *)base;
+  Elf64_Phdr *phdrs = (Elf64_Phdr *)((char *)base + eh->e_phoff);
+  for (int i = 0; i < eh->e_phnum; i++) {
+    if (phdrs[i].p_type == PT_INTERP) {
+      strncpy(interp, (char *)base + phdrs[i].p_vaddr,
+              sizeof(interp) - 1);
+      interp[sizeof(interp) - 1] = '\0';
+      return 1;
     }
   }
-  syscall_print("\n", 1);
-#endif
+  return 0;
+}
+
+unsigned int la_version(unsigned int version __attribute__((unused))) {
+  return LAV_CURRENT;
 }
 
 /// @brief Parse object to find the syscall entry point and the interpreter
@@ -270,21 +269,16 @@ void print_hex(uint64_t data) {
 /// where max_vaddr is the end of the last PT_LOAD segment.
 /// This 4MB offset matches the rewriter's find_addr_for_trampoline_code().
 int parse_object(const struct link_map *map) {
-  early_print("[audit-arm64] parse_object l_addr=", 34);
-  early_print_hex((uint64_t)map->l_addr);
+  DEBUG_EARLY_VAL( "[audit-arm64] parse_object l_addr=", (uint64_t)map->l_addr);
   
   unsigned long max_addr = 0;
   Elf64_Ehdr *eh = (Elf64_Ehdr *)map->l_addr;
-  if (memcmp(eh->e_ident,
-             "\x7f"
-             "ELF",
-             4) != 0) {
+  if (!is_elf((void *)map->l_addr)) {
     early_print("[audit-arm64] not an ELF file\n", 30);
     return 1;
   }
   
-  early_print("[audit-arm64] valid ELF, e_phnum=", 33);
-  early_print_hex(eh->e_phnum);
+  DEBUG_EARLY_VAL( "[audit-arm64] valid ELF, e_phnum=", eh->e_phnum);
   
   Elf64_Phdr *phdrs = (Elf64_Phdr *)((char *)map->l_addr + eh->e_phoff);
   for (int i = 0; i < eh->e_phnum; i++) {
@@ -293,43 +287,31 @@ int parse_object(const struct link_map *map) {
       if (vaddr_end > max_addr) {
         max_addr = vaddr_end;
       }
-    } else if (phdrs[i].p_type == PT_INTERP) {
-      strncpy(interp, (char *)map->l_addr + phdrs[i].p_vaddr,
-              sizeof(interp) - 1);
-      interp[sizeof(interp) - 1] = '\0';
     }
   }
+  extract_interp(map->l_addr);
   
-  // Calculate trampoline vaddr using the same formula as the rewriter:
   // trampoline_vaddr = page_align_up(max_vaddr) + 0x400000 (4MB offset)
   max_addr = align_up(max_addr, 0x1000);
   uint64_t trampoline_vaddr = max_addr + 0x400000;
   void *data_section_addr = (void *)(map->l_addr + trampoline_vaddr);
   
-  early_print("[audit-arm64] max_addr=", 23);
-  early_print_hex(max_addr);
-  early_print("[audit-arm64] trampoline_vaddr=", 31);
-  early_print_hex(trampoline_vaddr);
-  early_print("[audit-arm64] data_section_addr=", 32);
-  early_print_hex((uint64_t)data_section_addr);
+  DEBUG_EARLY_VAL( "[audit-arm64] max_addr=", max_addr);
+  DEBUG_EARLY_VAL( "[audit-arm64] trampoline_vaddr=", trampoline_vaddr);
+  DEBUG_EARLY_VAL( "[audit-arm64] data_section_addr=", (uint64_t)data_section_addr);
   
   uint64_t magic = read_u64(data_section_addr);
-  early_print("[audit-arm64] read magic=", 25);
-  early_print_hex(magic);
+  DEBUG_EARLY_VAL( "[audit-arm64] read magic=", magic);
   
   if (magic != TRAMP_MAGIC) {
     early_print("[audit-arm64] invalid trampoline magic!\n", 40);
-    early_print("[audit-arm64] expected=", 23);
-    early_print_hex(TRAMP_MAGIC);
+    DEBUG_EARLY_VAL( "[audit-arm64] expected=", TRAMP_MAGIC);
     return 1;
   }
   
-  // Handler address is at offset 8 in the data section
   syscall_entry = (syscall_stub_t)read_u64(data_section_addr + 8);
-  // Store trampoline data address for do_syscall to load host TLS from offset 16
   trampoline_data = data_section_addr;
-  early_print("[audit-arm64] got syscall entry: ", 33);
-  early_print_hex((uint64_t)syscall_entry);
+  DEBUG_EARLY_VAL( "[audit-arm64] got syscall entry: ", (uint64_t)syscall_entry);
   return 0;
 }
 
@@ -340,45 +322,32 @@ unsigned int la_objopen(struct link_map *map,
   const char *path = map->l_name;
 
   if (!path || path[0] == '\0') {
-    early_print("[audit-arm64] main binary, l_addr=", 34);
-    early_print_hex((uint64_t)map->l_addr);
-    // main binary should be called first.
+    DEBUG_EARLY_VAL( "[audit-arm64] main binary, l_addr=", (uint64_t)map->l_addr);
     // For dynamically linked binaries, the main binary typically has no
     // syscalls (all syscalls are in libc). We'll get syscall_entry from
-    // ld-linux.so instead. Trying to parse the main binary would crash
-    // because the trampoline memory isn't mapped.
+    // ld-linux.so instead.
     //
     // TODO: If we need to support main binaries with syscalls, we would need
     // to check if the .trampolineLB0 section exists first, which requires
     // reading the file from disk.
     if (map->l_addr != 0) {
-      // Extract interpreter path from PT_INTERP for later comparison
-      Elf64_Ehdr *eh = (Elf64_Ehdr *)map->l_addr;
-      if (memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0) {
-        Elf64_Phdr *phdrs = (Elf64_Phdr *)((char *)map->l_addr + eh->e_phoff);
-        for (int i = 0; i < eh->e_phnum; i++) {
-          if (phdrs[i].p_type == PT_INTERP) {
-            strncpy(interp, (char *)map->l_addr + phdrs[i].p_vaddr,
-                    sizeof(interp) - 1);
-            interp[sizeof(interp) - 1] = '\0';
-            early_print("[audit-arm64] interp=", 21);
-            for (int j = 0; j < 60 && interp[j]; j++) {
-              early_print(&interp[j], 1);
-            }
-            early_print("\n", 1);
-            break;
+      if (is_elf((void *)map->l_addr)) {
+        if (extract_interp(map->l_addr)) {
+          early_print("[audit-arm64] interp=", 21);
+          for (int j = 0; j < 60 && interp[j]; j++) {
+            early_print(&interp[j], 1);
           }
+          early_print("\n", 1);
         }
       }
       early_print("[audit-arm64] skipping main binary (no trampoline check)\n", 57);
     } else {
       early_print("[audit-arm64] main binary l_addr=0 (non-PIE)\n", 45);
     }
-    return 0; // main binary handled
+    return 0;
   }
 
   early_print("[audit-arm64] lib path: ", 24);
-  // Print first 60 chars of path
   for (int i = 0; i < 60 && path[i]; i++) {
     early_print(&path[i], 1);
   }
@@ -386,28 +355,23 @@ unsigned int la_objopen(struct link_map *map,
 
   if (syscall_entry == 0) {
     early_print("[audit-arm64] syscall_entry=0, trying ld.so\n", 44);
-    // failed to get the syscall entry point from the main binary
-    // fall back to get it from ld-*.so, which should be called next.
     if (parse_object(map) != 0) {
       early_print("[audit-arm64] ld.so also has no trampoline!\n", 44);
       return 0;
     }
     early_print("[audit-arm64] got syscall entry from ld.so\n", 43);
-    return 0; // ld.so is patched by libOS
+    return 0;
   }
 
   if (interp[0] != '\0' && strcmp(path, interp) == 0) {
-    // successfully get the entry point and interpreter from the main binary
     syscall_print("[audit-arm64] ld-*.so is patched by libOS\n", 42);
-    return 0; // ld.so is patched by libOS
+    return 0;
   }
 
-  // Other shared libraries
   syscall_print("[audit-arm64] la_objopen: path=", 31);
   syscall_print(path, 32);
   syscall_print("\n", 1);
-  syscall_print("[audit-arm64] lib l_addr=", 25);
-  print_hex(map->l_addr);
+  DEBUG_PRINT_VAL( "[audit-arm64] lib l_addr=", map->l_addr);
 
   if (!syscall_entry) {
     return 0;
@@ -436,10 +400,7 @@ unsigned int la_objopen(struct link_map *map,
   }
 
   Elf64_Ehdr *eh = (Elf64_Ehdr *)map_base;
-  if (memcmp(eh->e_ident,
-             "\x7f"
-             "ELF",
-             4) != 0) {
+  if (!is_elf(map_base)) {
     syscall_print("[audit-arm64] not an ELF file\n", 30);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
@@ -455,30 +416,23 @@ unsigned int la_objopen(struct link_map *map,
       continue;
 
     syscall_print("[audit-arm64] found trampoline section\n", 39);
-    // Note sh_addr, sh_offset, and sh_entsize are repurposed to store our trampoline info.
+    // sh_addr, sh_offset, and sh_entsize are repurposed for trampoline info.
     // See litebox_syscall_rewriter_arm64 for details.
     if (shdrs[i].sh_addr != HEADER_MAGIC) {
       syscall_print("[audit-arm64] invalid header magic\n", 35);
       break;
     }
 
-    // sh_offset contains the virtual address where data section should be mapped
-    // sh_entsize contains the total size (data section + code section)
     uint64_t data_section_vaddr = map->l_addr + shdrs[i].sh_offset;
     uint64_t total_size = shdrs[i].sh_entsize;
     uint64_t tramp_file_offset = file_size - total_size;
     
-    syscall_print("[audit-arm64] libc tramp vaddr=", 31);
-    print_hex(data_section_vaddr);
-    syscall_print("[audit-arm64] libc tramp size=", 30);
-    print_hex(total_size);
+    DEBUG_PRINT_VAL( "[audit-arm64] libc tramp vaddr=", data_section_vaddr);
+    DEBUG_PRINT_VAL( "[audit-arm64] libc tramp size=", total_size);
     
-    // Map the trampoline section as RW first (for writing header data),
-    // then mprotect to RWX. We use a two-step approach because the sandbox's
-    // mmap handler doesn't support RWX directly, but mprotect does.
-    // The header (first 24 bytes) needs to stay writable for the host TLS pointer
-    // at offset 16 (written at runtime by switch_to_guest), and code entries
-    // start at offset 0x18 within the same page.
+    // Map RW first, then mprotect to RWX. The sandbox's mmap handler
+    // doesn't support RWX directly, but mprotect does. The header at
+    // offset 16 must stay writable for the host TLS pointer.
     uint64_t total_size_aligned = align_up(total_size, 0x1000);
 
     void *data_mapped =
@@ -495,31 +449,24 @@ unsigned int la_objopen(struct link_map *map,
       break;
     }
 
-    // Validate magic
     if (read_u64(data_mapped) != TRAMP_MAGIC) {
       syscall_print("[audit-arm64] invalid trampoline magic in data\n", 47);
       break;
     }
 
-    // Write the syscall entry point to offset 8 in data section
     __builtin_memcpy((char *)data_mapped + 8, (const void *)&syscall_entry, 8);
     syscall_print("[audit-arm64] patched handler address\n", 38);
 
-    // Copy the host TLS table pointer from ld-linux's trampoline to this library's trampoline.
-    // The table pointer is stored at offset 16 in the trampoline data section.
-    // All shared libraries' trampolines need the same table pointer so their
-    // trampoline code can look up the host TLS for the current thread.
+    // Copy the host TLS table pointer from ld-linux's trampoline so this
+    // library's trampoline code can look up host TLS for the current thread.
     if (trampoline_data != 0) {
       uint64_t table_ptr;
       __builtin_memcpy(&table_ptr, (char *)trampoline_data + 16, sizeof(table_ptr));
-      syscall_print("[audit-arm64] table_ptr value=", 30);
-      print_hex(table_ptr);
+      DEBUG_PRINT_VAL( "[audit-arm64] table_ptr value=", table_ptr);
       __builtin_memcpy((char *)data_mapped + 16, (const void *)&table_ptr, 8);
       syscall_print("[audit-arm64] copied table pointer\n", 35);
     }
 
-    // Now mprotect the entire trampoline to RWX so code is executable
-    // and the table pointer at offset 16 remains writable at runtime.
     long mprotect_ret = do_syscall(SYS_mprotect, data_section_vaddr, total_size_aligned,
                                    PROT_READ | PROT_WRITE | PROT_EXEC, 0, 0, 0);
     if (mprotect_ret != 0) {
@@ -531,10 +478,7 @@ unsigned int la_objopen(struct link_map *map,
     break;
   }
 
-  syscall_print("[audit-arm64] closing fd\n", 25);
   do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
-  syscall_print("[audit-arm64] unmapping\n", 24);
   do_syscall(SYS_munmap, (long)map_base, file_size, 0, 0, 0, 0);
-  syscall_print("[audit-arm64] returning\n", 24);
   return 0;
 }

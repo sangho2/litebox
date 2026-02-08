@@ -320,31 +320,31 @@ pub struct FileStat {
 #[repr(C)]
 #[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
-    pub st_dev: u64,   // 0-7
-    pub st_ino: u64,   // 8-15
-    pub st_mode: u32,  // 16-19 (note: before st_nlink on ARM64)
-    pub st_nlink: u32, // 20-23 (u32, not u64 like x86_64)
-    pub st_uid: u32,   // 24-27
-    pub st_gid: u32,   // 28-31
-    pub st_rdev: u64,  // 32-39
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
     #[expect(clippy::pub_underscore_fields)]
-    pub __pad1: u64, // 40-47
-    pub st_size: i64,  // 48-55
-    pub st_blksize: i32, // 56-59 (i32, not usize)
+    pub __pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
     #[expect(clippy::pub_underscore_fields)]
-    pub __pad2: i32, // 60-63
-    pub st_blocks: i64, // 64-71
-    pub st_atime: i64, // 72-79
-    pub st_atime_nsec: u64, // 80-87
-    pub st_mtime: i64, // 88-95
-    pub st_mtime_nsec: u64, // 96-103
-    pub st_ctime: i64, // 104-111
-    pub st_ctime_nsec: u64, // 112-119
+    pub __pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: u64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: u64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: u64,
     #[expect(clippy::pub_underscore_fields)]
-    pub __unused4: u32, // 120-123
+    pub __unused4: u32,
     #[expect(clippy::pub_underscore_fields)]
-    pub __unused5: u32, // 124-127
-} // Total: 128 bytes
+    pub __unused5: u32,
+}
 
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86")]
@@ -2534,16 +2534,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
             #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
-            #[cfg(target_arch = "x86_64")]
-            Sysno::mmap => sys_req!(Mmap {
-                addr,
-                length,
-                prot,
-                flags,
-                fd,
-                offset,
-            }),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Sysno::mmap => sys_req!(Mmap {
                 addr,
                 length,
@@ -3015,11 +3006,6 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
             Sysno::statx => sys_req!(Statx { dirfd, pathname:*, flags, mask, buf:* }),
             // Noisy unsupported syscalls.
-            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-            Sysno::io_uring_setup | Sysno::rseq => {
-                return Err(errno::Errno::ENOSYS);
-            }
-            #[cfg(target_arch = "aarch64")]
             Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }

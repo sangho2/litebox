@@ -32,30 +32,13 @@ struct Runner {
     has_run: bool,
 }
 
-/// Get the output directory for test artifacts
-fn get_out_dir() -> PathBuf {
-    std::env::var_os("OUT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            // Fallback to target/debug/test-artifacts when OUT_DIR is not set
-            let manifest_dir =
-                std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-            let target_dir = PathBuf::from(manifest_dir)
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("target/debug/test-artifacts");
-            std::fs::create_dir_all(&target_dir).ok();
-            target_dir
-        })
-}
-
 impl Runner {
     fn new(target: &Path, unique_name: &str) -> Self {
         Self::with_backend(target, unique_name, Backend::Seccomp)
     }
 
     fn with_backend(target: &Path, unique_name: &str, backend: Backend) -> Self {
-        let dir_path = get_out_dir();
+        let dir_path = common::get_out_dir();
 
         // For rewriter backend, rewrite the executable
         let path = match backend {
@@ -284,17 +267,11 @@ fn test_static_exec_with_systrap() {
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn test_static_exec_with_rewriter() {
-    const SKIP_TESTS: &[&str] = &[];
-
     for path in find_c_test_files("./tests") {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .expect("failed to get file stem");
-        if SKIP_TESTS.contains(&stem) {
-            println!("Skipping known-failing test: {stem}");
-            continue;
-        }
         let unique_name = format!("{stem}_exec_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
         Runner::with_backend(&target, &unique_name, Backend::Rewriter).run();
@@ -317,7 +294,6 @@ fn test_dynamic_lib_with_systrap() {
     }
 }
 
-/// Test TCP socket with TUN device
 /// Test TCP socket with TUN device
 /// Note: This test requires root/CAP_NET_ADMIN privileges to create TUN devices
 #[test]
@@ -358,17 +334,11 @@ fn test_tun_with_tcp_socket() {
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn test_dynamic_lib_with_rewriter() {
-    const SKIP_TESTS: &[&str] = &[];
-
     for path in find_c_test_files("./tests") {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .expect("failed to get file stem");
-        if SKIP_TESTS.contains(&stem) {
-            println!("Skipping known-failing test: {stem}");
-            continue;
-        }
         let unique_name = format!("{stem}_dynamic_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
         Runner::with_backend(&target, &unique_name, Backend::Rewriter).run();

@@ -5,7 +5,6 @@ use glob::glob;
 use std::path::{Path, PathBuf};
 
 /// Find all dependencies of a given binary via `ldd`
-#[allow(dead_code, reason = "may not be used in all test configurations")]
 pub fn find_dependencies(prog: &str) -> Vec<String> {
     let output = std::process::Command::new("ldd")
         .arg(prog)
@@ -122,7 +121,7 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
 }
 
 /// Create tar file with caching
-#[allow(dead_code, reason = "may not be used in all test configurations")]
+#[allow(dead_code)]
 pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name: &str) -> bool {
     // For tar files, we need to consider the entire directory tree as input
     // We'll create a hash of all files in the tar_dir
@@ -193,7 +192,7 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
         eprintln!("Warning: Failed to create cache entry for {unique_name}: {e}");
     }
 
-    success
+    true
 }
 
 /// Find all Rust source files in the litebox_syscall_rewriter_arm64 crate
