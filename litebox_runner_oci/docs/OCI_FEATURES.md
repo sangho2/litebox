@@ -39,8 +39,8 @@ These flags extend OCI functionality for the `run` and `exec` commands:
 | `args` | ✅ Supported | Command and arguments |
 | `env` | ✅ Supported | Environment variables |
 | `cwd` | ✅ Supported | Working directory via `chdir()` syscall |
-| `user.uid` | ⚠️ Ignored | Runs as invoking user |
-| `user.gid` | ⚠️ Ignored | Runs as invoking user |
+| `user.uid` | ✅ Supported | Sets container process UID via OCI spec |
+| `user.gid` | ✅ Supported | Sets container process GID via OCI spec |
 | `capabilities` | ✅ Supported | Parsed from OCI spec and reported via `capget` syscall |
 | `rlimits` | ⚠️ Partial | NOFILE and STACK tracked; others return unlimited |
 | `noNewPrivileges` | ⚠️ Ignored | Always no new privileges |

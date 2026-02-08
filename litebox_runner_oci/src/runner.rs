@@ -2147,8 +2147,17 @@ fn run_container_internal(
     tracing::info!(path = %prog_path, "loading program into LiteBox sandbox");
 
     let platform = litebox_platform_multiplex::platform();
+    let mut task_params = platform.init_task();
+
+    // Override uid/gid from OCI spec's process.user
+    let user = process.user();
+    task_params.uid = user.uid();
+    task_params.euid = user.uid();
+    task_params.gid = user.gid();
+    task_params.egid = user.gid();
+
     let program = shim
-        .load_program(platform.init_task(), &prog_path, argv_cstrings, envp)
+        .load_program(task_params, &prog_path, argv_cstrings, envp)
         .with_context(|| {
             format!(
                 "failed to load program '{prog_path}'. \

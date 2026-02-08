@@ -76,7 +76,7 @@
 - [x] OCI lifecycle hooks (`prestart`, `createRuntime`, `createContainer`, `startContainer`, `poststart`, `poststop`)
 - [x] Exit code in OCI `state` output (`exitCode` field for kubelet)
 - [x] Capabilities (`process.capabilities` from OCI spec — parsed and reported via `capget`)
-- [ ] User/UID mapping (`process.user.uid`/`gid` from OCI spec, affects file ownership and `/proc/self/status`)
+- [x] User/UID mapping (`process.user.uid`/`gid` from OCI spec, sets container process credentials)
 
 #### Important (Production)
 - [ ] `/proc` completeness (`/proc/self/cgroup`, `/proc/net/*`, `/proc/sys/*`, `/proc/meminfo` improvements)
