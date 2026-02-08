@@ -55,7 +55,7 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
 }
 
 /// Get the output directory for test artifacts
-fn get_out_dir() -> PathBuf {
+pub fn get_out_dir() -> PathBuf {
     std::env::var("OUT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
