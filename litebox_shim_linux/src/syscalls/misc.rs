@@ -118,13 +118,17 @@ impl Task {
         data: Option<crate::MutPtr<litebox_common_linux::CapData>>,
     ) -> Result<(), Errno> {
         let hdr = header.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let caps = &self.global.capabilities;
         match hdr.version {
             _LINUX_CAPABILITY_VERSION_1 => {
                 if let Some(data_ptr) = data {
                     let cap = litebox_common_linux::CapData {
-                        effective: 0,
-                        permitted: 0,
-                        inheritable: 0,
+                        #[allow(clippy::cast_possible_truncation)]
+                        effective: caps.effective as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        permitted: caps.permitted as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        inheritable: caps.inheritable as u32,
                     };
                     data_ptr.write_at_offset(0, cap).ok_or(Errno::EFAULT)?;
                 }
@@ -132,15 +136,29 @@ impl Task {
             }
             _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
                 if let Some(data_ptr) = data {
-                    let cap = litebox_common_linux::CapData {
-                        effective: 0,
-                        permitted: 0,
-                        inheritable: 0,
+                    // V2/V3 uses two CapData structs: low 32 bits, then high 32 bits
+                    let cap_low = litebox_common_linux::CapData {
+                        #[allow(clippy::cast_possible_truncation)]
+                        effective: caps.effective as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        permitted: caps.permitted as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        inheritable: caps.inheritable as u32,
+                    };
+                    let cap_high = litebox_common_linux::CapData {
+                        #[allow(clippy::cast_possible_truncation)]
+                        effective: (caps.effective >> 32) as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        permitted: (caps.permitted >> 32) as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        inheritable: (caps.inheritable >> 32) as u32,
                     };
                     data_ptr
-                        .write_at_offset(0, cap.clone())
+                        .write_at_offset(0, cap_low)
                         .ok_or(Errno::EFAULT)?;
-                    data_ptr.write_at_offset(1, cap).ok_or(Errno::EFAULT)?;
+                    data_ptr
+                        .write_at_offset(1, cap_high)
+                        .ok_or(Errno::EFAULT)?;
                 }
                 Ok(())
             }

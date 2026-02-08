@@ -75,7 +75,7 @@
 #### Critical (Basic K8s)
 - [x] OCI lifecycle hooks (`prestart`, `createRuntime`, `createContainer`, `startContainer`, `poststart`, `poststop`)
 - [x] Exit code in OCI `state` output (`exitCode` field for kubelet)
-- [ ] Capabilities (`process.capabilities` from OCI spec — parse and allowlist/warn)
+- [x] Capabilities (`process.capabilities` from OCI spec — parsed and reported via `capget`)
 - [ ] User/UID mapping (`process.user.uid`/`gid` from OCI spec, affects file ownership and `/proc/self/status`)
 
 #### Important (Production)

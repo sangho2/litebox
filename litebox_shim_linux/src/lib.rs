@@ -128,6 +128,25 @@ pub struct LinuxShimBuilder {
     fs: Option<LinuxFS>,
     load_filter: Option<LoadFilter>,
     net_config: Option<litebox::net::NetworkInterfaceConfig>,
+    capabilities: CapabilitySet,
+}
+
+/// Linux capability bitmasks for the container process.
+///
+/// Each field is a 64-bit bitmask where bit N corresponds to Linux capability N
+/// (e.g., bit 0 = `CAP_CHOWN`, bit 12 = `CAP_NET_ADMIN`).
+#[derive(Clone, Debug, Default)]
+pub struct CapabilitySet {
+    /// Bounding set — upper limit on capabilities the process can gain.
+    pub bounding: u64,
+    /// Effective — capabilities currently in effect.
+    pub effective: u64,
+    /// Inheritable — preserved across execve.
+    pub inheritable: u64,
+    /// Permitted — limiting superset for effective capabilities.
+    pub permitted: u64,
+    /// Ambient — kept across execve even for non-root.
+    pub ambient: u64,
 }
 
 impl Default for LinuxShimBuilder {
@@ -146,6 +165,7 @@ impl LinuxShimBuilder {
             fs: None,
             load_filter: None,
             net_config: None,
+            capabilities: CapabilitySet::default(),
         }
     }
 
@@ -195,6 +215,12 @@ impl LinuxShimBuilder {
         self.net_config = Some(config);
     }
 
+    /// Set Linux capabilities for the container process.
+    /// These are reported via `capget` syscall.
+    pub fn set_capabilities(&mut self, caps: CapabilitySet) {
+        self.capabilities = caps;
+    }
+
     /// Build the shim.
     ///
     /// # Panics
@@ -218,6 +244,7 @@ impl LinuxShimBuilder {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
+            capabilities: self.capabilities,
         });
         LinuxShim(global)
     }
@@ -1265,6 +1292,8 @@ struct GlobalState {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable>,
+    /// Linux capabilities for the container process
+    capabilities: CapabilitySet,
 }
 
 struct Task {

@@ -41,7 +41,7 @@ These flags extend OCI functionality for the `run` and `exec` commands:
 | `cwd` | ✅ Supported | Working directory via `chdir()` syscall |
 | `user.uid` | ⚠️ Ignored | Runs as invoking user |
 | `user.gid` | ⚠️ Ignored | Runs as invoking user |
-| `capabilities` | ❌ Not supported | No capability management |
+| `capabilities` | ✅ Supported | Parsed from OCI spec and reported via `capget` syscall |
 | `rlimits` | ⚠️ Partial | NOFILE and STACK tracked; others return unlimited |
 | `noNewPrivileges` | ⚠️ Ignored | Always no new privileges |
 | `terminal` | ✅ Supported | PTY via console-socket |

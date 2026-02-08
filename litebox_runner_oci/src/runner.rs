@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
 use oci_spec::runtime::Spec;
+use oci_spec::runtime::{Capability, LinuxCapabilities, Process};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
@@ -2030,6 +2031,10 @@ fn run_container_internal(
     shim_builder.set_fs(initial_fs);
     shim_builder.set_load_filter(fixup_env);
 
+    // Parse OCI capabilities from spec and configure the shim
+    let caps = parse_oci_capabilities(process);
+    shim_builder.set_capabilities(caps);
+
     let shim = shim_builder.build();
 
     // Using rewriter backend - no seccomp setup needed
@@ -2300,6 +2305,96 @@ fn redirect_stdin(path: &Path) -> Result<StdinGuard> {
     }
 
     Ok(StdinGuard { original_fd })
+}
+
+/// Convert an OCI `Capability` enum variant to its Linux capability bit number.
+///
+/// Bit numbers correspond to the `CAP_*` constants from
+/// `include/uapi/linux/capability.h` in the Linux kernel.
+fn capability_to_bit(cap: Capability) -> u8 {
+    match cap {
+        Capability::Chown => 0,
+        Capability::DacOverride => 1,
+        Capability::DacReadSearch => 2,
+        Capability::Fowner => 3,
+        Capability::Fsetid => 4,
+        Capability::Kill => 5,
+        Capability::Setgid => 6,
+        Capability::Setuid => 7,
+        Capability::Setpcap => 8,
+        Capability::LinuxImmutable => 9,
+        Capability::NetBindService => 10,
+        Capability::NetBroadcast => 11,
+        Capability::NetAdmin => 12,
+        Capability::NetRaw => 13,
+        Capability::IpcLock => 14,
+        Capability::IpcOwner => 15,
+        Capability::SysModule => 16,
+        Capability::SysRawio => 17,
+        Capability::SysChroot => 18,
+        Capability::SysPtrace => 19,
+        Capability::SysPacct => 20,
+        Capability::SysAdmin => 21,
+        Capability::SysBoot => 22,
+        Capability::SysNice => 23,
+        Capability::SysResource => 24,
+        Capability::SysTime => 25,
+        Capability::SysTtyConfig => 26,
+        Capability::Mknod => 27,
+        Capability::Lease => 28,
+        Capability::AuditWrite => 29,
+        Capability::AuditControl => 30,
+        Capability::Setfcap => 31,
+        Capability::MacOverride => 32,
+        Capability::MacAdmin => 33,
+        Capability::Syslog => 34,
+        Capability::WakeAlarm => 35,
+        Capability::BlockSuspend => 36,
+        Capability::AuditRead => 37,
+        Capability::Perfmon => 38,
+        Capability::Bpf => 39,
+        Capability::CheckpointRestore => 40,
+    }
+}
+
+/// Convert a set of OCI capabilities to a 64-bit bitmask.
+fn capabilities_to_bitmask(caps: &oci_spec::runtime::Capabilities) -> u64 {
+    caps.iter().fold(0u64, |mask, cap| mask | (1u64 << capability_to_bit(*cap)))
+}
+
+/// Parse OCI `process.capabilities` into a [`litebox_shim_linux::CapabilitySet`].
+///
+/// If `process.capabilities` is absent, returns the OCI default capabilities
+/// (`CAP_AUDIT_WRITE`, `CAP_KILL`, `CAP_NET_BIND_SERVICE`).
+fn parse_oci_capabilities(process: &Process) -> litebox_shim_linux::CapabilitySet {
+    let defaults = LinuxCapabilities::default();
+    let linux_caps = process
+        .capabilities()
+        .as_ref()
+        .unwrap_or(&defaults);
+
+    litebox_shim_linux::CapabilitySet {
+        bounding: linux_caps
+            .bounding()
+            .as_ref()
+            .map_or(0, capabilities_to_bitmask),
+        effective: linux_caps
+            .effective()
+            .as_ref()
+            .map_or(0, capabilities_to_bitmask),
+        inheritable: linux_caps
+            .inheritable()
+            .as_ref()
+            .map_or(0, capabilities_to_bitmask),
+        permitted: linux_caps
+            .permitted()
+            .as_ref()
+            .map_or(0, capabilities_to_bitmask),
+        ambient: linux_caps
+            .ambient()
+            .as_ref()
+            .map_or(0, capabilities_to_bitmask),
+    }
 }
 
 #[cfg(test)]
@@ -2623,5 +2718,62 @@ mod tests {
     fn test_split_pipeline_with_redirects() {
         let stages = split_pipeline("cat /etc/os-release | grep -i name").unwrap();
         assert_eq!(stages, vec!["cat /etc/os-release", "grep -i name"]);
+    }
+
+    #[test]
+    fn test_capability_to_bit() {
+        assert_eq!(capability_to_bit(Capability::Chown), 0);
+        assert_eq!(capability_to_bit(Capability::Kill), 5);
+        assert_eq!(capability_to_bit(Capability::NetBindService), 10);
+        assert_eq!(capability_to_bit(Capability::NetAdmin), 12);
+        assert_eq!(capability_to_bit(Capability::SysAdmin), 21);
+        assert_eq!(capability_to_bit(Capability::AuditWrite), 29);
+        assert_eq!(capability_to_bit(Capability::Setfcap), 31);
+        assert_eq!(capability_to_bit(Capability::MacOverride), 32);
+        assert_eq!(capability_to_bit(Capability::CheckpointRestore), 40);
+    }
+
+    #[test]
+    fn test_capabilities_to_bitmask() {
+        use std::collections::HashSet;
+        let caps: HashSet<Capability> =
+            [Capability::Chown, Capability::Kill, Capability::NetBindService]
+                .into_iter()
+                .collect();
+        let mask = capabilities_to_bitmask(&caps);
+        assert_eq!(mask, (1 << 0) | (1 << 5) | (1 << 10));
+    }
+
+    #[test]
+    fn test_capabilities_to_bitmask_empty() {
+        let caps = std::collections::HashSet::new();
+        assert_eq!(capabilities_to_bitmask(&caps), 0);
+    }
+
+    #[test]
+    fn test_capabilities_to_bitmask_high_bits() {
+        use std::collections::HashSet;
+        let caps: HashSet<Capability> = [Capability::MacOverride, Capability::Bpf]
+            .into_iter()
+            .collect();
+        let mask = capabilities_to_bitmask(&caps);
+        assert_eq!(mask, (1u64 << 32) | (1u64 << 39));
+    }
+
+    #[test]
+    fn test_parse_oci_capabilities_defaults() {
+        use oci_spec::runtime::ProcessBuilder;
+        let process = ProcessBuilder::default()
+            .args(vec!["sh".to_string()])
+            .build()
+            .unwrap();
+        let caps = parse_oci_capabilities(&process);
+        // OCI default: CAP_AUDIT_WRITE(29), CAP_KILL(5), CAP_NET_BIND_SERVICE(10)
+        let expected = (1u64 << 29) | (1u64 << 5) | (1u64 << 10);
+        assert_eq!(caps.effective, expected);
+        assert_eq!(caps.permitted, expected);
+        assert_eq!(caps.bounding, expected);
+        assert_eq!(caps.inheritable, expected);
+        assert_eq!(caps.ambient, expected);
     }
 }
