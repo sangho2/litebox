@@ -143,6 +143,32 @@ impl Task {
         }
     }
 
+    /// Read from a proc file's content buffer.
+    ///
+    /// Returns the number of bytes read. Updates position atomically if offset is None.
+    fn read_proc_content(
+        content: &[u8],
+        position: &core::sync::atomic::AtomicUsize,
+        offset: Option<usize>,
+        buf: &mut [u8],
+    ) -> usize {
+        let read_pos = offset.unwrap_or_else(|| position.load(Ordering::Relaxed));
+
+        if read_pos >= content.len() {
+            return 0; // EOF
+        }
+
+        let remaining = content.len() - read_pos;
+        let to_read = buf.len().min(remaining);
+        buf[..to_read].copy_from_slice(&content[read_pos..read_pos + to_read]);
+
+        if offset.is_none() {
+            position.store(read_pos + to_read, Ordering::Relaxed);
+        }
+
+        to_read
+    }
+
     /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
         let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
@@ -409,28 +435,7 @@ impl Task {
             ),
             Descriptor::Proc {
                 content, position, ..
-            } => {
-                // Read from the virtual proc file content
-                let read_pos = if let Some(off) = offset {
-                    off
-                } else {
-                    position.load(Ordering::Relaxed)
-                };
-
-                if read_pos >= content.len() {
-                    return Ok(0); // EOF
-                }
-
-                let remaining = content.len() - read_pos;
-                let to_read = buf.len().min(remaining);
-                buf[..to_read].copy_from_slice(&content[read_pos..read_pos + to_read]);
-
-                if offset.is_none() {
-                    position.store(read_pos + to_read, Ordering::Relaxed);
-                }
-
-                Ok(to_read)
-            }
+            } => Ok(Self::read_proc_content(content, position, offset, buf))
         }
     }
 
@@ -679,20 +684,7 @@ impl Task {
                 Descriptor::Unix { .. } => todo!(),
                 Descriptor::Proc {
                     content, position, ..
-                } => {
-                    // Read from proc file
-                    let read_pos = position.load(Ordering::Relaxed);
-                    if read_pos >= content.len() {
-                        0 // EOF
-                    } else {
-                        let remaining = content.len() - read_pos;
-                        let to_read = kernel_buffer.len().min(remaining);
-                        kernel_buffer[..to_read]
-                            .copy_from_slice(&content[read_pos..read_pos + to_read]);
-                        position.store(read_pos + to_read, Ordering::Relaxed);
-                        to_read
-                    }
-                }
+                } => Self::read_proc_content(content, position, None, &mut kernel_buffer)
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -1235,45 +1227,21 @@ impl Task {
         // Use a fixed reasonable timestamp (2024-01-01 00:00:00 UTC)
         const DEFAULT_TIMESTAMP: i64 = 1704067200;
 
-        let mut filled_mask = 0u32;
-
-        // Only set mask bits for fields we actually fill
-        if mask & StatxMask::TYPE.bits() != 0 {
-            filled_mask |= StatxMask::TYPE.bits();
-        }
-        if mask & StatxMask::MODE.bits() != 0 {
-            filled_mask |= StatxMask::MODE.bits();
-        }
-        if mask & StatxMask::NLINK.bits() != 0 {
-            filled_mask |= StatxMask::NLINK.bits();
-        }
-        if mask & StatxMask::UID.bits() != 0 {
-            filled_mask |= StatxMask::UID.bits();
-        }
-        if mask & StatxMask::GID.bits() != 0 {
-            filled_mask |= StatxMask::GID.bits();
-        }
-        if mask & StatxMask::INO.bits() != 0 {
-            filled_mask |= StatxMask::INO.bits();
-        }
-        if mask & StatxMask::SIZE.bits() != 0 {
-            filled_mask |= StatxMask::SIZE.bits();
-        }
-        if mask & StatxMask::BLOCKS.bits() != 0 {
-            filled_mask |= StatxMask::BLOCKS.bits();
-        }
-        if mask & StatxMask::ATIME.bits() != 0 {
-            filled_mask |= StatxMask::ATIME.bits();
-        }
-        if mask & StatxMask::MTIME.bits() != 0 {
-            filled_mask |= StatxMask::MTIME.bits();
-        }
-        if mask & StatxMask::CTIME.bits() != 0 {
-            filled_mask |= StatxMask::CTIME.bits();
-        }
-        if mask & StatxMask::BTIME.bits() != 0 {
-            filled_mask |= StatxMask::BTIME.bits();
-        }
+        // We provide all requested fields - the mask bits requested are the ones we fill
+        let filled_mask = mask
+            & (StatxMask::TYPE
+                | StatxMask::MODE
+                | StatxMask::NLINK
+                | StatxMask::UID
+                | StatxMask::GID
+                | StatxMask::INO
+                | StatxMask::SIZE
+                | StatxMask::BLOCKS
+                | StatxMask::ATIME
+                | StatxMask::MTIME
+                | StatxMask::CTIME
+                | StatxMask::BTIME)
+                .bits();
 
         let timestamp = StatxTimestamp {
             tv_sec: DEFAULT_TIMESTAMP,

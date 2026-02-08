@@ -108,6 +108,30 @@ const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
 const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
+/// Convert 64-bit capability values to 32-bit CapData (taking low 32 bits).
+#[allow(clippy::cast_possible_truncation)]
+fn cap_data_low(effective: u64, permitted: u64, inheritable: u64) -> litebox_common_linux::CapData {
+    litebox_common_linux::CapData {
+        effective: effective as u32,
+        permitted: permitted as u32,
+        inheritable: inheritable as u32,
+    }
+}
+
+/// Convert 64-bit capability values to 32-bit CapData (taking high 32 bits).
+#[allow(clippy::cast_possible_truncation)]
+fn cap_data_high(
+    effective: u64,
+    permitted: u64,
+    inheritable: u64,
+) -> litebox_common_linux::CapData {
+    litebox_common_linux::CapData {
+        effective: (effective >> 32) as u32,
+        permitted: (permitted >> 32) as u32,
+        inheritable: (inheritable >> 32) as u32,
+    }
+}
+
 impl Task {
     /// Handle syscall `capget`.
     ///
@@ -122,14 +146,7 @@ impl Task {
         match hdr.version {
             _LINUX_CAPABILITY_VERSION_1 => {
                 if let Some(data_ptr) = data {
-                    let cap = litebox_common_linux::CapData {
-                        #[allow(clippy::cast_possible_truncation)]
-                        effective: caps.effective as u32,
-                        #[allow(clippy::cast_possible_truncation)]
-                        permitted: caps.permitted as u32,
-                        #[allow(clippy::cast_possible_truncation)]
-                        inheritable: caps.inheritable as u32,
-                    };
+                    let cap = cap_data_low(caps.effective, caps.permitted, caps.inheritable);
                     data_ptr.write_at_offset(0, cap).ok_or(Errno::EFAULT)?;
                 }
                 Ok(())
@@ -137,22 +154,9 @@ impl Task {
             _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
                 if let Some(data_ptr) = data {
                     // V2/V3 uses two CapData structs: low 32 bits, then high 32 bits
-                    let cap_low = litebox_common_linux::CapData {
-                        #[allow(clippy::cast_possible_truncation)]
-                        effective: caps.effective as u32,
-                        #[allow(clippy::cast_possible_truncation)]
-                        permitted: caps.permitted as u32,
-                        #[allow(clippy::cast_possible_truncation)]
-                        inheritable: caps.inheritable as u32,
-                    };
-                    let cap_high = litebox_common_linux::CapData {
-                        #[allow(clippy::cast_possible_truncation)]
-                        effective: (caps.effective >> 32) as u32,
-                        #[allow(clippy::cast_possible_truncation)]
-                        permitted: (caps.permitted >> 32) as u32,
-                        #[allow(clippy::cast_possible_truncation)]
-                        inheritable: (caps.inheritable >> 32) as u32,
-                    };
+                    let cap_low = cap_data_low(caps.effective, caps.permitted, caps.inheritable);
+                    let cap_high =
+                        cap_data_high(caps.effective, caps.permitted, caps.inheritable);
                     data_ptr
                         .write_at_offset(0, cap_low)
                         .ok_or(Errno::EFAULT)?;

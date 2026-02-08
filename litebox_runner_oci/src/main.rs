@@ -628,44 +628,24 @@ fn main() -> Result<()> {
             let mounts = parse_mounts(&mount)?;
             let rewrite_shell = !no_rewrite_shell;
 
-            let exit_code = if lazy_rewrite {
-                litebox_runner_oci::run_container_lazy_rewrite(
+            let exit_code = {
+                let lazy_mode = if lazy_rewrite {
+                    litebox_runner_oci::LazyMode::LazyRewrite
+                } else if lazy_tar {
+                    litebox_runner_oci::LazyMode::TarLayered
+                } else if lazy {
+                    litebox_runner_oci::LazyMode::Squashfs
+                } else {
+                    litebox_runner_oci::LazyMode::Eager
+                };
+                litebox_runner_oci::run_container(
                     &bundle,
                     None,
                     &extra_env,
                     &mounts,
                     &stdio,
                     &network,
-                    rewrite_shell,
-                )?
-            } else if lazy_tar {
-                litebox_runner_oci::run_container_lazy_tar(
-                    &bundle,
-                    None,
-                    &extra_env,
-                    &mounts,
-                    &stdio,
-                    &network,
-                    rewrite_shell,
-                )?
-            } else if lazy {
-                litebox_runner_oci::run_container_lazy(
-                    &bundle,
-                    None,
-                    &extra_env,
-                    &mounts,
-                    &stdio,
-                    &network,
-                    rewrite_shell,
-                )?
-            } else {
-                litebox_runner_oci::run_container_full(
-                    &bundle,
-                    None,
-                    &extra_env,
-                    &mounts,
-                    &stdio,
-                    &network,
+                    lazy_mode,
                     rewrite_shell,
                 )?
             };
@@ -713,13 +693,14 @@ fn main() -> Result<()> {
             let extra_env = parse_extra_env(&env, env_file.as_ref())?;
             let mounts = parse_mounts(&mount)?;
             // Run with overridden command, extra env, mounts, and networking
-            let exit_code = litebox_runner_oci::run_container_full(
+            let exit_code = litebox_runner_oci::run_container(
                 &bundle,
                 Some(&command),
                 &extra_env,
                 &mounts,
                 &litebox_runner_oci::StdioRedirect::default(),
                 &network,
+                litebox_runner_oci::LazyMode::Eager,
                 !no_rewrite_shell,
             )?;
             std::process::exit(exit_code);

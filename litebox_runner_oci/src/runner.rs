@@ -306,9 +306,9 @@ fn split_pipeline(script: &str) -> Option<Vec<String>> {
     if stages.len() > 1 { Some(stages) } else { None }
 }
 
-/// Cache directory for rewritten binaries (used in eager mode)
-fn cache_dir() -> PathBuf {
-    // Use XDG cache dir or fallback to ~/.cache
+/// Get litebox-oci cache directory with the given subdirectory.
+/// Uses XDG_CACHE_HOME if set, otherwise falls back to ~/.cache.
+fn litebox_cache_dir(subdir: &str) -> PathBuf {
     std::env::var("XDG_CACHE_HOME")
         .map_or_else(
             |_| {
@@ -320,7 +320,12 @@ fn cache_dir() -> PathBuf {
             PathBuf::from,
         )
         .join("litebox-oci")
-        .join("rewritten")
+        .join(subdir)
+}
+
+/// Cache directory for rewritten binaries (used in eager mode)
+fn cache_dir() -> PathBuf {
+    litebox_cache_dir("rewritten")
 }
 
 /// Compute a hash of file contents for cache key using xxhash (10x faster than DefaultHasher)
@@ -406,18 +411,7 @@ fn rewrite_with_cache(data: &[u8]) -> Vec<u8> {
 
 /// Squashfs cache directory for lazy loading
 fn squashfs_cache_dir() -> PathBuf {
-    std::env::var("XDG_CACHE_HOME")
-        .map_or_else(
-            |_| {
-                std::env::var("HOME").map_or_else(
-                    |_| PathBuf::from("/tmp"),
-                    |h| PathBuf::from(h).join(".cache"),
-                )
-            },
-            PathBuf::from,
-        )
-        .join("litebox-oci")
-        .join("squashfs")
+    litebox_cache_dir("squashfs")
 }
 
 /// Create a squashfs image from the rootfs directory.
@@ -523,18 +517,7 @@ impl Drop for SquashfsMount {
 
 /// Tar cache directory for true lazy loading
 fn tar_cache_dir() -> PathBuf {
-    std::env::var("XDG_CACHE_HOME")
-        .map_or_else(
-            |_| {
-                std::env::var("HOME").map_or_else(
-                    |_| PathBuf::from("/tmp"),
-                    |h| PathBuf::from(h).join(".cache"),
-                )
-            },
-            PathBuf::from,
-        )
-        .join("litebox-oci")
-        .join("tar")
+    litebox_cache_dir("tar")
 }
 
 /// Tar data that can be either owned or memory-mapped for zero-copy access.
@@ -919,225 +902,17 @@ fn setup_cni_tun(cni: &CniNetworkConfig) -> Result<String> {
     Ok(tun_name.to_string())
 }
 
-///
-/// This function:
-/// 1. Loads all files from the OCI rootfs into LiteBox's in-memory filesystem
-/// 2. Rewrites syscalls in executables for interception
-/// 3. Sets up the environment from the OCI spec
-/// 4. Runs the process through LiteBox's syscall emulation
-///
-/// # Panics
-///
-/// This function may panic if:
-/// - Path conversion to string fails for non-UTF8 paths
-/// - File creation in the sandbox fails
-pub fn run_container(bundle_path: &Path) -> Result<i32> {
-    run_container_internal(
-        bundle_path,
-        None,
-        &[],
-        &[],
-        &StdioRedirect::default(),
-        &NetworkConfig::default(),
-        LazyMode::Eager,
-        true,
-    )
-}
-
-/// Run a container with additional environment variables and mounts.
-pub fn run_container_with_options(
-    bundle_path: &Path,
-    extra_env: &[String],
-    mounts: &[Mount],
-) -> Result<i32> {
-    run_container_internal(
-        bundle_path,
-        None,
-        extra_env,
-        mounts,
-        &StdioRedirect::default(),
-        &NetworkConfig::default(),
-        LazyMode::Eager,
-        true,
-    )
-}
-
-/// Run a command in a container's rootfs with all options.
-pub fn run_container_with_all_options(
-    bundle_path: &Path,
-    args: &[String],
-    extra_env: &[String],
-    mounts: &[Mount],
-) -> Result<i32> {
-    if args.is_empty() {
-        anyhow::bail!("exec command cannot be empty");
-    }
-    run_container_internal(
-        bundle_path,
-        Some(args),
-        extra_env,
-        mounts,
-        &StdioRedirect::default(),
-        &NetworkConfig::default(),
-        LazyMode::Eager,
-        true,
-    )
-}
-
-/// Run a container with full control over all options including stdio redirection and networking.
-pub fn run_container_full(
-    bundle_path: &Path,
-    override_args: Option<&[String]>,
-    extra_env: &[String],
-    mounts: &[Mount],
-    stdio: &StdioRedirect,
-    network: &NetworkConfig,
-    rewrite_shell: bool,
-) -> Result<i32> {
-    if let Some(args) = override_args
-        && args.is_empty()
-    {
-        anyhow::bail!("exec command cannot be empty");
-    }
-    run_container_internal(
-        bundle_path,
-        override_args,
-        extra_env,
-        mounts,
-        stdio,
-        network,
-        LazyMode::Eager,
-        rewrite_shell,
-    )
-}
-
-/// Run a container with lazy file loading using squashfs + loop mount.
-///
-/// This mode:
-/// 1. Creates a squashfs image from the rootfs (cached for reuse)
-/// 2. Mounts it via loop device
-/// 3. Reads files on-demand instead of copying everything to memory
-/// 4. Rewrites executables lazily when they are first executed
-///
-/// Benefits:
-/// - Much faster container startup for large images
-/// - Lower memory usage (only accessed files are loaded)
-/// - Kernel handles caching and demand paging
-///
-/// Requirements:
-/// - `mksquashfs` command available
-/// - Root/sudo access for loop mount (or user namespaces)
-pub fn run_container_lazy(
-    bundle_path: &Path,
-    override_args: Option<&[String]>,
-    extra_env: &[String],
-    mounts: &[Mount],
-    stdio: &StdioRedirect,
-    network: &NetworkConfig,
-    rewrite_shell: bool,
-) -> Result<i32> {
-    if let Some(args) = override_args
-        && args.is_empty()
-    {
-        anyhow::bail!("exec command cannot be empty");
-    }
-    run_container_internal(
-        bundle_path,
-        override_args,
-        extra_env,
-        mounts,
-        stdio,
-        network,
-        LazyMode::Squashfs,
-        rewrite_shell,
-    )
-}
-
-/// Run a container with true lazy file loading using tar + layered filesystem.
-///
-/// This mode:
-/// 1. Creates a tar archive from the rootfs (cached for reuse)
-/// 2. Uses tar_ro::FileSystem as read-only lower layer
-/// 3. Uses in_mem::FileSystem as writable upper layer
-/// 4. Combines them with layered::FileSystem for copy-on-write
-/// 5. Only loads file metadata upfront - content is read on-demand
-///
-/// Benefits:
-/// - Much faster startup (no upfront file copying)
-/// - Lower memory usage (only accessed files are loaded)
-/// - Copy-on-write semantics for modifications
-///
-/// Note: Executable rewriting still happens for files that are accessed.
-pub fn run_container_lazy_tar(
-    bundle_path: &Path,
-    override_args: Option<&[String]>,
-    extra_env: &[String],
-    mounts: &[Mount],
-    stdio: &StdioRedirect,
-    network: &NetworkConfig,
-    rewrite_shell: bool,
-) -> Result<i32> {
-    if let Some(args) = override_args
-        && args.is_empty()
-    {
-        anyhow::bail!("exec command cannot be empty");
-    }
-    run_container_internal(
-        bundle_path,
-        override_args,
-        extra_env,
-        mounts,
-        stdio,
-        network,
-        LazyMode::TarLayered,
-        rewrite_shell,
-    )
-}
-
-/// Run an OCI container with lazy executable rewriting.
-///
-/// This mode combines the benefits of lazy loading with on-demand executable rewriting:
-/// - Only critical executables (dynamic linker, main binary) are rewritten upfront
-/// - Other executables are lazily rewritten when first accessed
-/// - Significantly faster startup for images with many executables
-///
-/// This is the fastest option for most workloads.
-pub fn run_container_lazy_rewrite(
-    bundle_path: &Path,
-    override_args: Option<&[String]>,
-    extra_env: &[String],
-    mounts: &[Mount],
-    stdio: &StdioRedirect,
-    network: &NetworkConfig,
-    rewrite_shell: bool,
-) -> Result<i32> {
-    if let Some(args) = override_args
-        && args.is_empty()
-    {
-        anyhow::bail!("exec command cannot be empty");
-    }
-    run_container_internal(
-        bundle_path,
-        override_args,
-        extra_env,
-        mounts,
-        stdio,
-        network,
-        LazyMode::LazyRewrite,
-        rewrite_shell,
-    )
-}
-
-/// Lazy loading mode
+/// Loading mode for the container filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LazyMode {
-    /// Eager loading - copy all files upfront
+pub enum LazyMode {
+    /// Eager loading — copy all files upfront.
     Eager,
-    /// Squashfs + loop mount (still walks all files)
+    /// Squashfs + loop mount (requires `mksquashfs` and root/sudo).
     Squashfs,
-    /// True lazy loading with tar + layered filesystem
+    /// Tar + layered filesystem with on-demand content loading.
     TarLayered,
-    /// Lazy rewriting - only critical executables eagerly, rest lazily transformed
+    /// Lazy rewriting — only critical executables eagerly, rest lazily transformed.
+    /// This is the fastest option for most workloads.
     LazyRewrite,
 }
 
@@ -1291,9 +1066,17 @@ fn run_pipeline(
     Ok(last_exit_code)
 }
 
-/// Internal implementation that handles both regular run and exec.
+/// Run an OCI container with the specified loading mode and options.
+///
+/// # Errors
+/// Returns an error if the bundle is invalid, the program cannot be loaded,
+/// or execution fails.
+///
+/// # Panics
+/// Panics if in-memory filesystem operations (mkdir, create, close) fail during
+/// sandbox setup, which indicates an internal bug rather than a user error.
 #[allow(clippy::too_many_arguments)]
-fn run_container_internal(
+pub fn run_container(
     bundle_path: &Path,
     override_args: Option<&[String]>,
     extra_env: &[String],
@@ -1319,6 +1102,13 @@ fn run_container_internal(
     } else {
         None
     };
+
+    // Validate override args if provided
+    if let Some(args) = override_args
+        && args.is_empty()
+    {
+        anyhow::bail!("exec command cannot be empty");
+    }
 
     let spec_path = bundle_path.join("config.json");
     let spec: Spec = {
