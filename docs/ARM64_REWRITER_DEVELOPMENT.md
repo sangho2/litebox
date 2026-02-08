@@ -85,6 +85,21 @@ Add ARM64 (aarch64) support to LiteBox using a syscall rewriter backend that:
 - Fixed `Sigcontext` and `Ucontext` struct layout mismatches vs kernel ABI (Bug 25, see below)
 - Signal delivery and `sys_rt_sigreturn` now work correctly — `signal.c` test passes
 
+### Phase 8: Loader Tests (Completed)
+- Migrated `loader.rs` tests from x86 to ARM64 (`litebox_runner_linux_arm64_userland/tests/loader.rs`)
+- Three tests exercising the platform/shim API directly (not through the runner CLI):
+  - `test_load_exec_dynamic` — Compiles hello.c dynamically, rewrites binary + all deps, installs rtld_audit .so, loads via platform API with `LD_AUDIT` and `LD_LIBRARY_PATH` env vars
+  - `test_load_exec_static` — Compiles hello.c statically, rewrites it, loads via platform API
+  - `test_syscall_rewriter` — Inline-asm nolibc C code (aarch64 SVC #0 for write=64/exit_group=94), compiles statically with `-nostdlib`, rewrites, loads via platform API
+- All tests use the syscall rewriter (SVC instructions require rewriting to be intercepted on ARM64)
+- Dynamic test installs `litebox_rtld_audit_arm64.so` via `include_bytes!` and passes `LD_AUDIT`/`LD_LIBRARY_PATH` env vars
+- Implemented fork-based process isolation (`run_in_fork()`) to solve ENOMEM when running all 3 tests together:
+  - `Platform::new()` uses `Box::leak` and `set_platform()` can only be called once per process
+  - Each test runs in a forked child with its own fresh `Platform`
+  - Compilation/rewriting happens in the parent (before fork) so build artifacts are shared on disk
+  - Parent waits for child and asserts successful exit
+- Made `get_out_dir()` public in `tests/common/mod.rs` for shared use across test files
+
 ---
 
 ## Technical Architecture
@@ -937,6 +952,12 @@ cargo test -p litebox_runner_linux_arm64_userland test_node_with_rewriter -- --n
 cargo test -p litebox_runner_linux_arm64_userland test_runner_with_python -- --nocapture
 sudo -E env "PATH=$PATH" cargo test -p litebox_runner_linux_arm64_userland test_tun_and_runner_with_iperf3 -- --nocapture
 
+# Run loader tests (platform/shim API)
+cargo test -p litebox_runner_linux_arm64_userland --test loader -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland --test loader test_load_exec_dynamic -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland --test loader test_load_exec_static -- --nocapture
+cargo test -p litebox_runner_linux_arm64_userland --test loader test_syscall_rewriter -- --nocapture
+
 # Run systrap tests
 cargo test -p litebox_runner_linux_arm64_userland test_static_exec_with_systrap -- --nocapture
 cargo test -p litebox_runner_linux_arm64_userland test_dynamic_lib_with_systrap -- --nocapture
@@ -1001,14 +1022,17 @@ coredumpctl debug -1 -A "-batch -ex 'bt' -ex 'info registers'"
 | `test_runner_with_python` | PASS | Python 3.12.9 `print("Hello, World from litebox!")` — rewrites python3 + stdlib .so files |
 | `test_tun_and_runner_with_iperf3` | PASS | iperf3 server starts inside sandbox via TUN device (requires root for TUN creation) |
 
-### Uncommitted Changes (2 files)
-All unstaged:
-- `litebox_runner_linux_arm64_userland/tests/run.rs` — Added `test_runner_with_python` and `test_tun_and_runner_with_iperf3` tests; removed `thread_exit` from `SKIP_TESTS`
-- `docs/ARM64_REWRITER_DEVELOPMENT.md` — Added Python and iperf3 test entries
+### Loader Tests (Platform/Shim API)
+
+| Test | Status | Notes |
+|------|--------|-------|
+| `test_load_exec_dynamic` | PASS | Dynamically linked hello.c, rewritten with all deps + rtld_audit .so |
+| `test_load_exec_static` | PASS | Statically linked hello.c, rewritten |
+| `test_syscall_rewriter` | PASS | Inline-asm nolibc binary with raw SVC #0 instructions |
+
+All 3 loader tests pass individually and together (both `--test-threads=1` and parallel) via fork-based isolation.
 
 ### Clippy: Zero warnings across all 6 packages
-
-### Git: 8 commits ahead of origin/main (not pushed), plus uncommitted changes above
 
 ---
 
@@ -1021,4 +1045,4 @@ All unstaged:
 
 ---
 
-*Last updated: 2026-02-08 (Session 16)*
+*Last updated: 2026-02-08 (Session 18)*
