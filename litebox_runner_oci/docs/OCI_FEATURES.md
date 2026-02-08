@@ -80,12 +80,16 @@ and hostname configuration in containers launched by Podman or containerd.
 
 | Field | Status | Notes |
 |-------|--------|-------|
-| `prestart` | ❌ Not supported | |
-| `createRuntime` | ❌ Not supported | |
-| `createContainer` | ❌ Not supported | |
-| `startContainer` | ❌ Not supported | |
-| `poststart` | ❌ Not supported | |
-| `poststop` | ❌ Not supported | |
+| `prestart` | ✅ Supported | Deprecated; runs before start signal. Receives state JSON on stdin |
+| `createRuntime` | ✅ Supported | Runs after create, before start (runtime namespace) |
+| `createContainer` | ✅ Supported | Runs after create (same as createRuntime — no separate container ns) |
+| `startContainer` | ✅ Supported | Runs before start signal (same context as prestart) |
+| `poststart` | ✅ Supported | Runs after container started. Best-effort (errors logged, not fatal) |
+| `poststop` | ✅ Supported | Runs during delete, after container stopped. Best-effort |
+
+All hooks receive the OCI container state as JSON on stdin. Hooks are executed sequentially;
+if a hook fails (non-zero exit), subsequent hooks in the same phase are skipped. Hooks support
+`path`, `args`, `env`, and `timeout` fields per OCI spec.
 
 ### Annotations (`annotations`)
 

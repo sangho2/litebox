@@ -9,15 +9,17 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use oci_spec::runtime::Hook;
 
 use crate::state::{ContainerState, StateManager, Status};
 
 /// Set up a PTY and send the master fd over a console socket.
 ///
 /// Creates a new pseudoterminal pair. Sends the master fd to the
-/// console-socket via SCM_RIGHTS (as runc does per OCI spec).
+/// console-socket via `SCM_RIGHTS` (as runc does per OCI spec).
 /// Returns the slave fd which should be used for container stdio.
 fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -123,6 +125,92 @@ fn should_unshare_netns(spec: &oci_spec::runtime::Spec) -> bool {
         })
 }
 
+/// Execute a list of OCI lifecycle hooks.
+///
+/// Each hook receives the container state JSON on stdin. Hooks are executed
+/// sequentially in the order specified. If a hook fails, subsequent hooks
+/// are skipped and an error is returned.
+fn run_hooks(hooks: &[Hook], state: &ContainerState, label: &str) -> Result<()> {
+    let state_json =
+        serde_json::to_string(state).context("failed to serialize container state for hook")?;
+
+    for hook in hooks {
+        let path = hook.path();
+        tracing::info!(hook = %path.display(), phase = label, "executing OCI hook");
+
+        let mut cmd = std::process::Command::new(path);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+
+        if let Some(args) = hook.args() {
+            // OCI spec: args[0] is the binary name (like execv), skip path and use args as-is
+            cmd.args(args.iter().skip(1));
+        }
+        if let Some(env) = hook.env() {
+            for e in env {
+                if let Some((k, v)) = e.split_once('=') {
+                    cmd.env(k, v);
+                }
+            }
+        }
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to execute {label} hook: {}", path.display()))?;
+
+        // Write state JSON to hook's stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(state_json.as_bytes());
+        }
+
+        let timeout = hook
+            .timeout()
+            .filter(|&t| t > 0)
+            .map(|t| Duration::from_secs(t.unsigned_abs()));
+
+        let status = if let Some(timeout) = timeout {
+            // Poll with try_wait to implement timeout without adding a dependency
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break s,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            anyhow::bail!(
+                                "{label} hook {} timed out after {}s",
+                                path.display(),
+                                timeout.as_secs()
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        anyhow::bail!("{label} hook {} wait failed: {e}", path.display());
+                    }
+                }
+            }
+        } else {
+            child
+                .wait()
+                .with_context(|| format!("{label} hook {} wait failed", path.display()))?
+        };
+
+        if !status.success() {
+            anyhow::bail!(
+                "{label} hook {} failed with exit status: {status}",
+                path.display()
+            );
+        }
+
+        tracing::debug!(hook = %path.display(), phase = label, "hook completed successfully");
+    }
+
+    Ok(())
+}
+
 /// OCI lifecycle manager.
 pub struct Lifecycle {
     state_manager: StateManager,
@@ -130,6 +218,7 @@ pub struct Lifecycle {
 
 impl Lifecycle {
     /// Create a new lifecycle manager.
+    #[must_use]
     pub fn new(state_manager: StateManager) -> Self {
         Self { state_manager }
     }
@@ -138,6 +227,11 @@ impl Lifecycle {
     ///
     /// This spawns a child process that waits for the start signal via a Unix socket.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the bundle or config.json is invalid, the container
+    /// already exists, forking fails, or a `createRuntime`/`createContainer` hook fails.
+    ///
     /// # Panics
     ///
     /// This function may panic in the child process if:
@@ -145,6 +239,7 @@ impl Lifecycle {
     /// - Failed to signal ready to parent
     /// - Failed to accept start connection
     /// - Failed to read start signal
+    #[allow(clippy::too_many_lines)]
     pub fn create(
         &self,
         id: &str,
@@ -166,6 +261,12 @@ impl Lifecycle {
         if self.state_manager.exists(id) {
             anyhow::bail!("container {id} already exists");
         }
+
+        // Parse OCI spec for hooks
+        let spec: oci_spec::runtime::Spec = serde_json::from_reader(
+            fs::File::open(&config_path).context("failed to open config.json")?,
+        )
+        .context("failed to parse config.json")?;
 
         // Create state directory
         let state_dir = self.state_manager.create_dir(id)?;
@@ -203,6 +304,24 @@ impl Lifecycle {
                 state.status = Status::Created;
                 state.pid = Some(pid);
                 self.state_manager.save(&state)?;
+
+                // Run createRuntime hooks (OCI spec: after container created, in runtime ns)
+                if let Some(hooks) = spec.hooks() {
+                    if let Some(cr_hooks) = hooks.create_runtime()
+                        && let Err(e) = run_hooks(cr_hooks, &state, "createRuntime")
+                    {
+                        tracing::warn!(error = %e, "createRuntime hook failed");
+                        return Err(e);
+                    }
+                    // createContainer hooks run in container ns; since litebox shares
+                    // the address space, we execute them here as well.
+                    if let Some(cc_hooks) = hooks.create_container()
+                        && let Err(e) = run_hooks(cc_hooks, &state, "createContainer")
+                    {
+                        tracing::warn!(error = %e, "createContainer hook failed");
+                        return Err(e);
+                    }
+                }
 
                 Ok(state)
             }
@@ -303,6 +422,11 @@ impl Lifecycle {
     }
 
     /// Start a created container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not in `Created` state, the sync
+    /// socket connection fails, or a `prestart`/`startContainer` hook fails.
     pub fn start(&self, id: &str) -> Result<ContainerState> {
         let state = self.state_manager.load(id)?;
 
@@ -312,6 +436,30 @@ impl Lifecycle {
                 id,
                 state.status
             );
+        }
+
+        // Parse OCI spec for hooks
+        let config_path = state.bundle.join("config.json");
+        let spec_hooks: Option<oci_spec::runtime::Hooks> = if config_path.exists() {
+            fs::File::open(&config_path)
+                .ok()
+                .and_then(|f| serde_json::from_reader::<_, oci_spec::runtime::Spec>(f).ok())
+                .and_then(|s| s.hooks().clone())
+        } else {
+            None
+        };
+
+        // Run prestart hooks (deprecated, but still supported per spec)
+        #[allow(deprecated)]
+        if let Some(ref hooks) = spec_hooks {
+            if let Some(prestart) = hooks.prestart() {
+                run_hooks(prestart, &state, "prestart")?;
+            }
+            // startContainer hooks run in container namespace; litebox shares
+            // the address space, so we execute them here before signaling start.
+            if let Some(sc_hooks) = hooks.start_container() {
+                run_hooks(sc_hooks, &state, "startContainer")?;
+            }
         }
 
         // Connect to the child's sync socket and signal it to start
@@ -335,15 +483,34 @@ impl Lifecycle {
             s.status = Status::Running;
         })?;
 
+        // Run poststart hooks (OCI spec: after container process started, in runtime ns)
+        if let Some(ref hooks) = spec_hooks
+            && let Some(poststart) = hooks.poststart()
+        {
+            // poststart hooks are best-effort per OCI spec — log but don't fail
+            if let Err(e) = run_hooks(poststart, &state, "poststart") {
+                tracing::warn!(error = %e, "poststart hook failed (non-fatal)");
+            }
+        }
+
         Ok(state)
     }
 
     /// Get the state of a container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found or state cannot be read.
     pub fn state(&self, id: &str) -> Result<ContainerState> {
         self.state_manager.refresh_state(id)
     }
 
     /// Send a signal to a container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found, already stopped, or
+    /// the signal cannot be delivered.
     pub fn kill(&self, id: &str, signal: i32) -> Result<()> {
         let state = self.state_manager.refresh_state(id)?;
 
@@ -374,6 +541,11 @@ impl Lifecycle {
     }
 
     /// Delete a container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found or is still running
+    /// (unless `force` is true).
     pub fn delete(&self, id: &str, force: bool) -> Result<()> {
         let state = self.state_manager.refresh_state(id)?;
 
@@ -410,11 +582,28 @@ impl Lifecycle {
             }
         }
 
+        // Run poststop hooks (OCI spec: after container exits, in runtime ns)
+        let config_path = state.bundle.join("config.json");
+        if let Ok(f) = fs::File::open(&config_path)
+            && let Ok(spec) = serde_json::from_reader::<_, oci_spec::runtime::Spec>(f)
+            && let Some(hooks) = spec.hooks()
+            && let Some(poststop) = hooks.poststop()
+        {
+            // poststop hooks are best-effort per OCI spec
+            if let Err(e) = run_hooks(poststop, &state, "poststop") {
+                tracing::warn!(error = %e, "poststop hook failed (non-fatal)");
+            }
+        }
+
         self.state_manager.delete(id)?;
         Ok(())
     }
 
     /// List all containers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state directory cannot be read.
     pub fn list(&self) -> Result<Vec<ContainerState>> {
         let ids = self.state_manager.list()?;
         let mut states = Vec::new();
@@ -721,5 +910,134 @@ mod tests {
         // Should only return the valid container
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].id, "valid-container");
+    }
+
+    #[test]
+    fn test_run_hooks_success() {
+        let state = ContainerState::new("test-hook".to_string(), PathBuf::from("/tmp"));
+        let hook = oci_spec::runtime::HookBuilder::default()
+            .path("/bin/true")
+            .build()
+            .unwrap();
+        let result = run_hooks(&[hook], &state, "test");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_hooks_failure() {
+        let state = ContainerState::new("test-hook".to_string(), PathBuf::from("/tmp"));
+        let hook = oci_spec::runtime::HookBuilder::default()
+            .path("/bin/false")
+            .build()
+            .unwrap();
+        let result = run_hooks(&[hook], &state, "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed"));
+    }
+
+    #[test]
+    fn test_run_hooks_nonexistent_binary() {
+        let state = ContainerState::new("test-hook".to_string(), PathBuf::from("/tmp"));
+        let hook = oci_spec::runtime::HookBuilder::default()
+            .path("/nonexistent/hook")
+            .build()
+            .unwrap();
+        let result = run_hooks(&[hook], &state, "test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_hooks_with_args_and_env() {
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("hook_ran");
+        // Use /bin/sh to create a marker file, proving args and env work
+        let hook = oci_spec::runtime::HookBuilder::default()
+            .path("/bin/sh")
+            .args(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", marker.display()),
+            ])
+            .env(vec!["HOOK_TEST=1".to_string()])
+            .build()
+            .unwrap();
+        let state = ContainerState::new("test-hook".to_string(), PathBuf::from("/tmp"));
+        let result = run_hooks(&[hook], &state, "test");
+        assert!(result.is_ok());
+        assert!(marker.exists(), "hook should have created marker file");
+    }
+
+    #[test]
+    fn test_run_hooks_timeout() {
+        let state = ContainerState::new("test-hook".to_string(), PathBuf::from("/tmp"));
+        let hook = oci_spec::runtime::HookBuilder::default()
+            .path("/bin/sleep")
+            .args(vec!["sleep".to_string(), "60".to_string()])
+            .timeout(1_i64)
+            .build()
+            .unwrap();
+        let result = run_hooks(&[hook], &state, "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn test_run_hooks_receives_state_on_stdin() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("stdin_capture");
+        // Hook reads stdin and writes it to a file
+        let hook = oci_spec::runtime::HookBuilder::default()
+            .path("/bin/sh")
+            .args(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("cat > {}", output.display()),
+            ])
+            .build()
+            .unwrap();
+        let state = ContainerState::new("test-stdin".to_string(), PathBuf::from("/tmp/bundle"));
+        let result = run_hooks(&[hook], &state, "test");
+        assert!(result.is_ok());
+        let captured = fs::read_to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&captured).unwrap();
+        assert_eq!(parsed["id"], "test-stdin");
+        assert_eq!(parsed["bundle"], "/tmp/bundle");
+    }
+
+    #[test]
+    fn test_run_hooks_sequential_stops_on_failure() {
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("should_not_exist");
+        let hooks = vec![
+            // First hook fails
+            oci_spec::runtime::HookBuilder::default()
+                .path("/bin/false")
+                .build()
+                .unwrap(),
+            // Second hook should NOT run
+            oci_spec::runtime::HookBuilder::default()
+                .path("/bin/sh")
+                .args(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("touch {}", marker.display()),
+                ])
+                .build()
+                .unwrap(),
+        ];
+        let state = ContainerState::new("test-seq".to_string(), PathBuf::from("/tmp"));
+        let result = run_hooks(&hooks, &state, "test");
+        assert!(result.is_err());
+        assert!(
+            !marker.exists(),
+            "second hook should not run after first fails"
+        );
+    }
+
+    #[test]
+    fn test_run_hooks_empty_list() {
+        let state = ContainerState::new("test-hook".to_string(), PathBuf::from("/tmp"));
+        let result = run_hooks(&[], &state, "test");
+        assert!(result.is_ok());
     }
 }

@@ -73,7 +73,7 @@
 ### Container / Kubernetes Compatibility
 
 #### Critical (Basic K8s)
-- [ ] OCI lifecycle hooks (`prestart`, `poststart`, `poststop` execution)
+- [x] OCI lifecycle hooks (`prestart`, `createRuntime`, `createContainer`, `startContainer`, `poststart`, `poststop`)
 - [ ] Exit code in OCI `state` output (`StatusCode` field for kubelet)
 - [ ] Capabilities (`process.capabilities` from OCI spec — parse and allowlist/warn)
 - [ ] User/UID mapping (`process.user.uid`/`gid` from OCI spec, affects file ownership and `/proc/self/status`)
