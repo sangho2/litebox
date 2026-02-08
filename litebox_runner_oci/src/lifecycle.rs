@@ -529,11 +529,13 @@ impl Lifecycle {
             anyhow::bail!("failed to send signal {signal} to process {pid}: {e}");
         }
 
-        // Check if process exited
+        // Check if process exited and capture exit code
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !StateManager::is_process_alive(pid) {
+            let exit_code = StateManager::try_wait_exit_code(pid);
             self.state_manager.update(id, |s| {
                 s.status = Status::Stopped;
+                s.exit_code = exit_code;
             })?;
         }
 

@@ -57,6 +57,10 @@ pub struct ContainerState {
     /// Optional annotations
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub annotations: std::collections::HashMap<String, String>,
+
+    /// Exit code of the container process (set when stopped)
+    #[serde(default, rename = "exitCode", skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 impl ContainerState {
@@ -69,6 +73,7 @@ impl ContainerState {
             pid: None,
             bundle,
             annotations: std::collections::HashMap::new(),
+            exit_code: None,
         }
     }
 }
@@ -192,6 +197,7 @@ impl StateManager {
     }
 
     /// Refresh container state by checking if process is still alive.
+    /// If the process has exited, captures the exit code.
     pub fn refresh_state(&self, id: &str) -> Result<ContainerState> {
         let mut state = self.load(id)?;
 
@@ -200,10 +206,35 @@ impl StateManager {
             && !Self::is_process_alive(pid)
         {
             state.status = Status::Stopped;
+            // Try waitpid first (works if we're the parent)
+            if let Some(code) = Self::try_wait_exit_code(pid) {
+                state.exit_code = Some(code);
+            }
             self.save(&state)?;
         }
 
         Ok(state)
+    }
+
+    /// Try to collect exit code from a child process using `waitpid` with `WNOHANG`.
+    /// Returns `Some(exit_code)` if the process has exited and we are its parent,
+    /// `None` if still running or not our child.
+    pub fn try_wait_exit_code(pid: u32) -> Option<i32> {
+        let mut status: i32 = 0;
+        // SAFETY: waitpid with WNOHANG is a standard, safe Linux syscall.
+        let ret = unsafe { libc::waitpid(pid.cast_signed(), &raw mut status, libc::WNOHANG) };
+        if ret > 0 {
+            if libc::WIFEXITED(status) {
+                Some(libc::WEXITSTATUS(status))
+            } else if libc::WIFSIGNALED(status) {
+                // Killed by signal: convention is 128 + signal number
+                Some(128 + libc::WTERMSIG(status))
+            } else {
+                Some(-1)
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -259,6 +290,7 @@ mod tests {
         assert!(state.pid.is_none());
         assert_eq!(state.bundle, PathBuf::from("/tmp/bundle"));
         assert!(state.annotations.is_empty());
+        assert!(state.exit_code.is_none());
     }
 
     #[test]
@@ -474,7 +506,80 @@ mod tests {
         assert!(json.contains("\"status\": \"running\""));
         assert!(json.contains("\"pid\": 12345"));
 
-        // Annotations should be omitted when empty
+        // Annotations and exitCode should be omitted when empty/none
         assert!(!json.contains("annotations"));
+        assert!(!json.contains("exitCode"));
+    }
+
+    #[test]
+    fn test_exit_code_serialization() {
+        let mut state = ContainerState::new("test-id".to_string(), PathBuf::from("/bundle"));
+        state.status = Status::Stopped;
+        state.exit_code = Some(0);
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(json.contains("\"exitCode\": 0"));
+
+        // Non-zero exit code
+        state.exit_code = Some(137);
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(json.contains("\"exitCode\": 137"));
+    }
+
+    #[test]
+    fn test_exit_code_deserialization() {
+        let json = r#"{
+            "ociVersion": "1.0.0",
+            "id": "test",
+            "status": "stopped",
+            "bundle": "/bundle",
+            "exitCode": 42
+        }"#;
+        let state: ContainerState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.exit_code, Some(42));
+
+        // Without exitCode (backward compatible)
+        let json_no_exit = r#"{
+            "ociVersion": "1.0.0",
+            "id": "test",
+            "status": "stopped",
+            "bundle": "/bundle"
+        }"#;
+        let state: ContainerState = serde_json::from_str(json_no_exit).unwrap();
+        assert_eq!(state.exit_code, None);
+    }
+
+    #[test]
+    fn test_try_wait_exit_code() {
+        // Spawn a real child process that exits with code 42
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 42"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        // Wait for child to exit
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let code = StateManager::try_wait_exit_code(pid);
+        assert_eq!(code, Some(42));
+    }
+
+    #[test]
+    fn test_try_wait_exit_code_zero() {
+        let child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let code = StateManager::try_wait_exit_code(pid);
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn test_signal_exit_code() {
+        // Convention: signal death = 128 + signal number
+        assert_eq!(128 + 9, 137); // SIGKILL
+        assert_eq!(128 + 15, 143); // SIGTERM
     }
 }

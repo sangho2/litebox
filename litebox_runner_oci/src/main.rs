@@ -382,7 +382,7 @@ fn main() -> Result<()> {
             PathBuf::from("/tmp/litebox-oci")
         }
     });
-    let state_manager = StateManager::new(root);
+    let state_manager = StateManager::new(root.clone());
     let lifecycle = Lifecycle::new(state_manager);
 
     match cli.command {
@@ -669,6 +669,16 @@ fn main() -> Result<()> {
                     rewrite_shell,
                 )?
             };
+
+            // Save exit code to state (if this was a create+start lifecycle container)
+            let sm = StateManager::new(root);
+            if sm.exists(&container_id) {
+                let _ = sm.update(&container_id, |s| {
+                    s.status = litebox_runner_oci::state::Status::Stopped;
+                    s.exit_code = Some(exit_code);
+                });
+            }
+
             std::process::exit(exit_code);
         }
 
