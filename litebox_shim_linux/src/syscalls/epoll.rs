@@ -554,19 +554,76 @@ impl PollSet {
         cx: &WaitContext<'_, Platform>,
         files: &FilesState,
     ) -> Result<(), WaitError> {
+        // Check if any poll entries are network socket fds by attempting
+        // to resolve them as EpollDescriptor::Socket.
+        let has_network_fds = {
+            let fds = files.file_descriptors.read();
+            self.entries.iter().any(|entry| {
+                entry.fd >= 0
+                    && fds
+                        .get_fd(entry.fd.reinterpret_as_unsigned())
+                        .and_then(|file| EpollDescriptor::try_from(files, file).ok())
+                        .is_some_and(|d| matches!(d, EpollDescriptor::Socket(_)))
+            })
+        };
+
+        if has_network_fds {
+            // Drive the network stack so incoming TUN packets are processed.
+            global.poll_network();
+        }
+
         if self.scan_once(global, files, None) {
             return Ok(());
         }
 
-        let mut register = true;
-        cx.wait_until(|| {
-            if self.scan_once(global, files, register.then_some(cx.waker())) {
-                return true;
+        if !has_network_fds {
+            // No network sockets — use standard blocking wait.
+            let mut register = true;
+            return cx.wait_until(|| {
+                if self.scan_once(global, files, register.then_some(cx.waker())) {
+                    return true;
+                }
+                register = false;
+                false
+            });
+        }
+
+        // Network sockets present — use a short polling interval to periodically
+        // drive the network stack, since the TUN device is read in the same thread.
+        let poll_interval = core::time::Duration::from_millis(10);
+        loop {
+            // Use the shorter of the poll interval and the remaining original timeout.
+            let effective_timeout = match cx.remaining_timeout() {
+                Some(remaining) => Some(remaining.min(poll_interval)),
+                None if cx.deadline().is_some() => {
+                    // Original deadline already passed
+                    return Err(WaitError::TimedOut);
+                }
+                None => Some(poll_interval), // No deadline — use poll interval
+            };
+            let short_cx = cx.with_timeout(effective_timeout);
+            let mut register = true;
+            let result = short_cx.wait_until(|| {
+                if self.scan_once(global, files, register.then_some(short_cx.waker())) {
+                    return true;
+                }
+                register = false;
+                false
+            });
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(WaitError::TimedOut) => {
+                    // Short timeout expired — drive the network and retry.
+                    global.poll_network();
+                    if self.scan_once(global, files, None) {
+                        return Ok(());
+                    }
+                    // Continue loop — will check original deadline at top.
+                }
+                Err(e) => return Err(e),
             }
-            // Don't register observers again in the next iteration.
-            register = false;
-            false
-        })
+        }
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.

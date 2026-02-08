@@ -406,6 +406,7 @@ enum PollDirection {
     /// Ingress (receiving) direction
     Ingress,
     /// Egress (sending) direction
+    #[allow(dead_code)]
     Egress,
     /// Both directions
     Both,
@@ -501,6 +502,14 @@ where
             })
     }
 
+    /// Drive the network stack: read TUN packets, process smoltcp, drain socket buffers.
+    ///
+    /// This is useful for poll/ppoll to detect data availability on network sockets
+    /// without performing a send/receive operation.
+    pub fn poll(&mut self) {
+        self.internal_perform_platform_interaction();
+    }
+
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
     fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
         self.attempt_to_close_queued();
@@ -509,6 +518,7 @@ where
 
         // Drain all socket channel buffers before polling to ensure data flows
         self.drain_all_socket_channel_buffers();
+
         self.interface
             .poll(self.now(), &mut self.device, &mut self.socket_set)
     }
@@ -1189,8 +1199,15 @@ where
                     .local_port_allocator
                     .allocate_local_port(addr.port())
                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
+                // Use None for unspecified address so smoltcp resolves source IP
+                // via get_source_address() during dispatch.
+                let bind_addr = if addr.ip().is_unspecified() {
+                    None
+                } else {
+                    Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip()))
+                };
                 let local_endpoint = smoltcp::wire::IpListenEndpoint {
-                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                    addr: bind_addr,
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
@@ -1296,9 +1313,9 @@ where
                 }
                 server_socket.refill_to_backlog(&mut self.socket_set);
             }
-            ProtocolSpecific::Udp(_) => return Err(ListenError::InvalidProtocol),
-            ProtocolSpecific::Icmp(_) => return Err(ListenError::InvalidProtocol),
-            ProtocolSpecific::Raw(_) => return Err(ListenError::InvalidProtocol),
+            ProtocolSpecific::Udp(_) | ProtocolSpecific::Icmp(_) | ProtocolSpecific::Raw(_) => {
+                return Err(ListenError::InvalidProtocol);
+            }
         }
 
         if let Some(proxy) = &socket_handle.proxy {
@@ -1390,9 +1407,9 @@ where
                 }
                 Ok(self.new_socket_fd_for(handle))
             }
-            ProtocolSpecific::Udp(_) => Err(AcceptError::InvalidProtocol),
-            ProtocolSpecific::Icmp(_) => Err(AcceptError::InvalidProtocol),
-            ProtocolSpecific::Raw(_) => Err(AcceptError::InvalidProtocol),
+            ProtocolSpecific::Udp(_) | ProtocolSpecific::Icmp(_) | ProtocolSpecific::Raw(_) => {
+                Err(AcceptError::InvalidProtocol)
+            }
         }
     }
 

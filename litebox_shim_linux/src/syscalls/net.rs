@@ -538,8 +538,8 @@ impl GlobalState {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
                 litebox_common_linux::IpOption::TTL => 64, // default TTL
-                litebox_common_linux::IpOption::RECVTTL => 0, // not enabled
-                litebox_common_linux::IpOption::RETOPTS => 0, // not enabled
+                litebox_common_linux::IpOption::RECVTTL
+                | litebox_common_linux::IpOption::RETOPTS => 0, // not enabled
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -835,8 +835,8 @@ impl GlobalState {
         // ICMP/Raw sockets bypass the proxy channel and go directly through Network::receive().
         // We retry with polling since the ICMP reply may not have arrived yet.
         if let NetworkProxy::Raw = proxy.as_ref() {
-            let max_attempts = match timeout {
-                Some(t) => (t.as_millis() / 10).max(1) as u32,
+            let max_attempts: u32 = match timeout {
+                Some(t) => u32::try_from(t.as_millis() / 10).unwrap_or(u32::MAX).max(1),
                 None => 1000, // ~10 seconds default
             };
             for _ in 0..max_attempts {
@@ -850,7 +850,6 @@ impl GlobalState {
                         for _ in 0..10000 {
                             core::hint::spin_loop();
                         }
-                        continue;
                     }
                     _ => return result.map_err(Errno::from),
                 }

@@ -548,7 +548,7 @@ impl Task {
             } => {
                 // Support seeking in proc files
                 let pos = position.load(Ordering::Relaxed);
-                #[allow(clippy::cast_sign_loss)]
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
                 let new_pos = match whence {
                     SeekWhence::RelativeToBeginning => offset as usize,
                     SeekWhence::RelativeToCurrentOffset => (pos as isize + offset) as usize,
@@ -984,7 +984,7 @@ impl Descriptor {
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
-                st_size: content.len().try_into().unwrap_or(0),
+                st_size: content.len(),
                 st_blksize: 4096,
                 st_blocks: 0,
                 ..Default::default()
@@ -1088,7 +1088,7 @@ impl Task {
                 st_uid: 0,
                 st_gid: 0,
                 st_rdev: 0,
-                st_size: content.len().try_into().unwrap_or(0),
+                st_size: content.len(),
                 st_blksize: 4096,
                 st_blocks: 0,
                 ..Default::default()
@@ -1731,13 +1731,16 @@ impl Task {
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) | IoctlArg::TCSETSW(_) | IoctlArg::TCSETSF(_) => Ok(0),
+            IoctlArg::TCSETS(_)
+            | IoctlArg::TCSETSW(_)
+            | IoctlArg::TCSETSF(_)
+            | IoctlArg::TIOCSPGRP(_)
+            | IoctlArg::TIOCSWINSZ(_) => Ok(0), // Accept and ignore
             IoctlArg::TIOCGPGRP(ptr) => {
                 // Return process group 1 (init-like behavior in sandbox)
                 ptr.write_at_offset(0, 1).ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TIOCSPGRP(_) => Ok(0), // Accept and ignore
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
@@ -1751,7 +1754,6 @@ impl Task {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TIOCSWINSZ(_) => Ok(0), // Accept and ignore window size changes
             IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
             _ => todo!(),
         }

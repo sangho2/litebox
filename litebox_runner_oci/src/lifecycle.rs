@@ -22,6 +22,12 @@ use crate::state::{ContainerState, StateManager, Status};
 fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    #[repr(C)]
+    struct CmsgFd {
+        hdr: libc::cmsghdr,
+        fd: i32,
+    }
+
     // Open a new PTY master via posix_openpt
     let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     if master_fd < 0 {
@@ -69,12 +75,7 @@ fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::Owned
         iov_base: data.as_ptr() as *mut libc::c_void,
         iov_len: 1,
     };
-    // Build cmsg with SCM_RIGHTS containing master fd
-    #[repr(C)]
-    struct CmsgFd {
-        hdr: libc::cmsghdr,
-        fd: i32,
-    }
+    #[allow(clippy::cast_possible_truncation)]
     let mut cmsg_buf = CmsgFd {
         hdr: libc::cmsghdr {
             cmsg_len: unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) } as _,
@@ -86,13 +87,13 @@ fn setup_console_socket(console_socket_path: &Path) -> Result<std::os::fd::Owned
     let msg = libc::msghdr {
         msg_name: std::ptr::null_mut(),
         msg_namelen: 0,
-        msg_iov: &iov as *const _ as *mut _,
+        msg_iov: (&raw const iov).cast_mut(),
         msg_iovlen: 1,
-        msg_control: &mut cmsg_buf as *mut _ as *mut libc::c_void,
+        msg_control: (&raw mut cmsg_buf).cast::<libc::c_void>(),
         msg_controllen: std::mem::size_of::<CmsgFd>(),
         msg_flags: 0,
     };
-    let ret = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
+    let ret = unsafe { libc::sendmsg(sock_fd, &raw const msg, 0) };
     if ret < 0 {
         anyhow::bail!(
             "sendmsg (SCM_RIGHTS) failed: {}",
@@ -115,12 +116,11 @@ fn should_unshare_netns(spec: &oci_spec::runtime::Spec) -> bool {
     spec.linux()
         .as_ref()
         .and_then(|l| l.namespaces().as_ref())
-        .map(|namespaces| {
+        .is_some_and(|namespaces| {
             namespaces
                 .iter()
                 .any(|ns| ns.typ() == LinuxNamespaceType::Network && ns.path().is_none())
         })
-        .unwrap_or(false)
 }
 
 /// OCI lifecycle manager.
@@ -214,19 +214,17 @@ impl Lifecycle {
                 // If the OCI spec requests a new network namespace (no path), unshare
                 // into one so that container managers (e.g., ctr --cni) can apply CNI
                 // plugins to our netns via /proc/<pid>/ns/net.
-                if let Ok(spec_data) = fs::read(&config_path) {
-                    if let Ok(spec) = serde_json::from_slice::<oci_spec::runtime::Spec>(&spec_data)
-                    {
-                        if should_unshare_netns(&spec) {
-                            // SAFETY: unshare is a standard Linux syscall.
-                            let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
-                            if ret == 0 {
-                                // Bring up loopback in the new netns
-                                let _ = std::process::Command::new("ip")
-                                    .args(["link", "set", "lo", "up"])
-                                    .status();
-                            }
-                        }
+                if let Ok(spec_data) = fs::read(&config_path)
+                    && let Ok(spec) = serde_json::from_slice::<oci_spec::runtime::Spec>(&spec_data)
+                    && should_unshare_netns(&spec)
+                {
+                    // SAFETY: unshare is a standard Linux syscall.
+                    let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+                    if ret == 0 {
+                        // Bring up loopback in the new netns
+                        let _ = std::process::Command::new("ip")
+                            .args(["link", "set", "lo", "up"])
+                            .status();
                     }
                 }
 

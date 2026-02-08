@@ -63,12 +63,12 @@ impl ProcFile {
 
         // Handle /proc/<pid>/* where pid matches current process
         // For now, we treat any numeric PID as "self" since we're single-process
-        if let Some(rest) = path.strip_prefix('/') {
-            if let Some(idx) = rest.find('/') {
-                let (pid_str, remaining) = rest.split_at(idx);
-                if pid_str.parse::<u32>().is_ok() {
-                    return Self::parse_self_path(remaining);
-                }
+        if let Some(rest) = path.strip_prefix('/')
+            && let Some(idx) = rest.find('/')
+        {
+            let (pid_str, remaining) = rest.split_at(idx);
+            if pid_str.parse::<u32>().is_ok() {
+                return Self::parse_self_path(remaining);
             }
         }
 
@@ -205,7 +205,7 @@ fn generate_fd_link(fd: u32) -> Vec<u8> {
         0 => b"/dev/stdin".to_vec(),
         1 => b"/dev/stdout".to_vec(),
         2 => b"/dev/stderr".to_vec(),
-        _ => alloc::format!("pipe:[{}]", fd).into_bytes(),
+        _ => alloc::format!("pipe:[{fd}]").into_bytes(),
     }
 }
 
@@ -218,18 +218,17 @@ fn generate_maps() -> Vec<u8> {
 fn generate_self_stat(ctx: &ProcContext) -> Vec<u8> {
     // Format: pid (comm) state ppid pgrp session tty_nr tpgid flags ...
     // We provide minimal required fields
-    let comm = ctx
-        .cmdline
-        .first()
-        .map(|s| {
+    let comm = ctx.cmdline.first().map_or_else(
+        || "litebox".into(),
+        |s| {
             s.rsplit('/')
                 .next()
                 .unwrap_or(s)
                 .chars()
                 .take(15)
                 .collect::<String>()
-        })
-        .unwrap_or_else(|| "litebox".into());
+        },
+    );
 
     alloc::format!(
         "{} ({}) R {} {} {} 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
@@ -238,18 +237,17 @@ fn generate_self_stat(ctx: &ProcContext) -> Vec<u8> {
 }
 
 fn generate_self_status(ctx: &ProcContext) -> Vec<u8> {
-    let comm = ctx
-        .cmdline
-        .first()
-        .map(|s| {
+    let comm = ctx.cmdline.first().map_or_else(
+        || "litebox".into(),
+        |s| {
             s.rsplit('/')
                 .next()
                 .unwrap_or(s)
                 .chars()
                 .take(15)
                 .collect::<String>()
-        })
-        .unwrap_or_else(|| "litebox".into());
+        },
+    );
 
     alloc::format!(
         "Name:\t{}\n\

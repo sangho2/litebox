@@ -309,13 +309,15 @@ fn split_pipeline(script: &str) -> Option<Vec<String>> {
 fn cache_dir() -> PathBuf {
     // Use XDG cache dir or fallback to ~/.cache
     std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME").map_or_else(
-                |_| PathBuf::from("/tmp"),
-                |h| PathBuf::from(h).join(".cache"),
-            )
-        })
+        .map_or_else(
+            |_| {
+                std::env::var("HOME").map_or_else(
+                    |_| PathBuf::from("/tmp"),
+                    |h| PathBuf::from(h).join(".cache"),
+                )
+            },
+            PathBuf::from,
+        )
         .join("litebox-oci")
         .join("rewritten")
 }
@@ -404,13 +406,15 @@ fn rewrite_with_cache(data: &[u8]) -> Vec<u8> {
 /// Squashfs cache directory for lazy loading
 fn squashfs_cache_dir() -> PathBuf {
     std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME").map_or_else(
-                |_| PathBuf::from("/tmp"),
-                |h| PathBuf::from(h).join(".cache"),
-            )
-        })
+        .map_or_else(
+            |_| {
+                std::env::var("HOME").map_or_else(
+                    |_| PathBuf::from("/tmp"),
+                    |h| PathBuf::from(h).join(".cache"),
+                )
+            },
+            PathBuf::from,
+        )
         .join("litebox-oci")
         .join("squashfs")
 }
@@ -445,7 +449,7 @@ fn create_squashfs(rootfs_path: &Path) -> Result<PathBuf> {
         .context("failed to run mksquashfs. Is squashfs-tools installed?")?;
 
     if !status.success() {
-        anyhow::bail!("mksquashfs failed with status: {}", status);
+        anyhow::bail!("mksquashfs failed with status: {status}");
     }
 
     Ok(squashfs_path)
@@ -519,13 +523,15 @@ impl Drop for SquashfsMount {
 /// Tar cache directory for true lazy loading
 fn tar_cache_dir() -> PathBuf {
     std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME").map_or_else(
-                |_| PathBuf::from("/tmp"),
-                |h| PathBuf::from(h).join(".cache"),
-            )
-        })
+        .map_or_else(
+            |_| {
+                std::env::var("HOME").map_or_else(
+                    |_| PathBuf::from("/tmp"),
+                    |h| PathBuf::from(h).join(".cache"),
+                )
+            },
+            PathBuf::from,
+        )
         .join("litebox-oci")
         .join("tar")
 }
@@ -612,17 +618,17 @@ fn create_tar_from_rootfs(rootfs_path: &Path) -> Result<TarSource> {
 
                 let file = std::fs::File::open(entry.path())?;
                 builder.append_data(&mut header, &*path_str, file)?;
-            } else if entry.file_type().is_symlink() {
-                if let Ok(link_target) = std::fs::read_link(entry.path()) {
-                    let mut header = tar::Header::new_gnu();
-                    header.set_entry_type(tar::EntryType::Symlink);
-                    header.set_mode(0o777);
-                    header.set_size(0);
-                    header.set_uid(0);
-                    header.set_gid(0);
-                    header.set_cksum();
-                    builder.append_link(&mut header, &*path_str, &link_target)?;
-                }
+            } else if entry.file_type().is_symlink()
+                && let Ok(link_target) = std::fs::read_link(entry.path())
+            {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_mode(0o777);
+                header.set_size(0);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_cksum();
+                builder.append_link(&mut header, &*path_str, &link_target)?;
             }
         }
         builder.finish()?;
@@ -715,10 +721,11 @@ pub fn detect_cni_network(spec: &Spec) -> Option<CniNetworkConfig> {
 
     if let Some(netns_path) = net_ns.path().as_ref() {
         // Strategy 1: explicit netns path (Podman) — enter it and read config
+        use std::os::unix::io::AsRawFd;
+
         let netns_file = std::fs::File::open(netns_path).ok()?;
         let orig_netns = std::fs::File::open("/proc/self/ns/net").ok()?;
 
-        use std::os::unix::io::AsRawFd;
         let clone_newnet: libc::c_int = 0x40000000; // CLONE_NEWNET
         // SAFETY: setns is a standard Linux syscall. We pass a valid fd and flag.
         let ret = unsafe { libc::setns(netns_file.as_raw_fd(), clone_newnet) };
@@ -1193,10 +1200,10 @@ fn run_pipeline(
 
         // Build command: litebox_runner_oci run --bundle <path> <container-id>
         // with overridden args via config.json rewrite
-        let container_id = format!("pipe-{}-{}", pipe_id, i);
+        let container_id = format!("pipe-{pipe_id}-{i}");
 
         // Write a temporary config.json with this stage's args
-        let stage_config_dir = temp_dir.join(format!(".litebox_pipe_cfg_{}_{}", pipe_id, i));
+        let stage_config_dir = temp_dir.join(format!(".litebox_pipe_cfg_{pipe_id}_{i}"));
         fs::create_dir_all(&stage_config_dir)?;
 
         // Read original config and override args
@@ -1225,12 +1232,12 @@ fn run_pipeline(
         temp_files.push(stage_config_dir.clone());
 
         // Set up output temp file for non-last stages
-        let output_file = if !is_last {
-            let path = temp_dir.join(format!(".litebox_pipe_{}_{}", pipe_id, i));
+        let output_file = if is_last {
+            None
+        } else {
+            let path = temp_dir.join(format!(".litebox_pipe_{pipe_id}_{i}"));
             temp_files.push(path.clone());
             Some(path)
-        } else {
-            None
         };
 
         // Build the command
@@ -1369,23 +1376,25 @@ fn run_container_internal(
     };
 
     // Detect pipeline patterns in -c script strings and execute sequentially
-    if rewrite_shell && args.len() >= 3 && args[1] == "-c" {
-        if let Some(stages) = split_pipeline(&args[2]) {
-            tracing::info!(
-                stages = stages.len(),
-                pipeline = %args[2],
-                "detected pipeline, executing stages sequentially"
-            );
-            return run_pipeline(
-                &stages,
-                bundle_path,
-                &args,
-                extra_env,
-                mounts,
-                network,
-                lazy_mode,
-            );
-        }
+    if rewrite_shell
+        && args.len() >= 3
+        && args[1] == "-c"
+        && let Some(stages) = split_pipeline(&args[2])
+    {
+        tracing::info!(
+            stages = stages.len(),
+            pipeline = %args[2],
+            "detected pipeline, executing stages sequentially"
+        );
+        return run_pipeline(
+            &stages,
+            bundle_path,
+            &args,
+            extra_env,
+            mounts,
+            network,
+            lazy_mode,
+        );
     }
 
     tracing::info!(
@@ -1565,18 +1574,18 @@ fn run_container_internal(
 
                     if entry_type == tar::EntryType::Symlink || entry_type == tar::EntryType::Link {
                         // Check if this symlink is one of the main binary paths
-                        if main_binary_paths.iter().any(|p| p == &path_str) {
-                            if let Ok(Some(link_path)) = entry.link_name() {
-                                let link_str = link_path.to_string_lossy().to_string();
-                                let link_abs = if link_str.starts_with('/') {
-                                    link_str
-                                } else {
-                                    let parent =
-                                        Path::new(&path_str).parent().unwrap_or(Path::new("/"));
-                                    parent.join(&link_str).to_string_lossy().to_string()
-                                };
-                                critical_targets.insert(link_abs);
-                            }
+                        if main_binary_paths.iter().any(|p| p == &path_str)
+                            && let Ok(Some(link_path)) = entry.link_name()
+                        {
+                            let link_str = link_path.to_string_lossy().to_string();
+                            let link_abs = if link_str.starts_with('/') {
+                                link_str
+                            } else {
+                                let parent =
+                                    Path::new(&path_str).parent().unwrap_or(Path::new("/"));
+                                parent.join(&link_str).to_string_lossy().to_string()
+                            };
+                            critical_targets.insert(link_abs);
                         }
                     }
                 }
@@ -1624,24 +1633,20 @@ fn run_container_internal(
                         entry.read_to_end(&mut data)?;
                         executables_to_rewrite.push((path_str, data));
                     }
-                } else if entry_type == tar::EntryType::Symlink
-                    || entry_type == tar::EntryType::Link
+                } else if (entry_type == tar::EntryType::Symlink
+                    || entry_type == tar::EntryType::Link)
+                    && let Ok(Some(link_path)) = entry.link_name()
                 {
-                    if let Ok(link) = entry.link_name() {
-                        if let Some(link_path) = link {
-                            let link_str = link_path.to_string_lossy().to_string();
-                            // Normalize the link path to be absolute
-                            let link_abs = if link_str.starts_with('/') {
-                                link_str
-                            } else {
-                                // Relative symlink - resolve relative to the symlink's directory
-                                let parent =
-                                    Path::new(&path_str).parent().unwrap_or(Path::new("/"));
-                                parent.join(&link_str).to_string_lossy().to_string()
-                            };
-                            symlinks.push((path_str, link_abs));
-                        }
-                    }
+                    let link_str = link_path.to_string_lossy().to_string();
+                    // Normalize the link path to be absolute
+                    let link_abs = if link_str.starts_with('/') {
+                        link_str
+                    } else {
+                        // Relative symlink - resolve relative to the symlink's directory
+                        let parent = Path::new(&path_str).parent().unwrap_or(Path::new("/"));
+                        parent.join(&link_str).to_string_lossy().to_string()
+                    };
+                    symlinks.push((path_str, link_abs));
                 }
             }
 
@@ -1847,18 +1852,16 @@ fn run_container_internal(
                                 // Resolve nested symlink within rootfs
                                 if let Some(nested_target) =
                                     resolve_in_rootfs(sub_entry.path(), &effective_rootfs, 10)
+                                    && nested_target.is_file()
+                                    && nested_target.starts_with(&effective_rootfs)
                                 {
-                                    if nested_target.is_file()
-                                        && nested_target.starts_with(&effective_rootfs)
-                                    {
-                                        load_file_from_host(
-                                            &mut in_mem,
-                                            &nested_target,
-                                            symlink_target_str,
-                                            exec_mode,
-                                            file_mode,
-                                        );
-                                    }
+                                    load_file_from_host(
+                                        &mut in_mem,
+                                        &nested_target,
+                                        symlink_target_str,
+                                        exec_mode,
+                                        file_mode,
+                                    );
                                 }
                             }
                         }
@@ -1900,24 +1903,72 @@ fn run_container_internal(
                     in_mem.with_root_privileges(|fs| {
                         let _ = fs.mkdir(target_str, exec_mode);
                     });
-                } else if entry.file_type().is_file() {
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        let is_executable = entry
-                            .path()
-                            .metadata()
-                            .map(|m| m.permissions().mode() & 0o111 != 0)
-                            .unwrap_or(false);
-                        load_file_with_rewrite(
-                            &mut in_mem,
-                            data,
-                            target_str,
-                            is_executable,
-                            exec_mode,
-                            file_mode,
-                        );
-                    }
+                } else if entry.file_type().is_file()
+                    && let Ok(data) = std::fs::read(entry.path())
+                {
+                    let is_executable = entry
+                        .path()
+                        .metadata()
+                        .map(|m| m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false);
+                    load_file_with_rewrite(
+                        &mut in_mem,
+                        data,
+                        target_str,
+                        is_executable,
+                        exec_mode,
+                        file_mode,
+                    );
                 }
                 // Skip symlinks in mounts for simplicity
+            }
+        }
+
+        // Load OCI spec bind mounts (e.g., /etc/resolv.conf, /etc/hosts, /etc/hostname)
+        if let Some(spec_mounts) = spec.mounts() {
+            for m in spec_mounts {
+                if m.typ().as_deref() != Some("bind") {
+                    continue;
+                }
+                let Some(source) = m.source() else {
+                    continue;
+                };
+                let dest = m.destination().to_str().unwrap_or("");
+                if dest.is_empty() {
+                    continue;
+                }
+                let source_path = Path::new(source.as_os_str());
+                if source_path.is_file()
+                    && let Ok(data) = std::fs::read(source_path)
+                {
+                    tracing::debug!(
+                        source = %source_path.display(),
+                        destination = %dest,
+                        "loading OCI bind mount"
+                    );
+                    in_mem.with_root_privileges(|fs| {
+                        // Ensure parent directory exists
+                        if let Some(parent) = Path::new(dest).parent() {
+                            let parent_str = parent.to_str().unwrap_or("/");
+                            let dir_mode =
+                                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+                            let _ = fs.mkdir(parent_str, dir_mode);
+                        }
+                        // Remove existing file if present (rootfs may have a placeholder)
+                        let _ = fs.unlink(dest);
+                        let fd = fs
+                            .open(
+                                dest,
+                                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                                file_mode,
+                            )
+                            .ok();
+                        if let Some(fd) = fd {
+                            fs.initialize_primarily_read_heavy_file(&fd, data.into());
+                            let _ = fs.close(&fd);
+                        }
+                    });
+                }
             }
         }
 
@@ -1978,6 +2029,7 @@ fn run_container_internal(
 
     shim_builder.set_fs(initial_fs);
     shim_builder.set_load_filter(fixup_env);
+
     let shim = shim_builder.build();
 
     // Using rewriter backend - no seccomp setup needed

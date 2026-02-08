@@ -67,9 +67,14 @@ These flags extend OCI functionality for the `run` and `exec` commands:
 | Field | Status | Notes |
 |-------|--------|-------|
 | Standard mounts | ❌ Not supported | Rootfs loaded into in-memory fs |
-| Bind mounts (config.json) | ❌ Not supported | Use `--mount` CLI flag instead |
+| Bind mounts (config.json) | ⚠️ Partial | File bind mounts loaded (e.g., `/etc/resolv.conf`) |
 | Bind mounts (CLI) | ✅ Supported | Via `--mount` flag, snapshot only |
 | tmpfs | ❌ Not supported | |
+
+**OCI spec bind mounts:** When the OCI spec includes `type: "bind"` mounts pointing to
+host files (e.g., `/etc/resolv.conf`, `/etc/hosts`, `/etc/hostname`), litebox-oci reads
+them and loads their contents into the in-memory filesystem. This enables DNS resolution
+and hostname configuration in containers launched by Podman or containerd.
 
 ### Hooks (`hooks`)
 
@@ -227,6 +232,10 @@ network namespace and sets up networking with zero configuration:
 sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
   docker.io/library/alpine:latest /bin/ping -c 3 10.0.0.1
 
+# DNS resolution
+sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
+  docker.io/library/alpine:latest /usr/bin/nslookup dns.google
+
 # containerd (ctr) — use --cni flag
 sudo ctr run --rm --cni --runc-binary /usr/local/bin/litebox-oci \
   docker.io/library/alpine:latest test /bin/ping -c 3 10.0.0.1
@@ -264,21 +273,20 @@ sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
 ### Supported Socket Operations
 
 - **TCP**: `socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`, `close`
-- **UDP**: `socket`, `bind`, `sendto`/`recvfrom`, `close`
+- **UDP**: `socket`, `bind`, `sendto`/`recvfrom`, `connect`+`write`/`read`, `close`
 - **ICMP**: `socket(SOCK_RAW/SOCK_DGRAM, IPPROTO_ICMP)`, `sendto`/`recvfrom` (ping works)
+- **DNS**: UDP-based resolution via `/etc/resolv.conf` (loaded from OCI spec bind mounts)
 - **Timer**: `setitimer(ITIMER_REAL)` for SIGALRM delivery (required by ping)
 
 ### Not Yet Supported
 
 - Generic raw sockets (`SOCK_RAW` with non-ICMP protocols)
-- DNS resolution (needs `/etc/resolv.conf` in rootfs)
 - `/proc/net/*` files
 
 ### Limitations
 
 - No per-container IP isolation (all containers use smoltcp IP `10.0.0.2`)
 - No port mapping (requires host-side iptables)
-- Pinging external IPs beyond the TUN gateway requires DNS + routing (not yet supported)
 
 ## Architectural Limitations
 

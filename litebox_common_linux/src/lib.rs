@@ -593,6 +593,14 @@ impl<P: RawMutPointer<u8>> Clone for IoReadVec<P> {
 
 impl From<litebox::fs::FileStatus> for FileStat {
     fn from(value: litebox::fs::FileStatus) -> Self {
+        // Use a fixed reasonable timestamp (2024-01-01 00:00:00 UTC) instead of epoch
+        // This avoids "Jan 1 1970" display issues in tools like `ls -l`
+        // 1704067200 = seconds since epoch for 2024-01-01 00:00:00 UTC
+        #[cfg(target_arch = "x86_64")]
+        const DEFAULT_TIMESTAMP: i64 = 1704067200;
+        #[cfg(target_arch = "x86")]
+        const DEFAULT_TIMESTAMP: u32 = 1704067200;
+
         // TODO: add more fields
         let litebox::fs::FileStatus {
             file_type,
@@ -603,14 +611,6 @@ impl From<litebox::fs::FileStatus> for FileStat {
             blksize,
             ..
         } = value;
-
-        // Use a fixed reasonable timestamp (2024-01-01 00:00:00 UTC) instead of epoch
-        // This avoids "Jan 1 1970" display issues in tools like `ls -l`
-        // 1704067200 = seconds since epoch for 2024-01-01 00:00:00 UTC
-        #[cfg(target_arch = "x86_64")]
-        const DEFAULT_TIMESTAMP: i64 = 1704067200;
-        #[cfg(target_arch = "x86")]
-        const DEFAULT_TIMESTAMP: u32 = 1704067200;
 
         Self {
             st_dev: <_>::try_from(dev).unwrap(),

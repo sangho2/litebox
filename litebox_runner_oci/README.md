@@ -220,6 +220,10 @@ The container manager sets up a CNI network namespace. litebox-oci auto-detects 
 sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
   docker.io/library/alpine:latest /bin/ping -c 3 10.0.0.1
 
+# DNS resolution works out of the box
+sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
+  docker.io/library/alpine:latest /usr/bin/nslookup dns.google
+
 # containerd (ctr) — use --cni flag
 sudo ctr run --rm --cni --runc-binary /usr/local/bin/litebox-oci \
   docker.io/library/alpine:latest test /bin/ping -c 3 10.0.0.1
@@ -260,11 +264,11 @@ sudo podman run --rm --runtime /usr/local/bin/litebox-oci \
 
 **Supported:**
 - TCP sockets (`socket`, `connect`, `bind`, `listen`, `accept`, `send`/`recv`)
-- UDP sockets (`socket`, `bind`, `sendto`/`recvfrom`)
+- UDP sockets (`socket`, `bind`, `sendto`/`recvfrom`, `connect`+`write`/`read`)
 - ICMP ping (`SOCK_RAW`/`SOCK_DGRAM` + `IPPROTO_ICMP`)
+- DNS resolution (via `/etc/resolv.conf` from OCI spec bind mounts)
 
 **Not yet supported:**
-- DNS resolution (needs `/etc/resolv.conf` in rootfs)
 - Generic raw sockets (non-ICMP)
 
 **Note:** All containers use smoltcp-internal IP `10.0.0.2`. With auto-CNI, kernel NAT translates this to the container's real CNI-assigned IP.
@@ -377,6 +381,8 @@ See [TODO.md](TODO.md) for detailed performance analysis and virtual block devic
 - ✅ Binary caching for faster subsequent runs
 - ✅ Lazy file loading (`--lazy-tar`, `--lazy`)
 - ✅ TUN-based networking (`--tun-device`)
+- ✅ Automatic CNI networking (Podman + `ctr --cni`)
+- ✅ DNS resolution (via OCI spec bind mounts)
 - ✅ Virtual /proc filesystem (cpuinfo, meminfo, mounts, etc.)
 - ✅ `chdir()` syscall and `process.cwd` from OCI spec
 - ✅ Fork-free shell (litebox-sh) for container entrypoint scripts

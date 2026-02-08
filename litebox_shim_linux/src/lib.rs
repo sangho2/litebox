@@ -1298,6 +1298,15 @@ impl Drop for Task {
 
 pub type LoadFilter = fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>);
 
+impl GlobalState {
+    /// Drive the network stack to process pending TUN packets.
+    /// This ensures smoltcp reads incoming packets and updates socket buffers,
+    /// which is needed for poll/ppoll to detect data availability on network sockets.
+    pub(crate) fn poll_network(&self) {
+        self.net.lock().poll();
+    }
+}
+
 #[cfg(test)]
 mod test_utils {
     extern crate std;

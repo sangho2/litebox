@@ -46,6 +46,8 @@
 - [x] Multi-distro container testing (Alpine, BusyBox, Debian, Ubuntu — 111/112 99% pass)
 - [x] Pipeline orchestration: `echo hello | cat`, `ls / | grep bin` work via sequential re-exec
 - [x] Rootfs-aware symlink resolution for merged `/usr` layouts (Debian, Ubuntu, Fedora)
+- [x] DNS resolution via OCI spec bind mounts (`/etc/resolv.conf`, `/etc/hosts`, `/etc/hostname`)
+- [x] OCI spec file bind mount loading (container managers inject config files)
 
 ## TODO
 
@@ -116,8 +118,8 @@ Manual TUN mode via `--tun-device` flag for environments without CNI.
 
 - Container IP (internal): `10.0.0.2/24` (smoltcp)
 - Gateway (internal): `10.0.0.1` (TUN interface)
-- Supports: TCP, UDP, ICMP (ping), setitimer (SIGALRM)
-- Not supported: Generic raw sockets (non-ICMP), DNS resolution
+- Supports: TCP, UDP, ICMP (ping), DNS resolution, setitimer (SIGALRM)
+- Not supported: Generic raw sockets (non-ICMP)
 
 ### Multi-threading and Process Model
 
