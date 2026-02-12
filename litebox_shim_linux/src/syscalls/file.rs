@@ -1485,37 +1485,58 @@ impl Task {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 match desc {
                     Descriptor::LiteBoxRawFd(raw_fd) => {
-                        self.files.borrow().run_on_raw_fd(
-                            *raw_fd,
-                            |_file_fd| {
-                                // TODO: stdio NONBLOCK?
-                                #[cfg(debug_assertions)]
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "Attempted to set non-blocking on raw fd; currently unimplemented"
-                                );
-                                Ok(())
-                            },
-                            |socket_fd| {
-                                if let Err(e) = self.global.litebox.descriptor_table_mut().with_metadata_mut(
-                                    socket_fd,
-                                    |crate::syscalls::net::SocketOFlags(flags)| {
-                                        flags.set(OFlags::NONBLOCK, val != 0);
-                                    },
-                                ) {
-                                    match e {
-                                        MetadataError::ClosedFd => return Err(Errno::EBADF),
-                                        MetadataError::NoSuchMetadata => unreachable!(),
+                        self.files
+                            .borrow()
+                            .run_on_raw_fd(
+                                *raw_fd,
+                                |file_fd| {
+                                    match self
+                                        .global
+                                        .litebox
+                                        .descriptor_table_mut()
+                                        .with_metadata_mut(file_fd, |crate::StdioStatusFlags(f)| {
+                                            f.set(OFlags::NONBLOCK, val != 0);
+                                        }) {
+                                        Ok(()) => Ok(()),
+                                        Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
+                                        Err(MetadataError::NoSuchMetadata) => {
+                                            // Non-stdio raw fd with no metadata to track
+                                            // flags on -- silently succeed.
+                                            Ok(())
+                                        }
                                     }
-                                }
-                                Ok(())
-                            },
-                            |fd| {
-    self.global.pipes                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
-                                    .map_err(Errno::from)
-                            },
-                        )
-                        .flatten()?;
+                                },
+                                |socket_fd| {
+                                    if let Err(e) = self
+                                        .global
+                                        .litebox
+                                        .descriptor_table_mut()
+                                        .with_metadata_mut(
+                                            socket_fd,
+                                            |crate::syscalls::net::SocketOFlags(flags)| {
+                                                flags.set(OFlags::NONBLOCK, val != 0);
+                                            },
+                                        )
+                                    {
+                                        match e {
+                                            MetadataError::ClosedFd => return Err(Errno::EBADF),
+                                            MetadataError::NoSuchMetadata => unreachable!(),
+                                        }
+                                    }
+                                    Ok(())
+                                },
+                                |fd| {
+                                    self.global
+                                        .pipes
+                                        .update_flags(
+                                            fd,
+                                            litebox::pipes::Flags::NON_BLOCKING,
+                                            val != 0,
+                                        )
+                                        .map_err(Errno::from)
+                                },
+                            )
+                            .flatten()?;
                     }
                     Descriptor::Eventfd { file, .. } => file.set_status(OFlags::NONBLOCK, val != 0),
                     Descriptor::Epoll { file, .. } => {
